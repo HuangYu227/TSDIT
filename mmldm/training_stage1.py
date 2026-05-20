@@ -177,6 +177,7 @@ def main():
     parser.add_argument("--block_size", type=int, default=4, help="Block-causal block size")
     parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--max_samples", type=int, default=None, help="Max samples (debug)")
+    parser.add_argument("--split_file", type=str, default=None, help="Path to splits.json for train/val split")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_dir", type=str, default="./checkpoints/stage1")
     parser.add_argument("--log_interval", type=int, default=10)
@@ -201,19 +202,28 @@ def main():
         block_size=args.block_size,
     )
 
-    # Build dataset
-    dataset = TSFragmentDataset(
-        data_dir=args.data_dir,
-        datasets=args.datasets,
-        time_intervals=args.time_intervals,
-        max_samples=args.max_samples,
-    )
-    print(f"Loaded {len(dataset)} samples")
-
-    # Split train/val
-    val_size = min(len(dataset) // 10, 1000)
-    train_size = len(dataset) - val_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+    # Build dataset with SampleID-level split
+    if args.split_file is not None:
+        train_ds = TSFragmentDataset(
+            data_dir=args.data_dir, datasets=args.datasets,
+            time_intervals=args.time_intervals, max_samples=args.max_samples,
+            split="train", split_file=args.split_file,
+        )
+        val_ds = TSFragmentDataset(
+            data_dir=args.data_dir, datasets=args.datasets,
+            time_intervals=args.time_intervals,
+            split="val", split_file=args.split_file,
+        )
+        print(f"Train: {len(train_ds)} samples, Val: {len(val_ds)} samples (from {args.split_file})")
+    else:
+        dataset = TSFragmentDataset(
+            data_dir=args.data_dir, datasets=args.datasets,
+            time_intervals=args.time_intervals, max_samples=args.max_samples,
+        )
+        val_size = min(len(dataset) // 10, 1000)
+        train_size = len(dataset) - val_size
+        train_ds, val_ds = random_split(dataset, [train_size, val_size])
+        print(f"Loaded {len(dataset)} samples (random split)")
 
     collate = CollateFn()
     train_loader = DataLoader(
