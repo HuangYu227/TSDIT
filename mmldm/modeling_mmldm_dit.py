@@ -1,0 +1,649 @@
+# Copyright 2026 MMLDM Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""MMLDM Multimodal DiT — Stage 2 prior model.
+
+Implements the block-causal multimodal diffusion transformer prior
+``p_psi(z_0 | c)`` with Flow Matching and DCD dual-condition denoising.
+
+The DiT learns the vector field ``v_psi(z_t, t; z_0^{(<b)}, c)`` under
+the visible set ``V_b = {sg(z_0^{(<b)}), z_t^(b), c}``.
+
+Stage 2 training minimizes::
+
+    L = L_FM + gamma1 * L_DCD_mix + gamma2 * L_DCD_aux
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Optional, Union
+
+import torch
+import torch.nn.functional as F
+from einops import rearrange, pack, unpack
+from torch import nn
+from transformers import AutoConfig, AutoModel, PreTrainedModel
+
+from .attention_utils import create_multimodal_joint_mask
+from .configuration_mmldm import MMLDMDiTConfig
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _flatten(hid_list: list[torch.Tensor]):
+    """``List[Tensor(*, c)]`` → ``(Tensor(L_total, c), shape (B, 1))``."""
+    shape = torch.stack([
+        torch.tensor(x.shape[:-1], device=hid_list[0].device) for x in hid_list
+    ])
+    hid = torch.cat([x.flatten(0, -2) for x in hid_list])
+    return hid, shape
+
+
+def _unflatten(hid: torch.Tensor, hid_shape: torch.LongTensor):
+    """Inverse of :func:`_flatten`."""
+    hid_len = hid_shape.prod(-1)
+    hid = hid.split(hid_len.tolist())
+    return [x.unflatten(0, s.tolist()) for x, s in zip(hid, hid_shape)]
+
+
+# ---------------------------------------------------------------------------
+# Timestep Embedding
+# ---------------------------------------------------------------------------
+
+
+def _get_sinusoidal_embedding(
+    timesteps: torch.Tensor,
+    embedding_dim: int,
+) -> torch.Tensor:
+    """Sinusoidal timestep embedding (diffusers convention)."""
+    assert len(timesteps.shape) == 1
+    half_dim = embedding_dim // 2
+    exponent = -math.log(10000) * torch.arange(
+        start=0, end=half_dim, dtype=torch.float32, device=timesteps.device
+    )
+    exponent = exponent / half_dim
+    emb = torch.exp(exponent)
+    emb = timesteps.float()[:, None] * emb[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+    if embedding_dim % 2 == 1:
+        emb = F.pad(emb, (0, 1))
+    return emb
+
+
+class TimestepEmbedding(nn.Module):
+    """Three-layer MLP for timestep conditioning."""
+
+    def __init__(self, sinusoidal_dim: int, hidden_dim: int, output_dim: int):
+        super().__init__()
+        self.sinusoidal_dim = sinusoidal_dim
+        self.proj_in = nn.Linear(sinusoidal_dim, hidden_dim)
+        self.proj_hid = nn.Linear(hidden_dim, hidden_dim)
+        self.proj_out = nn.Linear(hidden_dim, output_dim)
+        self.act = nn.SiLU()
+
+    def initialize_weights(self):
+        nn.init.normal_(self.proj_in.weight, std=0.02)
+        nn.init.normal_(self.proj_hid.weight, std=0.02)
+        nn.init.normal_(self.proj_out.weight, std=0.02)
+
+    def forward(self, timestep, device, dtype):
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], device=device, dtype=dtype)
+        if timestep.ndim == 0:
+            timestep = timestep[None]
+        emb = _get_sinusoidal_embedding(timestep, self.sinusoidal_dim).to(dtype)
+        emb = self.act(self.proj_in(emb))
+        emb = self.act(self.proj_hid(emb))
+        emb = self.proj_out(emb)
+        return emb
+
+
+# ---------------------------------------------------------------------------
+# Patch In/Out
+# ---------------------------------------------------------------------------
+
+
+class PatchIn1D(nn.Module):
+    """1-D patch embedding."""
+
+    def __init__(self, in_channels: int, patch_size: int, dim: int):
+        super().__init__()
+        self.patch_size = patch_size
+        self.proj = nn.Linear(in_channels * patch_size, dim)
+
+    def forward(self, txt: torch.Tensor, txt_shape: torch.LongTensor):
+        txt_shape_before_patchify = txt_shape
+        if self.patch_size != 1:
+            batch_list = _unflatten(txt, txt_shape)
+            for i in range(len(batch_list)):
+                batch_list[i] = rearrange(
+                    batch_list[i], "(T t) c -> T (t c)", t=self.patch_size
+                )
+            txt, txt_shape = _flatten(batch_list)
+        txt = self.proj(txt)
+        return txt, txt_shape, txt_shape_before_patchify
+
+
+class PatchOut1D(nn.Module):
+    """1-D patch un-embedding."""
+
+    def __init__(self, out_channels: int, patch_size: int, dim: int):
+        super().__init__()
+        self.patch_size = patch_size
+        self.proj = nn.Linear(dim, out_channels * patch_size)
+
+    def forward(
+        self,
+        txt: torch.Tensor,
+        txt_shape: torch.LongTensor,
+        txt_shape_before_patchify: torch.LongTensor,
+    ):
+        txt = self.proj(txt)
+        if self.patch_size != 1:
+            batch_list = _unflatten(txt, txt_shape)
+            for i in range(len(batch_list)):
+                batch_list[i] = rearrange(
+                    batch_list[i], "T (t c) -> (T t) c", t=self.patch_size
+                )
+            txt, txt_shape = _flatten(batch_list)
+        return txt, txt_shape
+
+
+# ---------------------------------------------------------------------------
+# Adaptive LayerNorm (from MMDiT)
+# ---------------------------------------------------------------------------
+
+
+class AdaptiveLayerNorm(nn.Module):
+    """Adaptive LayerNorm with time conditioning.
+
+    Produces gamma/beta from the conditioning signal, applied after
+    standard LayerNorm.  Gamma initialized to 1, beta to 0.
+    """
+
+    def __init__(self, dim: int, dim_cond: Optional[int] = None):
+        super().__init__()
+        has_cond = dim_cond is not None
+        self.has_cond = has_cond
+        self.ln = nn.LayerNorm(dim, elementwise_affine=not has_cond)
+
+        if has_cond:
+            cond_linear = nn.Linear(dim_cond, dim * 2)
+            self.to_cond = nn.Sequential(
+                nn.SiLU(),
+                cond_linear,
+            )
+            nn.init.zeros_(cond_linear.weight)
+            nn.init.constant_(cond_linear.bias[:dim], 1.0)
+            nn.init.zeros_(cond_linear.bias[dim:])
+
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None):
+        x = self.ln(x)
+        if self.has_cond and cond is not None:
+            # x: (*, D), cond: (*, dim_cond) — may differ in leading dims.
+            # Squeeze to 2D for MLP, then restore original shape.
+            orig_shape = x.shape
+            x_flat = x.reshape(-1, x.shape[-1])
+            cond_flat = cond.reshape(-1, cond.shape[-1])
+            gamma, beta = self.to_cond(cond_flat).chunk(2, dim=-1)
+            x_flat = x_flat * gamma + beta
+            x = x_flat.reshape(orig_shape)
+        return x
+
+
+# ---------------------------------------------------------------------------
+# MLP (GELU, tanh approximation)
+# ---------------------------------------------------------------------------
+
+
+class MLP(nn.Module):
+    def __init__(self, dim: int, expand_ratio: int = 4):
+        super().__init__()
+        self.proj_in = nn.Linear(dim, dim * expand_ratio)
+        self.act = nn.GELU("tanh")
+        self.proj_out = nn.Linear(dim * expand_ratio, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj_out(self.act(self.proj_in(x)))
+
+
+# ---------------------------------------------------------------------------
+# Multimodal Joint Attention (for DiT)
+# ---------------------------------------------------------------------------
+
+
+class MultimodalJointAttention(nn.Module):
+    """Joint attention for the DiT, with per-modality QKV and RoPE."""
+
+    def __init__(
+        self,
+        ts_dim: int,
+        text_dim: int,
+        heads: int,
+        head_dim: int,
+        qk_bias: bool = False,
+        qk_norm_eps: float = 1e-5,
+        rope_dim: int = 32,
+    ):
+        super().__init__()
+        inner_dim = heads * head_dim
+        self.heads = heads
+        self.head_dim = head_dim
+        self.rope_dim = rope_dim
+
+        # Per-modality QKV
+        self.ts_to_qkv = nn.Linear(ts_dim, inner_dim * 3, bias=qk_bias)
+        self.text_to_qkv = nn.Linear(text_dim, inner_dim * 3, bias=qk_bias)
+
+        # Per-modality output
+        self.ts_to_out = nn.Linear(inner_dim, ts_dim, bias=qk_bias)
+        self.text_to_out = nn.Linear(inner_dim, text_dim, bias=qk_bias)
+
+        # QK norm
+        self.ts_q_norm = nn.LayerNorm(head_dim, eps=qk_norm_eps, elementwise_affine=True)
+        self.ts_k_norm = nn.LayerNorm(head_dim, eps=qk_norm_eps, elementwise_affine=True)
+        self.text_q_norm = nn.LayerNorm(head_dim, eps=qk_norm_eps, elementwise_affine=True)
+        self.text_k_norm = nn.LayerNorm(head_dim, eps=qk_norm_eps, elementwise_affine=True)
+
+        # RoPE (simplified sinusoidal)
+        self._rope_cache: Optional[torch.Tensor] = None
+
+    def _get_rope_freqs(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+        if self._rope_cache is not None and self._rope_cache.shape[0] >= seq_len:
+            return self._rope_cache[:seq_len]
+        half_dim = self.rope_dim // 2
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, half_dim, device=device).float() / half_dim))
+        t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
+        freqs = torch.outer(t, inv_freq)  # (L, rope_dim//2)
+        self._rope_cache = freqs
+        return freqs
+
+    def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+        """Apply rotary embedding to first ``rope_dim`` channels."""
+        d = self.rope_dim
+        x_rope = x[..., :d].float()
+        x_pass = x[..., d:]
+        half = d // 2
+        x1, x2 = x_rope[..., :half], x_rope[..., half:]
+        # Truncate freqs to half so cos/sin match x1, x2
+        freqs_half = freqs[..., :half]
+        cos = freqs_half.cos().unsqueeze(0).unsqueeze(0)
+        sin = freqs_half.sin().unsqueeze(0).unsqueeze(0)
+        out1 = x1 * cos - x2 * sin
+        out2 = x2 * cos + x1 * sin
+        return torch.cat([torch.cat([out1, out2], dim=-1).to(x.dtype), x_pass], dim=-1)
+
+    def forward(
+        self,
+        ts_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B = ts_tokens.shape[0]
+        L_ts = ts_tokens.shape[1]
+        L_text = text_tokens.shape[1]
+
+        # Project to QKV
+        ts_qkv = self.ts_to_qkv(ts_tokens).reshape(B, L_ts, 3, self.heads, self.head_dim)
+        text_qkv = self.text_to_qkv(text_tokens).reshape(B, L_text, 3, self.heads, self.head_dim)
+
+        ts_q, ts_k, ts_v = ts_qkv.unbind(2)
+        text_q, text_k, text_v = text_qkv.unbind(2)
+
+        # Transpose to (B, H, L, D)
+        ts_q, ts_k, ts_v = ts_q.transpose(1, 2), ts_k.transpose(1, 2), ts_v.transpose(1, 2)
+        text_q, text_k, text_v = text_q.transpose(1, 2), text_k.transpose(1, 2), text_v.transpose(1, 2)
+
+        # QK norm
+        ts_q = self.ts_q_norm(ts_q)
+        ts_k = self.ts_k_norm(ts_k)
+        text_q = self.text_q_norm(text_q)
+        text_k = self.text_k_norm(text_k)
+
+        # Apply RoPE to TS only — text tokens are global conditions,
+        # not a temporal sequence, so they carry no relative position.
+        ts_freqs = self._get_rope_freqs(L_ts, ts_q.device, ts_q.dtype)
+        ts_q = self._apply_rope(ts_q, ts_freqs)
+        ts_k = self._apply_rope(ts_k, ts_freqs)
+
+        # Pack
+        all_q, _ = pack([ts_q, text_q], "b h * d")
+        all_k, _ = pack([ts_k, text_k], "b h * d")
+        all_v, packed_shape = pack([ts_v, text_v], "b h * d")
+
+        # Attention
+        d_head = all_q.shape[-1]
+        scale = 1.0 / (d_head ** 0.5)
+        attn = all_q.mul(scale) @ all_k.transpose(-2, -1)
+        if attn_mask is not None:
+            attn = attn + attn_mask.to(attn.dtype)
+        attn_weight = attn.softmax(dim=-1)
+        outs = attn_weight @ all_v
+
+        # Merge heads
+        outs = outs.transpose(1, 2).reshape(B, L_ts + L_text, -1)
+
+        # Unpack
+        ts_out, text_out = unpack(outs, packed_shape, "b * d")
+
+        # Output projection
+        ts_out = self.ts_to_out(ts_out)
+        text_out = self.text_to_out(text_out)
+
+        return ts_out, text_out
+
+
+# ---------------------------------------------------------------------------
+# Multimodal DiT Block
+# ---------------------------------------------------------------------------
+
+
+class MultimodalDiTBlock(nn.Module):
+    """DiT block with MMDiT-style joint attention and AdaLN conditioning.
+
+    Structure per block:
+    1. AdaLN pre-norm + JointAttention + post-attn gamma + residual
+    2. AdaLN pre-norm + FeedForward + post-ff gamma + residual
+    """
+
+    def __init__(
+        self,
+        ts_dim: int,
+        text_dim: int,
+        emb_dim: int,
+        heads: int,
+        head_dim: int,
+        expand_ratio: int = 4,
+        norm_eps: float = 1e-5,
+        qk_bias: bool = False,
+        rope_dim: int = 32,
+    ):
+        super().__init__()
+        # Attention norms (adaptive)
+        self.ts_attn_norm = AdaptiveLayerNorm(ts_dim, dim_cond=emb_dim)
+        self.text_attn_norm = AdaptiveLayerNorm(text_dim, dim_cond=emb_dim)
+
+        # Joint attention
+        self.joint_attn = MultimodalJointAttention(
+            ts_dim=ts_dim,
+            text_dim=text_dim,
+            heads=heads,
+            head_dim=head_dim,
+            qk_bias=qk_bias,
+            qk_norm_eps=norm_eps,
+            rope_dim=rope_dim,
+        )
+
+        # Post-attn gamma (from conditioning)
+        self.ts_post_attn_gamma = nn.Sequential(nn.SiLU(), nn.Linear(emb_dim, ts_dim))
+        self.text_post_attn_gamma = nn.Sequential(nn.SiLU(), nn.Linear(emb_dim, text_dim))
+        nn.init.zeros_(self.ts_post_attn_gamma[-1].weight)
+        nn.init.zeros_(self.ts_post_attn_gamma[-1].bias)
+        nn.init.zeros_(self.text_post_attn_gamma[-1].weight)
+        nn.init.zeros_(self.text_post_attn_gamma[-1].bias)
+
+        # FFN norms (adaptive)
+        self.ts_ffn_norm = AdaptiveLayerNorm(ts_dim, dim_cond=emb_dim)
+        self.text_ffn_norm = AdaptiveLayerNorm(text_dim, dim_cond=emb_dim)
+
+        # FFN
+        self.ts_ffn = MLP(ts_dim, expand_ratio)
+        self.text_ffn = MLP(text_dim, expand_ratio)
+
+        # Post-ff gamma
+        self.ts_post_ff_gamma = nn.Sequential(nn.SiLU(), nn.Linear(emb_dim, ts_dim))
+        self.text_post_ff_gamma = nn.Sequential(nn.SiLU(), nn.Linear(emb_dim, text_dim))
+        nn.init.zeros_(self.ts_post_ff_gamma[-1].weight)
+        nn.init.zeros_(self.ts_post_ff_gamma[-1].bias)
+        nn.init.zeros_(self.text_post_ff_gamma[-1].weight)
+        nn.init.zeros_(self.text_post_ff_gamma[-1].bias)
+
+    def forward(
+        self,
+        ts_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        ts_emb: torch.Tensor,
+        text_emb: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        # Attention branch
+        ts_normed = self.ts_attn_norm(ts_tokens, cond=ts_emb)
+        text_normed = self.text_attn_norm(text_tokens, cond=text_emb)
+
+        ts_attn_out, text_attn_out = self.joint_attn(
+            ts_normed, text_normed, attn_mask=attn_mask
+        )
+
+        # Post-attn gamma + residual
+        ts_attn_out = ts_attn_out * self.ts_post_attn_gamma(ts_emb)
+        text_attn_out = text_attn_out * self.text_post_attn_gamma(text_emb)
+
+        ts_tokens = ts_tokens + ts_attn_out
+        text_tokens = text_tokens + text_attn_out
+
+        # FFN branch
+        ts_ff = self.ts_ffn(self.ts_ffn_norm(ts_tokens, cond=ts_emb))
+        text_ff = self.text_ffn(self.text_ffn_norm(text_tokens, cond=text_emb))
+
+        # Post-ff gamma + residual
+        ts_ff = ts_ff * self.ts_post_ff_gamma(ts_emb)
+        text_ff = text_ff * self.text_post_ff_gamma(text_emb)
+
+        ts_tokens = ts_tokens + ts_ff
+        text_tokens = text_tokens + text_ff
+
+        return ts_tokens, text_tokens
+
+
+# ---------------------------------------------------------------------------
+# Output dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MMLDMDiTOutput:
+    ts_sample: torch.Tensor
+    text_sample: torch.Tensor
+
+
+# ---------------------------------------------------------------------------
+# Main Model: MMLDMDiTModel
+# ---------------------------------------------------------------------------
+
+
+class MMLDMDiTModel(PreTrainedModel):
+    """Multimodal DiT prior for MMLDM Stage 2.
+
+    Learns the vector field ``v_psi(z_t, t; z_0^{(<b)}, c)`` with
+    block-causal attention and MMDiT-style joint attention.
+    """
+
+    config_class = MMLDMDiTConfig
+    base_model_prefix = "mmldm_dit"
+
+    def __init__(self, config: MMLDMDiTConfig):
+        super().__init__(config)
+        self.config = config
+        self.block_size = config.block_size
+        self.heads = config.heads
+
+        # Patch embedding
+        self.ts_in = PatchIn1D(
+            in_channels=config.ts_in_channels,
+            patch_size=config.patch_size,
+            dim=config.txt_dim,
+        )
+        self.text_in = PatchIn1D(
+            in_channels=config.text_in_channels,
+            patch_size=config.patch_size,
+            dim=config.txt_dim,
+        )
+
+        # Timestep embedding
+        self.emb_in = TimestepEmbedding(
+            sinusoidal_dim=256,
+            hidden_dim=config.txt_dim,
+            output_dim=config.emb_dim,
+        )
+
+        # DiT blocks
+        self.blocks = nn.ModuleList([
+            MultimodalDiTBlock(
+                ts_dim=config.txt_dim,
+                text_dim=config.txt_dim,
+                emb_dim=config.emb_dim,
+                heads=config.heads,
+                head_dim=config.head_dim,
+                expand_ratio=config.expand_ratio,
+                norm_eps=config.norm_eps,
+                qk_bias=config.qk_bias,
+                rope_dim=config.rope_dim,
+            )
+            for _ in range(config.num_layers)
+        ])
+
+        # Output
+        self.ts_out_norm = AdaptiveLayerNorm(config.txt_dim, dim_cond=config.emb_dim)
+        self.text_out_norm = AdaptiveLayerNorm(config.txt_dim, dim_cond=config.emb_dim)
+
+        self.ts_out = PatchOut1D(
+            out_channels=config.ts_out_channels,
+            patch_size=config.patch_size,
+            dim=config.txt_dim,
+        )
+        self.text_out = PatchOut1D(
+            out_channels=config.text_out_channels,
+            patch_size=config.patch_size,
+            dim=config.txt_dim,
+        )
+
+        self.post_init()
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+
+    def forward(
+        self,
+        ts: torch.FloatTensor,
+        text: torch.FloatTensor,
+        ts_shape: torch.LongTensor,
+        text_shape: torch.LongTensor,
+        timestep: Union[int, float, torch.IntTensor, torch.FloatTensor],
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> MMLDMDiTOutput:
+        """NA-form forward pass.
+
+        Args:
+            ts: ``(L_ts_total, ts_channels)`` TS latent tokens.
+            text: ``(L_text_total, text_channels)`` text latent tokens.
+            ts_shape: ``(B, 1)`` per-sample TS lengths.
+            text_shape: ``(B, 1)`` per-sample text lengths.
+            timestep: Flow Matching time ``t``.
+            attn_mask: optional block-causal mask.
+
+        Returns:
+            :class:`MMLDMDiTOutput` with velocity field predictions.
+        """
+        # Patch embed
+        ts, ts_shape_patched, ts_shape_before = self.ts_in(ts, ts_shape)
+        text, text_shape_patched, text_shape_before = self.text_in(text, text_shape)
+
+        # Per-modality timestep embeddings.
+        # TS: per-token timesteps  |  Text: global (mean) timestep
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], device=ts.device, dtype=ts.dtype)
+        if timestep.ndim == 0:
+            timestep = timestep[None]
+
+        if timestep.numel() > 1 and ts_shape_patched.shape[0] > 1:
+            # Multi-sample: extract per-sample timesteps and expand for text
+            cum_lens = torch.cat([
+                torch.zeros(1, dtype=torch.long, device=ts.device),
+                ts_shape_patched.flatten().cumsum(0),
+            ])
+            t_per_sample = torch.stack([
+                timestep[cum_lens[i]] for i in range(ts_shape_patched.shape[0])
+            ])
+            text_t_expanded = torch.repeat_interleave(
+                t_per_sample, text_shape_patched.flatten(),
+            )
+        else:
+            t_per_sample = timestep
+            text_t_expanded = timestep.mean().expand(
+                int(text_shape_patched.sum().item()),
+            )
+
+        ts_emb = self.emb_in(timestep, device=ts.device, dtype=ts.dtype)         # (L_ts, emb_dim)
+        text_emb = self.emb_in(text_t_expanded, device=ts.device, dtype=ts.dtype)  # (L_text, emb_dim)
+
+        # Build mask if not provided — multimodal [ts; text] joint layout
+        if attn_mask is None:
+            # Default: fixed block_size for each sample
+            lengths = ts_shape_patched.flatten().tolist()
+            block_sizes_fallback = []
+            for l in lengths:
+                n_full = l // self.block_size
+                sizes = [self.block_size] * n_full
+                remainder = l - n_full * self.block_size
+                if remainder > 0:
+                    sizes.append(remainder)
+                block_sizes_fallback.append(sizes if sizes else [l])
+
+            attn_mask = create_multimodal_joint_mask(
+                ts_shape=ts_shape_patched,
+                text_shape=text_shape_patched,
+                block_sizes=block_sizes_fallback,
+                dtype=torch.bfloat16 if ts.is_cuda else ts.dtype,
+                device=ts.device,
+            )
+
+        # Add batch dim for attention
+        ts = ts.unsqueeze(0)    # (1, L_ts, d)
+        text = text.unsqueeze(0)  # (1, L_text, d)
+
+        # Add batch dim to embeddings
+        ts_emb = ts_emb.unsqueeze(0)      # (1, L_ts, emb_dim)
+        text_emb = text_emb.unsqueeze(0)  # (1, 1, emb_dim)
+
+        # DiT blocks
+        for block in self.blocks:
+            ts, text = block(
+                ts, text,
+                ts_emb=ts_emb,
+                text_emb=text_emb,
+                attn_mask=attn_mask,
+            )
+
+        # Output norm + unpatch
+        ts = self.ts_out_norm(ts.squeeze(0), cond=ts_emb.squeeze(0))
+        text = self.text_out_norm(text.squeeze(0), cond=text_emb.squeeze(0))
+
+        ts, _ = self.ts_out(ts, ts_shape_patched, ts_shape_before)
+        text, _ = self.text_out(text, text_shape_patched, text_shape_before)
+
+        return MMLDMDiTOutput(ts_sample=ts, text_sample=text)
+
+
+# Register
+AutoConfig.register("mmldm_dit", MMLDMDiTConfig)
+AutoModel.register(MMLDMDiTConfig, MMLDMDiTModel)

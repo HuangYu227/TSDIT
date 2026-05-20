@@ -1,0 +1,177 @@
+# Copyright 2026 MMLDM Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Dataset loader for TSFragment-600K.
+
+Each CSV row contains:
+- SampleID: unique identifier
+- SampleNumID: numeric ID
+- TimeInterval: 24, 48, or 96
+- Text: natural language description of the time series
+- TextEmbedding: 128-dim vector (NumPy repr format, space-separated)
+- OT: time series values (Python list format, comma-separated)
+"""
+
+from __future__ import annotations
+
+import ast
+import csv
+import os
+from pathlib import Path
+from typing import Optional, Sequence
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+
+def _parse_text_embedding(s: str) -> np.ndarray:
+    """Parse NumPy repr format: ``[val1  val2  val3 ...]`` with possible newlines."""
+    cleaned = s.strip().strip("[]")
+    # Replace newlines with spaces, then split on whitespace
+    cleaned = cleaned.replace("\n", " ").replace("\r", " ")
+    return np.fromstring(cleaned, sep=" ", dtype=np.float32)
+
+
+def _parse_ot(s: str) -> np.ndarray:
+    """Parse Python list format: ``[val1, val2, val3, ...]``."""
+    values = ast.literal_eval(s.strip())
+    return np.array(values, dtype=np.float32)
+
+
+class TSFragmentDataset(Dataset):
+    """Dataset for TSFragment-600K CSV files.
+
+    Args:
+        data_dir: path to the directory containing CSV files.
+        datasets: list of dataset names to include (e.g., ``["ETTh1", "ETTm1"]``).
+            If None, all datasets are included.
+        time_intervals: list of time intervals to include (e.g., ``[24, 48]``).
+            If None, all intervals are included.
+        max_samples: maximum number of samples to load (for debugging).
+    """
+
+    AVAILABLE_DATASETS = [
+        "ETTh1", "ETTh1s", "ETTm1",
+        "airquality", "electricity", "exchangerate", "traffic",
+    ]
+    AVAILABLE_INTERVALS = [24, 48, 96]
+
+    def __init__(
+        self,
+        data_dir: str,
+        datasets: Optional[Sequence[str]] = None,
+        time_intervals: Optional[Sequence[int]] = None,
+        max_samples: Optional[int] = None,
+    ):
+        super().__init__()
+        self.data_dir = Path(data_dir)
+        self.datasets = datasets or self.AVAILABLE_DATASETS
+        self.time_intervals = time_intervals or self.AVAILABLE_INTERVALS
+
+        self.samples = []
+        self._load_files(max_samples)
+
+    def _load_files(self, max_samples: Optional[int]) -> None:
+        for ds_name in self.datasets:
+            for interval in self.time_intervals:
+                fname = f"embedding_cleaned_{ds_name}_{interval}.csv"
+                fpath = self.data_dir / fname
+                if not fpath.exists():
+                    continue
+                self._load_csv(fpath, ds_name, interval, max_samples)
+
+    def _load_csv(
+        self,
+        fpath: Path,
+        dataset_name: str,
+        time_interval: int,
+        max_samples: Optional[int],
+    ) -> None:
+        count = 0
+        with open(fpath, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader)  # skip header
+            for row in reader:
+                if max_samples is not None and len(self.samples) >= max_samples:
+                    return
+                try:
+                    sample_id = int(row[0])
+                    text_str = row[3]
+                    text_emb = _parse_text_embedding(row[4])
+                    ot = _parse_ot(row[5])
+
+                    self.samples.append(
+                        {
+                            "sample_id": sample_id,
+                            "dataset_name": dataset_name,
+                            "time_interval": time_interval,
+                            "text_str": text_str,
+                            "text_embedding": text_emb,
+                            "ot": ot,
+                        }
+                    )
+                    count += 1
+                except (ValueError, IndexError, SyntaxError):
+                    continue  # skip malformed rows
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict:
+        s = self.samples[idx]
+        return {
+            "sample_id": s["sample_id"],
+            "dataset_name": s["dataset_name"],
+            "time_interval": s["time_interval"],
+            "text_str": s["text_str"],
+            "text_embedding": torch.from_numpy(s["text_embedding"].copy()),
+            "ot": torch.from_numpy(s["ot"].copy()).unsqueeze(-1),  # (L, 1)
+        }
+
+
+class CollateFn:
+    """Collate function for variable-length time series.
+
+    Returns batched tensors with padding for the time series.
+    Text embeddings are stacked (fixed 128-dim).
+
+    Output format:
+        text_embedding: (B, 128)
+        ot: (B, L_max, 1) padded with zeros
+        ot_lengths: (B,) actual lengths
+        text_strs: list of B strings
+        dataset_names: list of B strings
+    """
+
+    def __call__(self, batch: list[dict]) -> dict:
+        text_embeddings = torch.stack([s["text_embedding"] for s in batch])
+        ot_lengths = torch.tensor([s["ot"].shape[0] for s in batch], dtype=torch.long)
+        L_max = int(ot_lengths.max().item())
+
+        # Pad time series to L_max
+        B = len(batch)
+        ot_padded = torch.zeros(B, L_max, 1, dtype=torch.float32)
+        for i, s in enumerate(batch):
+            L = s["ot"].shape[0]
+            ot_padded[i, :L, :] = s["ot"]
+
+        return {
+            "text_embedding": text_embeddings,  # (B, 128)
+            "ot": ot_padded,                    # (B, L_max, 1)
+            "ot_lengths": ot_lengths,           # (B,)
+            "text_strs": [s["text_str"] for s in batch],
+            "dataset_names": [s["dataset_name"] for s in batch],
+            "time_intervals": [s["time_interval"] for s in batch],
+        }
