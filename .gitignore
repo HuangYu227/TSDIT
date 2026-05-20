@@ -1,1 +1,4 @@
 Three Levels Data/
+__pycache__/
+*.pyc
+*.egg-info/

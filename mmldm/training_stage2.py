@@ -35,7 +35,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 
 from .configuration_mmldm import MMLDMDiTConfig, MMLDMVAEConfig
 from .data.tsfragment_dataset import CollateFn, TSFragmentDataset
@@ -320,6 +320,7 @@ def main():
     parser.add_argument("--cfg_drop_prob", type=float, default=0.1, help="CFG condition dropout prob")
     parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--split_file", type=str, default=None, help="Path to splits.json for train/val split")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_dir", type=str, default="./checkpoints/stage2")
     parser.add_argument("--log_interval", type=int, default=10)
@@ -365,18 +366,32 @@ def main():
         ).to(device)
         print("Semantic router enabled")
 
-    # Build dataset
-    dataset = TSFragmentDataset(
-        data_dir=args.data_dir,
-        datasets=args.datasets,
-        time_intervals=args.time_intervals,
-        max_samples=args.max_samples,
-    )
-    print(f"Loaded {len(dataset)} samples")
-
-    val_size = min(len(dataset) // 10, 1000)
-    train_ds, val_ds = random_split(dataset, [len(dataset) - val_size, val_size])
+    # Build dataset with SampleID-level split
     collate = CollateFn()
+
+    if args.split_file is not None:
+        train_ds = TSFragmentDataset(
+            data_dir=args.data_dir, datasets=args.datasets,
+            time_intervals=args.time_intervals, max_samples=args.max_samples,
+            split="train", split_file=args.split_file,
+        )
+        val_ds = TSFragmentDataset(
+            data_dir=args.data_dir, datasets=args.datasets,
+            time_intervals=args.time_intervals,
+            split="val", split_file=args.split_file,
+        )
+        print(f"Train: {len(train_ds)} samples, Val: {len(val_ds)} samples (from {args.split_file})")
+    else:
+        # Fallback: random row-level split (may leak for ETTh1 sliding windows)
+        dataset = TSFragmentDataset(
+            data_dir=args.data_dir, datasets=args.datasets,
+            time_intervals=args.time_intervals, max_samples=args.max_samples,
+        )
+        val_size = min(len(dataset) // 10, 1000)
+        from torch.utils.data import random_split
+        train_ds, val_ds = random_split(dataset, [len(dataset) - val_size, val_size])
+        print(f"Loaded {len(dataset)} samples (random split, no split_file)")
+
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         collate_fn=collate, num_workers=0, pin_memory=True,

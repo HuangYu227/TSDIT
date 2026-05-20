@@ -451,6 +451,7 @@ def main():
     parser.add_argument("--eval_datasets", type=str, nargs="+", default=["ETTh1"])
     parser.add_argument("--eval_time_intervals", type=int, nargs="+", default=[24])
     parser.add_argument("--eval_seed", type=int, default=42, help="Must match training split seed")
+    parser.add_argument("--split_file", type=str, default=None, help="Path to splits.json for test split")
     parser.add_argument("--n_runs", type=int, default=1, help="Generation runs per sample (for MRR)")
     parser.add_argument("--metrics", type=str, default="MSE,WAPE,MRR")
     parser.add_argument("--eval_output", type=str, default=None, help="JSON path for eval results")
@@ -466,18 +467,27 @@ def main():
         needs_single = any(m in metrics for m in ("MSE", "WAPE"))
         needs_multi = "MRR" in metrics
 
-        # Load dataset and split with same seed as training
-        from torch.utils.data import random_split
-
-        dataset = TSFragmentDataset(
-            data_dir=args.eval_data_dir,
-            datasets=args.eval_datasets,
-            time_intervals=args.eval_time_intervals,
-            max_samples=args.max_eval_samples,
-        )
-        val_size = min(len(dataset) // 10, 1000)
-        _, test_ds = random_split(dataset, [len(dataset) - val_size, val_size],
-                                  generator=torch.Generator().manual_seed(args.eval_seed))
+        # Load test split (SampleID-level, no data leakage)
+        if args.split_file is not None:
+            test_ds = TSFragmentDataset(
+                data_dir=args.eval_data_dir,
+                datasets=args.eval_datasets,
+                time_intervals=args.eval_time_intervals,
+                max_samples=args.max_eval_samples,
+                split="test", split_file=args.split_file,
+            )
+        else:
+            # Fallback: random split (may leak for ETTh1 sliding windows)
+            from torch.utils.data import random_split
+            dataset = TSFragmentDataset(
+                data_dir=args.eval_data_dir,
+                datasets=args.eval_datasets,
+                time_intervals=args.eval_time_intervals,
+                max_samples=args.max_eval_samples,
+            )
+            val_size = min(len(dataset) // 10, 1000)
+            _, test_ds = random_split(dataset, [len(dataset) - val_size, val_size],
+                                      generator=torch.Generator().manual_seed(args.eval_seed))
         print(f"Eval dataset: {len(test_ds)} test samples")
 
         # Collect ground truth and generations
