@@ -651,6 +651,38 @@ class MMLDMVAEModel(PreTrainedModel):
         x = self.text_proj(text_embs)  # (B, d)
         return [x[i : i + 1] for i in range(B)]  # list of (1, d)
 
+    @staticmethod
+    def _single_block_sizes(lengths: torch.LongTensor) -> list[list[int]]:
+        """Represent each sample as one bidirectional block."""
+        return [[int(l)] for l in lengths.flatten().tolist()]
+
+    def encode_text_condition(self, text_embs: torch.Tensor) -> torch.Tensor:
+        """Encode text embeddings without seeing the target time series.
+
+        Stage 2 and inference must use this path for conditioning.  The joint
+        encoder mixes text with the target TS and would leak target information
+        into the DiT condition during training.
+        """
+        text_per_sample = self._encode_text_per_sample(text_embs)
+        text_shape = torch.tensor(
+            [[x.shape[0]] for x in text_per_sample],
+            dtype=torch.long,
+            device=text_per_sample[0].device,
+        )
+        text_x = torch.cat(text_per_sample, dim=0).unsqueeze(0)
+
+        text_attn_mask = create_multimodal_joint_mask(
+            ts_shape=text_shape,
+            text_shape=torch.zeros_like(text_shape),
+            block_sizes=self._single_block_sizes(text_shape),
+            dtype=text_x.dtype,
+            device=text_x.device,
+        )
+        for block in self.text_encoder_blocks:
+            text_x = block(text_x, attn_mask=text_attn_mask)
+
+        return self.text_final_norm(self.text_final_layer(text_x.squeeze(0)))
+
     def encode(
         self,
         ot_list: list[torch.Tensor],
@@ -683,22 +715,47 @@ class MMLDMVAEModel(PreTrainedModel):
             device=text_per_sample[0].device,
         )
 
+        ts_attn_mask = create_multimodal_joint_mask(
+            ts_shape=ts_shape,
+            text_shape=torch.zeros_like(ts_shape),
+            block_sizes=self._single_block_sizes(ts_shape),
+            dtype=ts_per_sample[0].dtype,
+            device=ts_per_sample[0].device,
+        )
+        text_attn_mask = create_multimodal_joint_mask(
+            ts_shape=text_shape,
+            text_shape=torch.zeros_like(text_shape),
+            block_sizes=self._single_block_sizes(text_shape),
+            dtype=text_per_sample[0].dtype,
+            device=text_per_sample[0].device,
+        )
+        joint_attn_mask = create_multimodal_joint_mask(
+            ts_shape=ts_shape,
+            text_shape=text_shape,
+            block_sizes=self._single_block_sizes(ts_shape),
+            dtype=ts_per_sample[0].dtype,
+            device=ts_per_sample[0].device,
+        )
+
         # Run through individual encoder blocks
         ts_x = torch.cat(ts_per_sample, dim=0).unsqueeze(0)  # (1, L_ts_total, d)
         for block in self.ts_encoder_blocks:
-            ts_x = block(ts_x)
+            ts_x = block(ts_x, attn_mask=ts_attn_mask)
 
         text_x = torch.cat(text_per_sample, dim=0).unsqueeze(0)  # (1, L_text_total, d)
         for block in self.text_encoder_blocks:
-            text_x = block(text_x)
+            text_x = block(text_x, attn_mask=text_attn_mask)
 
-        # Joint encoder — no block-causal mask needed for encoding
+        text_condition_latents = self.text_final_norm(
+            self.text_final_layer(text_x.squeeze(0)),
+        )
+
+        # Joint encoder: bidirectional within each sample, isolated across samples.
         for block in self.joint_encoder_blocks:
-            ts_x, text_x = block(ts_x, text_x)
+            ts_x, text_x = block(ts_x, text_x, attn_mask=joint_attn_mask)
 
         # Combine TS and text latents for the final projection
         ts_latents = ts_x.squeeze(0)  # (L_ts_total, d)
-        text_latents_raw = text_x.squeeze(0)  # (L_text_total, d)
 
         # Project TS latents to latent space
         ts_latents = self.final_layer(ts_latents)
@@ -706,11 +763,6 @@ class MMLDMVAEModel(PreTrainedModel):
             mean, logvar = torch.chunk(ts_latents, 2, dim=-1)
             mean = self.final_norm(mean)
             ts_latents = torch.cat((mean, logvar), dim=-1)
-
-        # Project text latents to the same latent_dim space
-        text_latents = self.text_final_norm(
-            self.text_final_layer(text_latents_raw),
-        )  # (L_text_total, latent_dim)
 
         # Split back to per-sample latents
         split_sizes = ts_shape.flatten().tolist()
@@ -726,7 +778,7 @@ class MMLDMVAEModel(PreTrainedModel):
         return TextVAEEncoderOutput(
             latents_list=latents_mode,
             latent_dists=latent_dists,
-            text_latents=text_latents,
+            text_latents=text_condition_latents,
         )
 
     # ---------------------------------------------------------------

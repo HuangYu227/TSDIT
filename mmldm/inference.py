@@ -330,12 +330,8 @@ def generate_timeseries(
     text_embs = text_embedding.to(device)  # (1, text_dim)
 
     with torch.no_grad():
-        # Use a dummy TS to trigger VAE's text encoder path
-        dummy_ts = [torch.zeros(1, 1, device=device)]  # (1 token, 1 channel)
-        enc_output = vae.encode(dummy_ts, text_embs)
-        text_latent = enc_output.text_latents  # (L_text, latent_dim)
+        text_latent = vae.encode_text_condition(text_embs)  # (B, latent_dim)
 
-    print(f"DEBUG: text_latent.shape={text_latent.shape}, text_embs.shape={text_embs.shape}")
     text_shape = _shape_tensor([text_latent.shape[0]], device)
 
     # Optional: prepare router input

@@ -62,6 +62,74 @@ def _unflatten(hid: torch.Tensor, hid_shape: torch.LongTensor):
     return [x.unflatten(0, s.tolist()) for x, s in zip(hid, hid_shape)]
 
 
+def _to_1d_timestep(
+    timestep: Union[int, float, torch.IntTensor, torch.FloatTensor],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if not torch.is_tensor(timestep):
+        timestep = torch.tensor([timestep], device=device, dtype=dtype)
+    return timestep.to(device=device, dtype=dtype).flatten()
+
+
+def _expand_ts_timestep(
+    timestep: Union[int, float, torch.IntTensor, torch.FloatTensor],
+    ts_shape: torch.LongTensor,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Expand scalar/per-sample/per-token timesteps to TS-token timesteps."""
+    t = _to_1d_timestep(timestep, device=device, dtype=dtype)
+    lengths = ts_shape.flatten().to(device=device)
+    total = int(lengths.sum().item())
+    batch = int(lengths.numel())
+
+    if t.numel() == 1:
+        return t.expand(total)
+    if t.numel() == total:
+        return t
+    if t.numel() == batch:
+        return torch.repeat_interleave(t, lengths)
+    raise ValueError(
+        f"timestep must be scalar, per-sample ({batch}), or per-token ({total}); "
+        f"got {t.numel()}"
+    )
+
+
+def _expand_text_timestep(
+    timestep: Union[int, float, torch.IntTensor, torch.FloatTensor],
+    ts_shape: torch.LongTensor,
+    text_shape: torch.LongTensor,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Expand conditioning timesteps to text-token timesteps."""
+    t = _to_1d_timestep(timestep, device=device, dtype=dtype)
+    ts_lengths = ts_shape.flatten().to(device=device)
+    text_lengths = text_shape.flatten().to(device=device)
+    total_ts = int(ts_lengths.sum().item())
+    total_text = int(text_lengths.sum().item())
+    batch = int(ts_lengths.numel())
+
+    if total_text == 0:
+        return torch.empty(0, device=device, dtype=dtype)
+    if t.numel() == 1:
+        per_sample = t.expand(batch)
+    elif t.numel() == batch:
+        per_sample = t
+    elif t.numel() == total_text:
+        return t
+    elif t.numel() == total_ts:
+        end_indices = ts_lengths.cumsum(0) - 1
+        per_sample = t[end_indices]
+    else:
+        raise ValueError(
+            f"text timestep must be scalar, per-sample ({batch}), per-text-token "
+            f"({total_text}), or per-TS-token ({total_ts}); got {t.numel()}"
+        )
+    return torch.repeat_interleave(per_sample, text_lengths)
+
+
 # ---------------------------------------------------------------------------
 # Timestep Embedding
 # ---------------------------------------------------------------------------
@@ -201,6 +269,13 @@ class AdaptiveLayerNorm(nn.Module):
             orig_shape = x.shape
             x_flat = x.reshape(-1, x.shape[-1])
             cond_flat = cond.reshape(-1, cond.shape[-1])
+            if cond_flat.shape[0] == 1 and x_flat.shape[0] != 1:
+                cond_flat = cond_flat.expand(x_flat.shape[0], -1)
+            elif cond_flat.shape[0] != x_flat.shape[0]:
+                raise ValueError(
+                    f"AdaptiveLayerNorm condition length {cond_flat.shape[0]} "
+                    f"does not match token length {x_flat.shape[0]}"
+                )
             gamma, beta = self.to_cond(cond_flat).chunk(2, dim=-1)
             x_flat = x_flat * gamma + beta
             x = x_flat.reshape(orig_shape)
@@ -322,11 +397,9 @@ class MultimodalJointAttention(nn.Module):
 
         # Concatenate prefix KV if provided
         if prefix_kv is not None:
-            pre_ts_k, pre_ts_v, pre_text_k, pre_text_v = prefix_kv
+            pre_ts_k, pre_ts_v, _pre_text_k, _pre_text_v = prefix_kv
             ts_k = torch.cat([pre_ts_k, ts_k], dim=2)
             ts_v = torch.cat([pre_ts_v, ts_v], dim=2)
-            text_k = torch.cat([pre_text_k, text_k], dim=2)
-            text_v = torch.cat([pre_text_v, text_v], dim=2)
 
         # Pack
         all_q, _ = pack([ts_q, text_q], "b h * d")
@@ -569,12 +642,38 @@ class MMLDMDiTModel(PreTrainedModel):
         )
 
         self.post_init()
+        self._reset_conditioning_init()
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
+
+    def _reset_conditioning_init(self):
+        """Restore DiT-style stable init after HF ``post_init`` recursion."""
+        for module in self.modules():
+            if isinstance(module, AdaptiveLayerNorm) and module.has_cond:
+                cond_linear = module.to_cond[-1]
+                dim = cond_linear.out_features // 2
+                nn.init.zeros_(cond_linear.weight)
+                nn.init.constant_(cond_linear.bias[:dim], 1.0)
+                nn.init.zeros_(cond_linear.bias[dim:])
+
+        for block in self.blocks:
+            for gate in (
+                block.ts_post_attn_gamma[-1],
+                block.text_post_attn_gamma[-1],
+                block.ts_post_ff_gamma[-1],
+                block.text_post_ff_gamma[-1],
+            ):
+                nn.init.zeros_(gate.weight)
+                nn.init.zeros_(gate.bias)
+
+        nn.init.zeros_(self.ts_out.proj.weight)
+        nn.init.zeros_(self.ts_out.proj.bias)
+        nn.init.zeros_(self.text_out.proj.weight)
+        nn.init.zeros_(self.text_out.proj.bias)
 
     def forward(
         self,
@@ -586,6 +685,7 @@ class MMLDMDiTModel(PreTrainedModel):
         attn_mask: Optional[torch.Tensor] = None,
         prefix_kv: Optional[PrefixKVCache] = None,
         pos_offset: int = 0,
+        text_timestep: Optional[Union[int, float, torch.IntTensor, torch.FloatTensor]] = None,
     ) -> MMLDMDiTOutput:
         """NA-form forward pass.
 
@@ -605,31 +705,19 @@ class MMLDMDiTModel(PreTrainedModel):
         text, text_shape_patched, text_shape_before = self.text_in(text, text_shape)
 
         # Per-modality timestep embeddings.
-        # TS: per-token timesteps  |  Text: global (mean) timestep
-        if not torch.is_tensor(timestep):
-            timestep = torch.tensor([timestep], device=ts.device, dtype=ts.dtype)
-        if timestep.ndim == 0:
-            timestep = timestep[None]
+        ts_t_expanded = _expand_ts_timestep(
+            timestep, ts_shape_patched, device=ts.device, dtype=ts.dtype,
+        )
+        text_t_source = timestep if text_timestep is None else text_timestep
+        text_t_expanded = _expand_text_timestep(
+            text_t_source,
+            ts_shape_patched,
+            text_shape_patched,
+            device=ts.device,
+            dtype=ts.dtype,
+        )
 
-        if timestep.numel() > 1 and ts_shape_patched.shape[0] > 1:
-            # Multi-sample: extract per-sample timesteps and expand for text
-            cum_lens = torch.cat([
-                torch.zeros(1, dtype=torch.long, device=ts.device),
-                ts_shape_patched.flatten().cumsum(0),
-            ])
-            t_per_sample = torch.stack([
-                timestep[cum_lens[i]] for i in range(ts_shape_patched.shape[0])
-            ])
-            text_t_expanded = torch.repeat_interleave(
-                t_per_sample, text_shape_patched.flatten(),
-            )
-        else:
-            t_per_sample = timestep
-            text_t_expanded = timestep.mean().expand(
-                int(text_shape_patched.sum().item()),
-            )
-
-        ts_emb = self.emb_in(timestep, device=ts.device, dtype=ts.dtype)         # (L_ts, emb_dim)
+        ts_emb = self.emb_in(ts_t_expanded, device=ts.device, dtype=ts.dtype)      # (L_ts, emb_dim)
         text_emb = self.emb_in(text_t_expanded, device=ts.device, dtype=ts.dtype)  # (L_text, emb_dim)
 
         # Build mask if not provided — multimodal [ts; text] joint layout
@@ -691,6 +779,7 @@ class MMLDMDiTModel(PreTrainedModel):
         text_shape: torch.LongTensor,
         timestep: Union[float, torch.FloatTensor],
         attn_mask: Optional[torch.Tensor] = None,
+        text_timestep: Optional[Union[int, float, torch.IntTensor, torch.FloatTensor]] = None,
     ) -> PrefixKVCache:
         """Compute and cache KV for prefix tokens (inference only)."""
         # Patch embed
@@ -698,13 +787,18 @@ class MMLDMDiTModel(PreTrainedModel):
         text, text_shape_patched, text_shape_before = self.text_in(text, text_shape)
 
         # Timestep embeddings
-        if not torch.is_tensor(timestep):
-            timestep = torch.tensor([timestep], device=ts.device, dtype=ts.dtype)
-        if timestep.ndim == 0:
-            timestep = timestep[None]
-
-        text_t_expanded = timestep.mean().expand(int(text_shape_patched.sum().item()))
-        ts_emb = self.emb_in(timestep, device=ts.device, dtype=ts.dtype)
+        ts_t_expanded = _expand_ts_timestep(
+            timestep, ts_shape_patched, device=ts.device, dtype=ts.dtype,
+        )
+        text_t_source = timestep if text_timestep is None else text_timestep
+        text_t_expanded = _expand_text_timestep(
+            text_t_source,
+            ts_shape_patched,
+            text_shape_patched,
+            device=ts.device,
+            dtype=ts.dtype,
+        )
+        ts_emb = self.emb_in(ts_t_expanded, device=ts.device, dtype=ts.dtype)
         text_emb = self.emb_in(text_t_expanded, device=ts.device, dtype=ts.dtype)
 
         # Build mask if not provided

@@ -469,8 +469,8 @@ def main():
                 [[z.shape[0]] for z in z_list], dtype=torch.long, device=device
             )
 
-            # Text latent comes from frozen VAE text encoder (already in latent_dim)
-            text_latent = enc_output.text_latents  # (B, latent_dim)
+            # Text latent: use clean text-only encoder (no TS leakage through joint blocks)
+            text_latent = vae.encode_text_condition(text_emb)  # (B, latent_dim)
 
             # CFG training: randomly drop text condition per sample
             if args.cfg_drop_prob > 0:
@@ -606,7 +606,7 @@ def main():
                 ts_shape_v = torch.tensor(
                     [[z.shape[0]] for z in z_list], dtype=torch.long, device=device,
                 )
-                text_latent_v = enc_output_v.text_latents
+                text_latent_v = vae.encode_text_condition(text_emb)
                 text_shape_v = torch.tensor([[1]] * B_v, dtype=torch.long, device=device)
                 t_v = torch.rand(B_v, device=device)
                 t_pt_v = expand_timesteps_per_token(t_v, ts_shape_v)
