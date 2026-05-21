@@ -50,7 +50,7 @@ from .attention_utils import create_multimodal_joint_mask
 from .configuration_mmldm import MMLDMDiTConfig, MMLDMVAEConfig
 from .data.tsfragment_dataset import CollateFn, TSFragmentDataset
 from .evaluation import evaluate_multi, evaluate_single, save_results
-from .modeling_mmldm_dit import MMLDMDiTModel
+from .modeling_mmldm_dit import MMLDMDiTModel, PrefixKVCache
 from .modeling_mmldm_vae import MMLDMVAEModel
 from .semantic_router import SemanticRouter
 
@@ -82,23 +82,11 @@ def euler_ode_step(
     T: float,
     attn_mask: Optional[torch.Tensor] = None,
     guidance_scale: float = 1.0,
+    prefix_kv: Optional[PrefixKVCache] = None,
+    prefix_kv_uncond: Optional[PrefixKVCache] = None,
+    pos_offset: int = 0,
 ) -> torch.Tensor:
-    """Single Euler ODE step with optional CFG.
-
-    Args:
-        z_t: current noisy latent ``(L_total, latent_dim)``.
-        text_latent: text conditioning latent ``(L_text, latent_dim)``.
-        ts_shape: ``(B, 1)`` per-sample TS lengths.
-        text_shape: ``(B, 1)`` per-sample text lengths.
-        t_curr: current timestep.
-        t_next: next timestep.
-        T: total diffusion time.
-        attn_mask: multimodal joint attention mask.
-        guidance_scale: CFG scale (1.0 = no guidance).
-
-    Returns:
-        Updated latent ``z_{t-dt}``.
-    """
+    """Single Euler ODE step with optional CFG and KV cache."""
     device = z_t.device
     dtype = z_t.dtype
     L_total = z_t.shape[0]
@@ -110,6 +98,7 @@ def euler_ode_step(
         ts=z_t, text=text_latent,
         ts_shape=ts_shape, text_shape=text_shape,
         timestep=t_batch, attn_mask=attn_mask,
+        prefix_kv=prefix_kv, pos_offset=pos_offset,
     )
     v_cond = output_cond.ts_sample
 
@@ -121,6 +110,7 @@ def euler_ode_step(
             ts=z_t, text=empty_text,
             ts_shape=ts_shape, text_shape=empty_text_shape,
             timestep=t_batch, attn_mask=attn_mask,
+            prefix_kv=prefix_kv_uncond, pos_offset=pos_offset,
         )
         v_uncond = output_uncond.ts_sample
         v = guidance_scale * (v_cond - v_uncond) + v_uncond
@@ -196,54 +186,89 @@ def generate_latent_blocks(
         block_sizes = [block_size] * n_blocks
 
     generated_blocks: list[torch.Tensor] = []
+    prefix_kv_cond: Optional[PrefixKVCache] = None
+    prefix_kv_uncond: Optional[PrefixKVCache] = None
+    L_text = int(text_shape.sum().item())
 
     for b, curr_block_len in enumerate(block_sizes):
         eps = torch.randn(curr_block_len, latent_dim, device=device, dtype=dtype)
         z_block = eps.clone()
 
-        # K-length: prefix + current block
         prefix_len = sum(x.shape[0] for x in generated_blocks)
         total_len_k = prefix_len + curr_block_len
 
-        ts_shape_k = _shape_tensor([total_len_k], device)
-
-        # Block sizes up to and including current block
-        full_block_sizes = block_sizes[: b + 1]
-
-        # Multimodal joint mask: [ts(=total_len_k) ; text(=L_text)]
-        attn_mask = create_multimodal_joint_mask(
-            ts_shape=ts_shape_k,
+        # Build full mask for [prefix + current_block ; text] K-side layout.
+        # Then slice Q-side rows to only include [current_block ; text].
+        ts_shape_full = _shape_tensor([total_len_k], device)
+        full_attn_mask = create_multimodal_joint_mask(
+            ts_shape=ts_shape_full,
             text_shape=text_shape,
-            block_sizes=[full_block_sizes],
+            block_sizes=[block_sizes[: b + 1]],
             dtype=dtype,
             device=device,
         )
+        # Slice Q rows: current TS block rows + all text rows
+        row_indices = torch.cat([
+            torch.arange(prefix_len, total_len_k, device=device),
+            torch.arange(total_len_k, total_len_k + L_text, device=device),
+        ])
+        attn_mask = full_attn_mask[:, :, row_indices, :]
 
-        # Concatenate prefix + current block
-        z_full = torch.cat(generated_blocks + [z_block], dim=0) if generated_blocks else z_block
+        if prefix_len > 0 and prefix_kv_cond is not None:
+            # KV cache path: only pass current block; prefix is in KV cache
+            ts_shape_curr = _shape_tensor([curr_block_len], device)
 
-        # Euler integration from t=T to t=0
-        for t_curr, t_next in zip(timesteps[:-1], timesteps[1:]):
-            z_full = euler_ode_step(
-                dit=dit,
-                z_t=z_full,
-                text_latent=text_latent,
-                ts_shape=ts_shape_k,
-                text_shape=text_shape,
-                t_curr=t_curr.item(),
-                t_next=t_next.item(),
-                T=T,
-                attn_mask=attn_mask,
-                guidance_scale=guidance_scale,
-            )
-            # Repaint: pin prefix blocks to their cleaned values
-            if generated_blocks:
-                prefix = torch.cat(generated_blocks, dim=0)
-                z_full = torch.cat([prefix, z_full[prefix_len:]], dim=0)
+            for t_curr, t_next in zip(timesteps[:-1], timesteps[1:]):
+                z_block = euler_ode_step(
+                    dit=dit,
+                    z_t=z_block,
+                    text_latent=text_latent,
+                    ts_shape=ts_shape_curr,
+                    text_shape=text_shape,
+                    t_curr=t_curr.item(),
+                    t_next=t_next.item(),
+                    T=T,
+                    attn_mask=attn_mask,
+                    guidance_scale=guidance_scale,
+                    prefix_kv=prefix_kv_cond,
+                    prefix_kv_uncond=prefix_kv_uncond,
+                    pos_offset=prefix_len,
+                )
+            z_clean = z_block
+        else:
+            # First block (no prefix): full forward pass
+            for t_curr, t_next in zip(timesteps[:-1], timesteps[1:]):
+                z_block = euler_ode_step(
+                    dit=dit,
+                    z_t=z_block,
+                    text_latent=text_latent,
+                    ts_shape=ts_shape_full,
+                    text_shape=text_shape,
+                    t_curr=t_curr.item(),
+                    t_next=t_next.item(),
+                    T=T,
+                    attn_mask=attn_mask,
+                    guidance_scale=guidance_scale,
+                )
+            z_clean = z_block
 
-        # Extract the just-denoised block
-        z_clean = z_full[-curr_block_len:]
         generated_blocks.append(z_clean)
+
+        # Compute prefix KV cache for the next block
+        prefix_all = torch.cat(generated_blocks, dim=0)
+        prefix_ts_shape = _shape_tensor([prefix_all.shape[0]], device)
+        prefix_kv_cond = dit.compute_prefix_kv(
+            ts=prefix_all, text=text_latent,
+            ts_shape=prefix_ts_shape, text_shape=text_shape,
+            timestep=0.0,
+        )
+        if guidance_scale > 1.0:
+            empty_text = torch.zeros_like(text_latent)
+            prefix_kv_uncond = dit.compute_prefix_kv(
+                ts=prefix_all, text=empty_text,
+                ts_shape=prefix_ts_shape, text_shape=text_shape,
+                timestep=0.0,
+            )
 
     return torch.cat(generated_blocks, dim=0)
 

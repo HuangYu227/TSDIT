@@ -28,7 +28,7 @@ Stage 2 training minimizes::
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Union
 
 import torch
@@ -264,15 +264,11 @@ class MultimodalJointAttention(nn.Module):
         # RoPE (simplified sinusoidal)
         self._rope_cache: Optional[torch.Tensor] = None
 
-    def _get_rope_freqs(self, seq_len: int, device: torch.device, dtype: torch.dtype):
-        if self._rope_cache is not None and self._rope_cache.shape[0] >= seq_len:
-            return self._rope_cache[:seq_len]
+    def _get_rope_freqs(self, seq_len: int, device: torch.device, dtype: torch.dtype, pos_offset: int = 0):
         half_dim = self.rope_dim // 2
         inv_freq = 1.0 / (10000 ** (torch.arange(0, half_dim, device=device).float() / half_dim))
-        t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
-        freqs = torch.outer(t, inv_freq)  # (L, rope_dim//2)
-        self._rope_cache = freqs
-        return freqs
+        t = torch.arange(pos_offset, pos_offset + seq_len, device=device, dtype=inv_freq.dtype)
+        return torch.outer(t, inv_freq)  # (L, rope_dim//2)
 
     def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         """Apply rotary embedding to first ``rope_dim`` channels."""
@@ -294,7 +290,10 @@ class MultimodalJointAttention(nn.Module):
         ts_tokens: torch.Tensor,
         text_tokens: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        prefix_kv: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        pos_offset: int = 0,
+        return_kv: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         B = ts_tokens.shape[0]
         L_ts = ts_tokens.shape[1]
         L_text = text_tokens.shape[1]
@@ -316,16 +315,26 @@ class MultimodalJointAttention(nn.Module):
         text_q = self.text_q_norm(text_q)
         text_k = self.text_k_norm(text_k)
 
-        # Apply RoPE to TS only — text tokens are global conditions,
-        # not a temporal sequence, so they carry no relative position.
-        ts_freqs = self._get_rope_freqs(L_ts, ts_q.device, ts_q.dtype)
+        # Apply RoPE to TS only
+        ts_freqs = self._get_rope_freqs(L_ts, ts_q.device, ts_q.dtype, pos_offset=pos_offset)
         ts_q = self._apply_rope(ts_q, ts_freqs)
         ts_k = self._apply_rope(ts_k, ts_freqs)
+
+        # Concatenate prefix KV if provided
+        if prefix_kv is not None:
+            pre_ts_k, pre_ts_v, pre_text_k, pre_text_v = prefix_kv
+            ts_k = torch.cat([pre_ts_k, ts_k], dim=2)
+            ts_v = torch.cat([pre_ts_v, ts_v], dim=2)
+            text_k = torch.cat([pre_text_k, text_k], dim=2)
+            text_v = torch.cat([pre_text_v, text_v], dim=2)
 
         # Pack
         all_q, _ = pack([ts_q, text_q], "b h * d")
         all_k, _ = pack([ts_k, text_k], "b h * d")
-        all_v, packed_shape = pack([ts_v, text_v], "b h * d")
+        all_v, packed_shape_kv = pack([ts_v, text_v], "b h * d")
+
+        # For unpacking output: q has (L_ts + L_text) tokens, kv may have more
+        packed_shape_q = ([L_ts], [L_text])
 
         # Attention
         d_head = all_q.shape[-1]
@@ -339,12 +348,17 @@ class MultimodalJointAttention(nn.Module):
         # Merge heads
         outs = outs.transpose(1, 2).reshape(B, L_ts + L_text, -1)
 
-        # Unpack
-        ts_out, text_out = unpack(outs, packed_shape, "b * d")
+        # Unpack — use q shape since output matches query length
+        ts_out, text_out = unpack(outs, packed_shape_q, "b * d")
 
         # Output projection
         ts_out = self.ts_to_out(ts_out)
         text_out = self.text_to_out(text_out)
+
+        if return_kv:
+            # Return current KV (without prefix) for caching
+            current_kv = (ts_k[:, :, -L_ts:], ts_v[:, :, -L_ts:], text_k[:, :, -L_text:], text_v[:, :, -L_text:])
+            return ts_out, text_out, current_kv
 
         return ts_out, text_out
 
@@ -421,15 +435,25 @@ class MultimodalDiTBlock(nn.Module):
         ts_emb: torch.Tensor,
         text_emb: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        prefix_kv: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        pos_offset: int = 0,
+        return_kv: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, tuple]:
 
         # Attention branch
         ts_normed = self.ts_attn_norm(ts_tokens, cond=ts_emb)
         text_normed = self.text_attn_norm(text_tokens, cond=text_emb)
 
-        ts_attn_out, text_attn_out = self.joint_attn(
-            ts_normed, text_normed, attn_mask=attn_mask
-        )
+        if return_kv:
+            ts_attn_out, text_attn_out, kv = self.joint_attn(
+                ts_normed, text_normed, attn_mask=attn_mask,
+                prefix_kv=prefix_kv, pos_offset=pos_offset, return_kv=True,
+            )
+        else:
+            ts_attn_out, text_attn_out = self.joint_attn(
+                ts_normed, text_normed, attn_mask=attn_mask,
+                prefix_kv=prefix_kv, pos_offset=pos_offset,
+            )
 
         # Post-attn gamma + residual
         ts_attn_out = ts_attn_out * self.ts_post_attn_gamma(ts_emb)
@@ -449,6 +473,8 @@ class MultimodalDiTBlock(nn.Module):
         ts_tokens = ts_tokens + ts_ff
         text_tokens = text_tokens + text_ff
 
+        if return_kv:
+            return ts_tokens, text_tokens, kv
         return ts_tokens, text_tokens
 
 
@@ -461,6 +487,14 @@ class MultimodalDiTBlock(nn.Module):
 class MMLDMDiTOutput:
     ts_sample: torch.Tensor
     text_sample: torch.Tensor
+
+
+@dataclass
+class PrefixKVCache:
+    """Cached KV pairs from prefix blocks for inference acceleration."""
+    # List of (ts_k, ts_v, text_k, text_v) per layer
+    layers: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = field(default_factory=list)
+    n_prefix_ts: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +584,8 @@ class MMLDMDiTModel(PreTrainedModel):
         text_shape: torch.LongTensor,
         timestep: Union[int, float, torch.IntTensor, torch.FloatTensor],
         attn_mask: Optional[torch.Tensor] = None,
+        prefix_kv: Optional[PrefixKVCache] = None,
+        pos_offset: int = 0,
     ) -> MMLDMDiTOutput:
         """NA-form forward pass.
 
@@ -626,12 +662,15 @@ class MMLDMDiTModel(PreTrainedModel):
         text_emb = text_emb.unsqueeze(0)  # (1, 1, emb_dim)
 
         # DiT blocks
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
+            layer_prefix_kv = prefix_kv.layers[i] if prefix_kv is not None and i < len(prefix_kv.layers) else None
             ts, text = block(
                 ts, text,
                 ts_emb=ts_emb,
                 text_emb=text_emb,
                 attn_mask=attn_mask,
+                prefix_kv=layer_prefix_kv,
+                pos_offset=pos_offset,
             )
 
         # Output norm + unpatch
@@ -642,6 +681,70 @@ class MMLDMDiTModel(PreTrainedModel):
         text, _ = self.text_out(text, text_shape_patched, text_shape_before)
 
         return MMLDMDiTOutput(ts_sample=ts, text_sample=text)
+
+    @torch.no_grad()
+    def compute_prefix_kv(
+        self,
+        ts: torch.FloatTensor,
+        text: torch.FloatTensor,
+        ts_shape: torch.LongTensor,
+        text_shape: torch.LongTensor,
+        timestep: Union[float, torch.FloatTensor],
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> PrefixKVCache:
+        """Compute and cache KV for prefix tokens (inference only)."""
+        # Patch embed
+        ts, ts_shape_patched, ts_shape_before = self.ts_in(ts, ts_shape)
+        text, text_shape_patched, text_shape_before = self.text_in(text, text_shape)
+
+        # Timestep embeddings
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], device=ts.device, dtype=ts.dtype)
+        if timestep.ndim == 0:
+            timestep = timestep[None]
+
+        text_t_expanded = timestep.mean().expand(int(text_shape_patched.sum().item()))
+        ts_emb = self.emb_in(timestep, device=ts.device, dtype=ts.dtype)
+        text_emb = self.emb_in(text_t_expanded, device=ts.device, dtype=ts.dtype)
+
+        # Build mask if not provided
+        if attn_mask is None:
+            lengths = ts_shape_patched.flatten().tolist()
+            block_sizes_fallback = []
+            for l in lengths:
+                n_full = l // self.block_size
+                sizes = [self.block_size] * n_full
+                remainder = l - n_full * self.block_size
+                if remainder > 0:
+                    sizes.append(remainder)
+                block_sizes_fallback.append(sizes if sizes else [l])
+            attn_mask = create_multimodal_joint_mask(
+                ts_shape=ts_shape_patched,
+                text_shape=text_shape_patched,
+                block_sizes=block_sizes_fallback,
+                dtype=torch.bfloat16 if ts.is_cuda else ts.dtype,
+                device=ts.device,
+            )
+
+        ts = ts.unsqueeze(0)
+        text = text.unsqueeze(0)
+        ts_emb = ts_emb.unsqueeze(0)
+        text_emb = text_emb.unsqueeze(0)
+
+        # Run all blocks, collecting KV from each
+        cache = PrefixKVCache()
+        for block in self.blocks:
+            ts, text, kv = block(
+                ts, text,
+                ts_emb=ts_emb,
+                text_emb=text_emb,
+                attn_mask=attn_mask,
+                return_kv=True,
+            )
+            cache.layers.append(kv)
+
+        cache.n_prefix_ts = int(ts_shape_patched.sum().item())
+        return cache
 
 
 # Register
