@@ -4,8 +4,8 @@ Framework Design Document (PR)
 ================================================================================
 
 Author: [Your Name]
-Date: 2026-05-19
-Version: 1.1 (加入 Adaptive Semantic Patching)
+Date: 2026-05-21
+Version: 1.2 (修复信息泄漏 + DiT Read-Only Text + KV Cache 推理加速)
 
 ================================================================================
 目录
@@ -20,8 +20,9 @@ Version: 1.1 (加入 Adaptive Semantic Patching)
     4.3 Text Encoder
     4.4 JointEncoder (MMDiT-style)
     4.5 DiagonalGaussianDistribution
-    4.6 Block-Causal Decoder
-    4.7 损失函数
+    4.6 纯文本条件编码路径 (v1.2 新增)
+    4.7 Block-Causal Decoder
+    4.8 损失函数
 5.  Stage 2: 多模态 DiT 先验 + DCD
     5.1 整体架构
     5.2 Multimodal DiT Block
@@ -86,6 +87,19 @@ MMLDM: Multimodal Latent Diffusion Model
   - 高频变化期（如"剧烈波动"）分配更密集的 latent token 交互
   - 平稳期分配更稀疏的交互，降低冗余计算
   - "即插即用"机制，不改变训练损失，仅改变注意力掩码和 block 分割
+
+创新点 5: DiT Read-Only Text 注意力 (v1.2 新增)
+  - 标准 MMDiT 中 text 和 TS 双向注意力，但 block-causal 场景下
+    text tokens 会成为多层中转通道，绕过 TS side 的因果约束
+  - DiT 中禁止 Text→TS 方向：text tokens 只能 attend 到其他 text tokens
+  - TS→Text 保持允许：TS tokens 可以读取文本条件
+  - 消除多层 relay leakage，保证训练时信息集与推理时一致
+
+创新点 6: 条件编码路径分离 (v1.2 新增)
+  - VAE 的 encode() 输出 text_latents 走 joint encoder，包含 TS 信息
+  - Stage 2 训练时若使用该 text_latents 作为条件，等价于数据泄漏
+  - 新增 encode_text_condition() 纯文本编码路径，绕过 joint encoder
+  - DiT 条件信号仅包含文本信息，不含 ground truth TS
 
 1.4 技术来源
 ------------
@@ -297,7 +311,17 @@ Stage 1 的目标是学习一个共享的多模态潜空间。输入时间序列
 采样：
   z_0 = mean + std · ε,  ε ~ N(0, I)
 
-4.6 Block-Causal Decoder
+4.6 纯文本条件编码路径 (v1.2 新增)
+-------------------------------------
+
+  encode_text_condition(text_emb):
+    text_emb → Text_proj → Text_blocks → text_latent
+
+  此路径绕过 JointEncoder，输出纯文本 latent，不含 TS 信息。
+  用于 Stage 2 训练时作为 DiT 的条件输入，避免数据泄漏。
+  VAE 内部的 encode() 仍使用 JointEncoder 做联合编码（用于重建）。
+
+4.7 Block-Causal Decoder
 -------------------------
 
 从潜空间 z_0 重建时间序列。
@@ -402,10 +426,11 @@ Stage 2 的目标是在 Stage 1 学到的共享潜空间上训练扩散先验 p_
   │  └──────────────────────┬──────────────────────────────┘   │
   │                         ↓                                  │
   │  ┌─────────────────────────────────────────────────────┐   │
-  │  │ JointAttention (MMDiT-style)                        │   │
+  │  │ JointAttention (Read-Only Text)                     │   │
   │  │ Q = [Q_ts; Q_text], K = [K_ts; K_text]             │   │
   │  │ V = [V_ts; V_text]                                  │   │
-  │  │ Out = softmax(Q·K^T/√d) · V                        │   │
+  │  │ Mask: Text→TS blocked, TS→Text allowed              │   │
+  │  │ Out = softmax(Q·K^T/√d + mask) · V                 │   │
   │  │ → 分割为 Out_ts, Out_text                           │   │
   │  └──────────────────────┬──────────────────────────────┘   │
   │                         ↓                                  │
@@ -529,10 +554,16 @@ block 大小确定后，动态构建注意力掩码：
   修改: 接受变长 block sizes [b_1, b_2, ..., b_B] 代替固定 block_size
 
   注意力规则（与固定分块相同）：
-    左侧 block 的 token 之间: 双向注意力
-    当前 block 的 token 之间: 双向注意力
-    左侧 → 当前: 因果（可以看到）
-    当前 → 左侧: 不可见
+    TS side:
+      左侧 block 的 token 之间: 双向注意力
+      当前 block 的 token 之间: 双向注意力
+      左侧 → 当前: 因果（可以看到）
+      当前 → 左侧: 不可见
+    Cross-modal:
+      TS → Text: 允许（TS tokens 可以读取文本条件）
+      Text → TS: 禁止（Read-Only Text，防止多层 relay 泄漏）
+    Text side:
+      Text ↔ Text: 双向注意力（同一样本内）
 
   区别: 每个 block 的大小 b_b 是动态的，掩码矩阵的分块边界随之变化
 
@@ -713,8 +744,8 @@ Stage 2 的总损失：
 
   z^pre = Encoder(c)                    # 文本条件编码为 prefix latent
 
-6.2 Block-by-Block 去噪
--------------------------
+6.2 Block-by-Block 去噪（含 KV Cache 加速）
+---------------------------------------------
 
 对于 b = 1, 2, ..., B：
 
@@ -722,11 +753,21 @@ Stage 2 的总损失：
 
   2. 对于 t = T, T-Δ, ..., 0:
      a. 构建可见集: V_b = { sg(z^pre), sg(z_0^{(<b)}), z_t^(b) }
-     b. DiT 前向: v_ψ = f_ψ(z_t^(b), t; V_b, c)
-     c. Euler 更新: z_{t-Δ}^(b) = z_t^(b) - Δ/T · v_ψ
+     b. 构建 Read-Only Text 掩码: Text→TS 禁止
+     c. 若 b > 1，加载 prefix KV cache（前 b-1 个 block 的 TS KV）
+     d. DiT 前向: v_ψ = f_ψ(z_t^(b), t; V_b, c, prefix_kv)
+     e. Euler 更新: z_{t-Δ}^(b) = z_t^(b) - Δ/T · v_ψ
 
   3. 得到干净 block: z_0^(b)
-  4. 更新 KV cache: 将 z_0^(b) 写入历史
+  4. 计算 prefix KV: prefix_kv^(b) = compute_prefix_kv(z_0^{(1:b)})
+     - 仅缓存 TS side 的 K, V（text KV 被丢弃）
+     - prefix KV 在所有 ODE 步骤间复用，无需每步重新计算
+
+  KV Cache 优化细节:
+  - PrefixKVCache 存储每层 (ts_k, ts_v) 共 2 个张量（非 4 个）
+  - 推理时先构建完整 [prefix+current; text] 掩码，再裁剪 Q-side 行
+  - RoPE 通过 pos_offset 参数确保绝对位置正确
+  - 优势: prefix blocks 的 K, V 固定不变，无需在每个 ODE 步重复计算
 
 6.3 解码
 ---------
@@ -842,8 +883,8 @@ mmldm/
 │   ├── AlignmentProjector          # 文本→latent 对齐
 │   └── BlockAllocator              # 自适应 block 分配
 ├── attention_utils.py              # 注意力掩码工具
-│   ├── create_na_block_causal_mask (固定 block)
-│   └── create_adaptive_block_causal_mask (变长 block) ← 新增
+│   ├── create_multimodal_joint_mask (VAE 用，双向)
+│   └── create_dit_readonly_text_mask (DiT 用，Text→TS 禁止) ← v1.2
 ├── training_stage1.py              # Stage 1 训练脚本
 ├── training_stage2.py              # Stage 2 训练脚本 (含 DCD)
 ├── inference.py                    # 推理脚本

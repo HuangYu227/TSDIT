@@ -46,7 +46,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .attention_utils import create_dit_readonly_text_mask, create_multimodal_joint_mask
+from .attention_utils import create_dit_readonly_text_mask
 from .configuration_mmldm import MMLDMDiTConfig, MMLDMVAEConfig
 from .data.tsfragment_dataset import CollateFn, TSFragmentDataset
 from .evaluation import evaluate_multi, evaluate_single, save_results
@@ -387,26 +387,7 @@ def generate_timeseries(
         z = z_generated
 
     z_shape = _shape_tensor([z.shape[0]], device)
-
-    # Build decoder mask (TS-only, no text)
-    text_shape_zero = _shape_tensor([0], device)
-    n_full = z.shape[0] // block_size
-    dec_block_sizes = [block_size] * n_full
-    remainder = z.shape[0] - n_full * block_size
-    if remainder > 0:
-        dec_block_sizes.append(remainder)
-    if not dec_block_sizes:
-        dec_block_sizes = [z.shape[0]]
-
-    attn_mask = create_multimodal_joint_mask(
-        ts_shape=z_shape,
-        text_shape=text_shape_zero,
-        block_sizes=[dec_block_sizes],
-        dtype=z.dtype,
-        device=device,
-    )
-
-    recon = vae.decode(z, z_shape, z_shape, attn_mask=attn_mask)
+    recon = vae.decode(z, z_shape)
     ts_out = recon[:, :output_len, :]
 
     return ts_out
@@ -477,7 +458,7 @@ def main():
     parser.add_argument("--dit_checkpoint", type=str, required=True)
     parser.add_argument("--vae_checkpoint", type=str, required=True)
     parser.add_argument("--output_len", type=int, default=96)
-    parser.add_argument("--block_size", type=int, default=4)
+    parser.add_argument("--block_size", type=int, default=8)
     parser.add_argument("--T", type=float, default=1.0)
     parser.add_argument("--timestep_num", type=int, default=20)
     parser.add_argument("--guidance_scale", type=float, default=2.0)

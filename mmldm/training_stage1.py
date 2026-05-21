@@ -12,16 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Stage 1 training: Multimodal VAE pretraining.
+"""Stage 1 training: VAE pretraining with Conv1d encoder/decoder.
 
 Trains the MMLDM VAE with the objective::
 
-    L_VAE = L_recon + beta * KL + lambda_mask * L_mask
+    L_VAE = L_recon + beta * KL
 
 where:
 - L_recon: reconstruction loss (MSE for time series)
 - KL: KL divergence of the posterior against N(0, I)
-- L_mask: latent consistency loss (masked encoding ≈ full encoding)
+- beta: KL weight, annealed from kl_anneal_start → kl_anneal_end
 
 Usage:
     python -m mmldm.training_stage1 --data_dir ./data --epochs 10
@@ -57,6 +57,26 @@ def set_seed(seed: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# KL annealing
+# ---------------------------------------------------------------------------
+
+
+def get_kl_beta(
+    epoch: int,
+    kl_anneal_epochs: int,
+    kl_anneal_start: float,
+    kl_anneal_end: float,
+) -> float:
+    """Linear KL weight schedule from anneal_start to anneal_end."""
+    if kl_anneal_epochs <= 0:
+        return kl_anneal_end
+    if epoch >= kl_anneal_epochs:
+        return kl_anneal_end
+    progress = epoch / kl_anneal_epochs
+    return kl_anneal_start + (kl_anneal_end - kl_anneal_start) * progress
+
+
+# ---------------------------------------------------------------------------
 # Loss functions
 # ---------------------------------------------------------------------------
 
@@ -67,48 +87,11 @@ def compute_recon_loss(recon: torch.Tensor, target: torch.Tensor) -> torch.Tenso
 
 
 def compute_kl_loss(latent_dists: list) -> torch.Tensor:
-    """KL divergence against N(0, I)."""
+    """KL divergence against N(0, I), averaged over samples."""
     kl = 0.0
     for dist in latent_dists:
         kl = kl + dist.kl()
     return kl / len(latent_dists)
-
-
-def compute_mask_loss(
-    model: MMLDMVAEModel,
-    ot_list: list[torch.Tensor],
-    text_embs: torch.Tensor,
-    mask_ratio: float = 0.3,
-) -> torch.Tensor:
-    """Masked reconstruction loss: reconstruct masked time-domain positions.
-
-    Randomly masks a portion of the time series, encodes the masked
-    version, decodes, and penalizes only at masked positions.
-    """
-    masked_ot_list = []
-    masks_list = []
-    for ot in ot_list:
-        keep = torch.rand(ot.shape[0], device=ot.device) > mask_ratio  # True = keep
-        masked = ot.clone()
-        masked[~keep] = 0.0
-        masked_ot_list.append(masked)
-        masks_list.append(~keep)  # True = masked (need to predict)
-
-    enc_out = model.encode(masked_ot_list, text_embs)
-    z_sampled = torch.cat([d.sample() for d in enc_out.latent_dists], dim=0)
-
-    txt_shape = torch.tensor(
-        [[z.shape[0]] for z in masked_ot_list], dtype=torch.long, device=z_sampled.device,
-    )
-    recon = model.decode(z_sampled, txt_shape, txt_shape, attn_mask=None)
-
-    target_flat = torch.cat(ot_list, dim=0)
-    recon_flat = recon.squeeze(0)[: target_flat.shape[0]]
-    global_mask = torch.cat(masks_list, dim=0).unsqueeze(-1)  # (L_total, 1)
-
-    if global_mask.sum() == 0:
-        return torch.tensor(0.0, device=z_sampled.device, requires_grad=True)
-    return F.mse_loss(recon_flat[global_mask], target_flat[global_mask])
 
 
 # ---------------------------------------------------------------------------
@@ -119,36 +102,32 @@ def compute_mask_loss(
 def train_step(
     model: MMLDMVAEModel,
     batch: dict,
-    beta: float = 1e-3,
-    lambda_mask: float = 0.1,
+    beta: float = 1e-6,
     device: torch.device = torch.device("cpu"),
 ) -> dict:
     """Single training step.
 
-    Returns dict of losses: ``total``, ``recon``, ``kl``, ``mask``.
+    Returns dict of losses: total, recon, kl.
     """
     ot = batch["ot"].to(device)
-    text_emb = batch["text_embedding"].to(device)
     ot_lengths = batch["ot_lengths"]
 
     ot_list = [ot[i, :ot_lengths[i]] for i in range(ot.shape[0])]
 
-    output = model(ot_list, text_emb)
+    output = model(ot_list)
 
-    target = torch.cat(ot_list, dim=0).unsqueeze(0)  # (1, L_total, 1)
+    target = torch.cat(ot_list, dim=0).unsqueeze(0)  # (1, L_total, C)
     recon = output["recon"][:, : target.shape[1], :]
 
     l_recon = compute_recon_loss(recon, target)
     l_kl = compute_kl_loss(output["latent_dists"])
-    l_mask = compute_mask_loss(model, ot_list, text_emb)
 
-    total = l_recon + beta * l_kl + lambda_mask * l_mask
+    total = l_recon + beta * l_kl
 
     return {
         "total": total,
         "recon": l_recon,
         "kl": l_kl,
-        "mask": l_mask,
     }
 
 
@@ -166,15 +145,16 @@ def main():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--warmup_steps", type=int, default=100, help="LR warmup steps")
-    parser.add_argument("--beta", type=float, default=1e-3, help="KL weight")
-    parser.add_argument("--lambda_mask", type=float, default=0.1, help="Mask loss weight")
+    parser.add_argument("--kl_anneal_epochs", type=int, default=5, help="Epochs to anneal KL beta")
+    parser.add_argument("--kl_anneal_start", type=float, default=0.0, help="Initial KL beta")
+    parser.add_argument("--kl_anneal_end", type=float, default=1e-6, help="Final KL beta")
     parser.add_argument("--dim", type=int, default=128, help="Hidden dimension")
-    parser.add_argument("--latent_dim", type=int, default=16, help="Latent dimension")
+    parser.add_argument("--latent_dim", type=int, default=64, help="Latent dimension")
     parser.add_argument("--num_heads", type=int, default=4, help="Number of attention heads")
-    parser.add_argument("--encoder_blocks", type=int, default=4, help="Encoder blocks")
-    parser.add_argument("--decoder_blocks", type=int, default=4, help="Decoder blocks")
-    parser.add_argument("--joint_blocks", type=int, default=2, help="Joint encoder blocks")
-    parser.add_argument("--block_size", type=int, default=4, help="Block-causal block size")
+    parser.add_argument("--num_conv_layers", type=int, default=3, help="Conv1d residual layers")
+    parser.add_argument("--encoder_blocks", type=int, default=4, help="Encoder ConvResidualStack depth")
+    parser.add_argument("--decoder_blocks", type=int, default=4, help="Decoder ConvResidualStack depth")
+    parser.add_argument("--block_size", type=int, default=8, help="Block-causal block size (for Stage 2)")
     parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--max_samples", type=int, default=None, help="Max samples (debug)")
     parser.add_argument("--split_file", type=str, default=None, help="Path to splits.json for train/val split")
@@ -190,16 +170,18 @@ def main():
     # Build config
     config = MMLDMVAEConfig(
         ts_channels=1,
-        text_dim=128,
         dim=args.dim,
         ffn_dim=args.dim * 4,
         latent_dim=args.latent_dim,
         num_heads=args.num_heads,
         head_dim=args.dim // args.num_heads,
+        num_conv_layers=args.num_conv_layers,
         encoder_num_blocks=args.encoder_blocks,
         decoder_num_blocks=args.decoder_blocks,
-        joint_num_blocks=args.joint_blocks,
         block_size=args.block_size,
+        kl_anneal_start=args.kl_anneal_start,
+        kl_anneal_end=args.kl_anneal_end,
+        kl_anneal_epochs=args.kl_anneal_epochs,
     )
 
     # Build dataset with SampleID-level split
@@ -277,13 +259,19 @@ def main():
 
     for epoch in range(args.epochs):
         model.train()
-        epoch_losses = {"total": 0.0, "recon": 0.0, "kl": 0.0, "mask": 0.0}
+        epoch_losses = {"total": 0.0, "recon": 0.0, "kl": 0.0}
         t0 = time.time()
+
+        # KL annealing: compute beta for this epoch
+        beta = get_kl_beta(
+            epoch, args.kl_anneal_epochs,
+            args.kl_anneal_start, args.kl_anneal_end,
+        )
 
         optimizer.zero_grad()
 
         for step, batch in enumerate(train_loader):
-            losses = train_step(model, batch, beta=args.beta, lambda_mask=args.lambda_mask, device=device)
+            losses = train_step(model, batch, beta=beta, device=device)
 
             total = losses["total"] / args.grad_accum_steps
             total.backward()
@@ -293,8 +281,6 @@ def main():
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-            else:
-                grad_norm = torch.tensor(0.0)
 
             global_step += 1
 
@@ -306,7 +292,7 @@ def main():
                 print(
                     f"  Epoch {epoch+1} Step {step+1}/{len(train_loader)}: "
                     f"loss={avg['total']:.4f} recon={avg['recon']:.4f} "
-                    f"kl={avg['kl']:.6f} mask={avg['mask']:.4f} "
+                    f"kl={avg['kl']:.6f} beta={beta:.2e} "
                     f"lr={scheduler.get_last_lr()[0]:.2e}"
                 )
 
@@ -315,7 +301,7 @@ def main():
         print(
             f"Epoch {epoch+1}/{args.epochs} ({elapsed:.1f}s): "
             f"loss={avg['total']:.4f} recon={avg['recon']:.4f} "
-            f"kl={avg['kl']:.6f} mask={avg['mask']:.4f}"
+            f"kl={avg['kl']:.6f} beta={beta:.2e}"
         )
 
         # Validation
@@ -323,7 +309,7 @@ def main():
         val_loss = 0.0
         with torch.no_grad():
             for batch in val_loader:
-                losses = train_step(model, batch, beta=args.beta, lambda_mask=args.lambda_mask, device=device)
+                losses = train_step(model, batch, beta=beta, device=device)
                 val_loss += losses["total"].item()
         val_loss /= max(len(val_loader), 1)
         print(f"  Val loss: {val_loss:.4f}")

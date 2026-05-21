@@ -315,7 +315,7 @@ def main():
     parser.add_argument("--dit_dim", type=int, default=256, help="DiT hidden dimension")
     parser.add_argument("--dit_layers", type=int, default=12, help="DiT layers")
     parser.add_argument("--dit_heads", type=int, default=4, help="DiT heads")
-    parser.add_argument("--block_size", type=int, default=4, help="Default block size")
+    parser.add_argument("--block_size", type=int, default=8, help="Default block size")
     parser.add_argument("--use_adaptive_routing", action="store_true", help="Use semantic router")
     parser.add_argument("--cfg_drop_prob", type=float, default=0.1, help="CFG condition dropout prob")
     parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps")
@@ -461,7 +461,7 @@ def main():
 
             # Encode with VAE
             with torch.no_grad():
-                enc_output = vae.encode(ot_list, text_emb)
+                enc_output = vae.encode(ot_list)
                 z_list = [d.sample() for d in enc_output.latent_dists]
 
             z0 = torch.cat(z_list, dim=0)  # (L_total, latent_dim)
@@ -600,7 +600,7 @@ def main():
                 B_v = ot.shape[0]
                 ot_list = [ot[i, :ot_lengths[i]] for i in range(B_v)]
 
-                enc_output_v = vae.encode(ot_list, text_emb)
+                enc_output_v = vae.encode(ot_list)
                 z_list = [d.sample() for d in enc_output_v.latent_dists]
                 z0_v = torch.cat(z_list, dim=0)
                 ts_shape_v = torch.tensor(
