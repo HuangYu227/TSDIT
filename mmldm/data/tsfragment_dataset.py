@@ -157,13 +157,25 @@ class TSFragmentDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         s = self.samples[idx]
+        ot = s["ot"].copy()
+
+        # Z-normalization per sample
+        mean = ot.mean()
+        std = ot.std()
+        if std > 1e-8:
+            ot_norm = (ot - mean) / std
+        else:
+            ot_norm = ot - mean
+
         return {
             "sample_id": s["sample_id"],
             "dataset_name": s["dataset_name"],
             "time_interval": s["time_interval"],
             "text_str": s["text_str"],
             "text_embedding": torch.from_numpy(s["text_embedding"].copy()),
-            "ot": torch.from_numpy(s["ot"].copy()).unsqueeze(-1),  # (L, 1)
+            "ot": torch.from_numpy(ot_norm).unsqueeze(-1),  # (L, 1) normalized
+            "ot_mean": torch.tensor(mean, dtype=torch.float32),
+            "ot_std": torch.tensor(std, dtype=torch.float32),
         }
 
 
@@ -189,14 +201,20 @@ class CollateFn:
         # Pad time series to L_max
         B = len(batch)
         ot_padded = torch.zeros(B, L_max, 1, dtype=torch.float32)
+        ot_means = torch.zeros(B, dtype=torch.float32)
+        ot_stds = torch.ones(B, dtype=torch.float32)
         for i, s in enumerate(batch):
             L = s["ot"].shape[0]
             ot_padded[i, :L, :] = s["ot"]
+            ot_means[i] = s["ot_mean"]
+            ot_stds[i] = s["ot_std"]
 
         return {
             "text_embedding": text_embeddings,  # (B, 128)
-            "ot": ot_padded,                    # (B, L_max, 1)
+            "ot": ot_padded,                    # (B, L_max, 1) normalized
             "ot_lengths": ot_lengths,           # (B,)
+            "ot_means": ot_means,               # (B,) original means
+            "ot_stds": ot_stds,                 # (B,) original stds
             "text_strs": [s["text_str"] for s in batch],
             "dataset_names": [s["dataset_name"] for s in batch],
             "time_intervals": [s["time_interval"] for s in batch],
