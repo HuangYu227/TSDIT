@@ -840,6 +840,64 @@ class MMLDMDiTModel(PreTrainedModel):
         cache.n_prefix_ts = int(ts_shape_patched.sum().item())
         return cache
 
+    @torch.no_grad()
+    def extend_prefix_kv(
+        self,
+        existing_cache: PrefixKVCache,
+        new_ts: torch.FloatTensor,
+        text: torch.FloatTensor,
+        new_ts_shape: torch.LongTensor,
+        text_shape: torch.LongTensor,
+        timestep: Union[float, torch.FloatTensor],
+        pos_offset: int = 0,
+        text_timestep: Optional[Union[int, float, torch.IntTensor, torch.FloatTensor]] = None,
+    ) -> PrefixKVCache:
+        """Incrementally extend a PrefixKVCache with new tokens.
+
+        Only runs new_ts through all blocks and appends their KV to
+        existing_cache, instead of reprocessing all prefix tokens.
+        """
+        # Patch embed
+        ts, ts_shape_patched, _ = self.ts_in(new_ts, new_ts_shape)
+        text, text_shape_patched, _ = self.text_in(text, text_shape)
+
+        # Timestep embeddings
+        ts_t_expanded = _expand_ts_timestep(
+            timestep, ts_shape_patched, device=ts.device, dtype=ts.dtype,
+        )
+        text_t_source = timestep if text_timestep is None else text_timestep
+        text_t_expanded = _expand_text_timestep(
+            text_t_source, ts_shape_patched, text_shape_patched,
+            device=ts.device, dtype=ts.dtype,
+        )
+        ts_emb = self.emb_in(ts_t_expanded, device=ts.device, dtype=ts.dtype)
+        text_emb = self.emb_in(text_t_expanded, device=ts.device, dtype=ts.dtype)
+
+        ts = ts.unsqueeze(0)
+        text = text.unsqueeze(0)
+        ts_emb = ts_emb.unsqueeze(0)
+        text_emb = text_emb.unsqueeze(0)
+
+        # Run new tokens through all blocks, collecting KV
+        new_cache = PrefixKVCache()
+        for i, block in enumerate(self.blocks):
+            ts, text, kv = block(
+                ts, text,
+                ts_emb=ts_emb,
+                text_emb=text_emb,
+                pos_offset=pos_offset,
+                return_kv=True,
+            )
+            # Append to existing layer KV
+            old_ts_k, old_ts_v = existing_cache.layers[i]
+            new_ts_k, new_ts_v = kv
+            extended = (torch.cat([old_ts_k, new_ts_k], dim=2),
+                        torch.cat([old_ts_v, new_ts_v], dim=2))
+            new_cache.layers.append(extended)
+
+        new_cache.n_prefix_ts = existing_cache.n_prefix_ts + int(new_ts_shape.sum().item())
+        return new_cache
+
 
 # Register
 AutoConfig.register("mmldm_dit", MMLDMDiTConfig)

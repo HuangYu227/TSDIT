@@ -254,21 +254,39 @@ def generate_latent_blocks(
 
         generated_blocks.append(z_clean)
 
-        # Compute prefix KV cache for the next block
-        prefix_all = torch.cat(generated_blocks, dim=0)
-        prefix_ts_shape = _shape_tensor([prefix_all.shape[0]], device)
-        prefix_kv_cond = dit.compute_prefix_kv(
-            ts=prefix_all, text=text_latent,
-            ts_shape=prefix_ts_shape, text_shape=text_shape,
-            timestep=0.0,
-        )
-        if guidance_scale > 1.0:
-            empty_text = torch.zeros_like(text_latent)
-            prefix_kv_uncond = dit.compute_prefix_kv(
-                ts=prefix_all, text=empty_text,
-                ts_shape=prefix_ts_shape, text_shape=text_shape,
+        # Incrementally extend prefix KV cache (only process current block)
+        curr_ts_shape = _shape_tensor([curr_block_len], device)
+        if prefix_kv_cond is None:
+            # First block: compute KV from scratch
+            prefix_kv_cond = dit.compute_prefix_kv(
+                ts=z_clean, text=text_latent,
+                ts_shape=curr_ts_shape, text_shape=text_shape,
                 timestep=0.0,
             )
+        else:
+            prefix_kv_cond = dit.extend_prefix_kv(
+                existing_cache=prefix_kv_cond,
+                new_ts=z_clean, text=text_latent,
+                new_ts_shape=curr_ts_shape, text_shape=text_shape,
+                timestep=0.0,
+                pos_offset=prefix_len,
+            )
+        if guidance_scale > 1.0:
+            empty_text = torch.zeros_like(text_latent)
+            if prefix_kv_uncond is None:
+                prefix_kv_uncond = dit.compute_prefix_kv(
+                    ts=z_clean, text=empty_text,
+                    ts_shape=curr_ts_shape, text_shape=text_shape,
+                    timestep=0.0,
+                )
+            else:
+                prefix_kv_uncond = dit.extend_prefix_kv(
+                    existing_cache=prefix_kv_uncond,
+                    new_ts=z_clean, text=empty_text,
+                    new_ts_shape=curr_ts_shape, text_shape=text_shape,
+                    timestep=0.0,
+                    pos_offset=prefix_len,
+                )
 
     return torch.cat(generated_blocks, dim=0)
 
