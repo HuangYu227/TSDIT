@@ -46,7 +46,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .attention_utils import create_multimodal_joint_mask
+from .attention_utils import create_dit_readonly_text_mask, create_multimodal_joint_mask
 from .configuration_mmldm import MMLDMDiTConfig, MMLDMVAEConfig
 from .data.tsfragment_dataset import CollateFn, TSFragmentDataset
 from .evaluation import evaluate_multi, evaluate_single, save_results
@@ -200,7 +200,7 @@ def generate_latent_blocks(
         # Build full mask for [prefix + current_block ; text] K-side layout.
         # Then slice Q-side rows to only include [current_block ; text].
         ts_shape_full = _shape_tensor([total_len_k], device)
-        full_attn_mask = create_multimodal_joint_mask(
+        full_attn_mask = create_dit_readonly_text_mask(
             ts_shape=ts_shape_full,
             text_shape=text_shape,
             block_sizes=[block_sizes[: b + 1]],

@@ -21,12 +21,13 @@ This package implements the MMLDM framework, combining:
 - Adaptive Semantic Patching for text-guided dynamic block allocation
 """
 
-from .attention_utils import create_multimodal_joint_mask
+from .attention_utils import create_dit_readonly_text_mask, create_multimodal_joint_mask
 from .configuration_mmldm import MMLDMDiTConfig, MMLDMVAEConfig
 
 __all__ = [
     "MMLDMVAEConfig",
     "MMLDMDiTConfig",
+    "create_dit_readonly_text_mask",
     "create_multimodal_joint_mask",
 ]
 

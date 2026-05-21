@@ -37,7 +37,7 @@ from einops import rearrange, pack, unpack
 from torch import nn
 from transformers import AutoConfig, AutoModel, PreTrainedModel
 
-from .attention_utils import create_multimodal_joint_mask
+from .attention_utils import create_dit_readonly_text_mask
 from .configuration_mmldm import MMLDMDiTConfig
 
 
@@ -365,10 +365,10 @@ class MultimodalJointAttention(nn.Module):
         ts_tokens: torch.Tensor,
         text_tokens: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
-        prefix_kv: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        prefix_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         pos_offset: int = 0,
         return_kv: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         B = ts_tokens.shape[0]
         L_ts = ts_tokens.shape[1]
         L_text = text_tokens.shape[1]
@@ -395,9 +395,9 @@ class MultimodalJointAttention(nn.Module):
         ts_q = self._apply_rope(ts_q, ts_freqs)
         ts_k = self._apply_rope(ts_k, ts_freqs)
 
-        # Concatenate prefix KV if provided
+        # Concatenate prefix KV if provided (only TS KV is cached)
         if prefix_kv is not None:
-            pre_ts_k, pre_ts_v, _pre_text_k, _pre_text_v = prefix_kv
+            pre_ts_k, pre_ts_v = prefix_kv
             ts_k = torch.cat([pre_ts_k, ts_k], dim=2)
             ts_v = torch.cat([pre_ts_v, ts_v], dim=2)
 
@@ -429,8 +429,8 @@ class MultimodalJointAttention(nn.Module):
         text_out = self.text_to_out(text_out)
 
         if return_kv:
-            # Return current KV (without prefix) for caching
-            current_kv = (ts_k[:, :, -L_ts:], ts_v[:, :, -L_ts:], text_k[:, :, -L_text:], text_v[:, :, -L_text:])
+            # Return current TS KV (without prefix) for caching; text KV is discarded
+            current_kv = (ts_k[:, :, -L_ts:], ts_v[:, :, -L_ts:])
             return ts_out, text_out, current_kv
 
         return ts_out, text_out
@@ -508,7 +508,7 @@ class MultimodalDiTBlock(nn.Module):
         ts_emb: torch.Tensor,
         text_emb: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
-        prefix_kv: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        prefix_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         pos_offset: int = 0,
         return_kv: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, tuple]:
@@ -565,8 +565,8 @@ class MMLDMDiTOutput:
 @dataclass
 class PrefixKVCache:
     """Cached KV pairs from prefix blocks for inference acceleration."""
-    # List of (ts_k, ts_v, text_k, text_v) per layer
-    layers: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = field(default_factory=list)
+    # List of (ts_k, ts_v) per layer — text KV is not cached
+    layers: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
     n_prefix_ts: int = 0
 
 
@@ -733,7 +733,7 @@ class MMLDMDiTModel(PreTrainedModel):
                     sizes.append(remainder)
                 block_sizes_fallback.append(sizes if sizes else [l])
 
-            attn_mask = create_multimodal_joint_mask(
+            attn_mask = create_dit_readonly_text_mask(
                 ts_shape=ts_shape_patched,
                 text_shape=text_shape_patched,
                 block_sizes=block_sizes_fallback,
@@ -812,7 +812,7 @@ class MMLDMDiTModel(PreTrainedModel):
                 if remainder > 0:
                     sizes.append(remainder)
                 block_sizes_fallback.append(sizes if sizes else [l])
-            attn_mask = create_multimodal_joint_mask(
+            attn_mask = create_dit_readonly_text_mask(
                 ts_shape=ts_shape_patched,
                 text_shape=text_shape_patched,
                 block_sizes=block_sizes_fallback,

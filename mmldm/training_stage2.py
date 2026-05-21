@@ -41,7 +41,7 @@ from .configuration_mmldm import MMLDMDiTConfig, MMLDMVAEConfig
 from .data.tsfragment_dataset import CollateFn, TSFragmentDataset
 from .modeling_mmldm_dit import MMLDMDiTModel
 from .modeling_mmldm_vae import MMLDMVAEModel
-from .attention_utils import create_multimodal_joint_mask
+from .attention_utils import create_dit_readonly_text_mask
 from .semantic_router import SemanticRouter
 
 
@@ -282,7 +282,7 @@ def build_adaptive_mask_for_batch(
             block_sizes_i[-1] += n_lat - total
         nested_block_sizes.append(block_sizes_i)
 
-    return create_multimodal_joint_mask(
+    return create_dit_readonly_text_mask(
         ts_shape=ts_shape,
         text_shape=text_shape,
         block_sizes=nested_block_sizes,
