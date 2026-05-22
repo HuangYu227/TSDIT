@@ -12,14 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MMLDM VAE — Stage 1 model with Conv1d encoder/decoder.
+"""MMLDM VAE v2 — Spectral Dual-Latent + Engineering Improvements.
 
-Implements a per-sample Conv1d VAE for time series:
-- Encoder: Conv1d(k=3,s=1) + Residual stack → latent mean/logvar
-- Decoder: Conv1d(k=3,s=1) + Residual stack → reconstructed TS
+Innovations:
+- A: Spectral Dual-Latent (trend + residual subspaces)
+- C: Temporal Contrastive Latent Regularization (TCLR)
+- Engineering: Spectral reconstruction loss, latent standardization
 
-Also provides a standalone text encoder (encode_text_condition) for
-Stage 2 conditioning, using TransformerBlock with RoPE attention.
+Architecture:
+- Encoder: FFT decomposition -> trend (low-freq) + residual (high-freq)
+  -> Conv1d encoders -> separate latent projections
+- Decoder: merge [z_trend; z_residual] -> Conv1d decoder -> time domain
+- Text encoder: standalone TransformerBlock for Stage 2 conditioning
 """
 
 from __future__ import annotations
@@ -42,11 +46,7 @@ from .configuration_mmldm import MMLDMVAEConfig
 
 
 class DiagonalGaussianDistribution:
-    """Diagonal Gaussian posterior for the VAE latent space.
-
-    Splits the encoder output into mean and logvar, provides sampling
-    via the reparameterization trick.
-    """
+    """Diagonal Gaussian posterior for the VAE latent space."""
 
     def __init__(self, parameters: torch.Tensor, deterministic: bool = False):
         assert parameters.ndim in (2, 3)
@@ -74,7 +74,6 @@ class DiagonalGaussianDistribution:
         return self.mean
 
     def kl(self, other_mean: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """KL divergence against N(0, I) or another Gaussian."""
         if other_mean is None:
             other_mean = torch.zeros_like(self.mean)
         return 0.5 * (
@@ -85,8 +84,37 @@ class DiagonalGaussianDistribution:
 @dataclass
 class TextVAEEncoderOutput:
     latents_list: list[torch.Tensor]
-    latent_dists: Optional[list[DiagonalGaussianDistribution]] = None
-    text_latents: Optional[torch.Tensor] = None  # (B, latent_dim)
+    latent_dists: Optional[tuple[list[DiagonalGaussianDistribution], list[DiagonalGaussianDistribution]]] = None
+    text_latents: Optional[torch.Tensor] = None
+
+
+# ---------------------------------------------------------------------------
+# FFT decomposition helpers (Innovation A)
+# ---------------------------------------------------------------------------
+
+
+def fft_decompose(x: torch.Tensor, cutoff_ratio: float = 0.3):
+    """Decompose time series into low-freq (trend) and high-freq (residual).
+
+    Args:
+        x: (B, C, L) time series in time domain.
+        cutoff_ratio: fraction of frequencies to keep as low-freq.
+
+    Returns:
+        x_low: (B, C, L) low-frequency component (trend).
+        x_high: (B, C, L) high-frequency component (residual).
+    """
+    B, C, L = x.shape
+    X = torch.fft.rfft(x, dim=-1)  # (B, C, L//2+1)
+    freq_len = X.shape[-1]
+    cutoff = max(1, int(freq_len * cutoff_ratio))
+
+    X_low = X.clone()
+    X_low[:, :, cutoff:] = 0
+    x_low = torch.fft.irfft(X_low, n=L, dim=-1)
+
+    x_high = x - x_low
+    return x_low, x_high
 
 
 # ---------------------------------------------------------------------------
@@ -95,16 +123,17 @@ class TextVAEEncoderOutput:
 
 
 class ConvResidual(nn.Module):
-    """Conv1d(k=3,p=1) -> ReLU -> Conv1d(k=1) + skip connection."""
+    """Conv1d(k=3,p=1) -> SiLU -> Conv1d(k=1) + skip connection."""
 
     def __init__(self, dim: int):
         super().__init__()
+        self.norm = nn.GroupNorm(1, dim)  # InstanceNorm for stability
         self.conv1 = nn.Conv1d(dim, dim, kernel_size=3, padding=1)
-        self.act = nn.ReLU()
+        self.act = nn.SiLU()
         self.conv2 = nn.Conv1d(dim, dim, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.conv2(self.act(self.conv1(x)))
+        return x + self.conv2(self.act(self.conv1(self.norm(x))))
 
 
 class ConvResidualStack(nn.Module):
@@ -129,10 +158,9 @@ class ConvEncoder(nn.Module):
         self.stack = ConvResidualStack(dim, num_layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, in_channels, L)
         x = self.proj_in(x)
         x = self.stack(x)
-        return x  # (B, dim, L)
+        return x
 
 
 class ConvDecoder(nn.Module):
@@ -145,21 +173,18 @@ class ConvDecoder(nn.Module):
         self.proj_out = nn.Conv1d(dim, out_channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, dim, L)
         x = self.proj_in(x)
         x = self.stack(x)
         x = self.proj_out(x)
-        return x  # (B, out_channels, L)
+        return x
 
 
 # ---------------------------------------------------------------------------
-# Standalone text encoder modules (for encode_text_condition)
+# Standalone text encoder modules
 # ---------------------------------------------------------------------------
 
 
 class RotaryEmbedding(nn.Module):
-    """Rotary positional embedding."""
-
     def __init__(self, dim: int, theta: int = 10000):
         super().__init__()
         self.dim = dim
@@ -174,7 +199,6 @@ class RotaryEmbedding(nn.Module):
 
 
 def _apply_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    """Apply rotary embedding. x: (B, H, L, D), freqs: (L, D/2)."""
     x_rot = x.float()
     cos = freqs.cos().unsqueeze(0).unsqueeze(0)
     sin = freqs.sin().unsqueeze(0).unsqueeze(0)
@@ -186,8 +210,6 @@ def _apply_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
 
 
 class SwiGLUFFN(nn.Module):
-    """SwiGLU feed-forward network."""
-
     def __init__(self, dim: int, ffn_dim: int, dropout: float = 0.0):
         super().__init__()
         self.w1 = nn.Linear(dim, ffn_dim, bias=False)
@@ -200,17 +222,8 @@ class SwiGLUFFN(nn.Module):
 
 
 class TextTransformerBlock(nn.Module):
-    """Pre-norm Transformer block for text-only encoding (no KV cache)."""
-
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        head_dim: int,
-        ffn_dim: int,
-        dropout: float = 0.0,
-        layer_norm_eps: float = 1e-6,
-    ):
+    def __init__(self, dim: int, num_heads: int, head_dim: int, ffn_dim: int,
+                 dropout: float = 0.0, layer_norm_eps: float = 1e-6):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -222,56 +235,44 @@ class TextTransformerBlock(nn.Module):
         self.q_norm = nn.LayerNorm(head_dim, eps=layer_norm_eps)
         self.k_norm = nn.LayerNorm(head_dim, eps=layer_norm_eps)
         self.rope = RotaryEmbedding(head_dim, theta=10000)
-
         self.ffn_norm = nn.LayerNorm(dim, eps=layer_norm_eps)
         self.ffn = SwiGLUFFN(dim, ffn_dim, dropout=dropout)
 
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, L, _ = x.shape
-
         h = self.attn_norm(x)
         qkv = self.qkv_proj(h).reshape(B, L, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(2)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        q, k = self.q_norm(q), self.k_norm(k)
 
         freqs = self.rope(L, device=x.device, dtype=q.dtype)
-        q = _apply_rotary_emb(q, freqs)
-        k = _apply_rotary_emb(k, freqs)
+        q, k = _apply_rotary_emb(q, freqs), _apply_rotary_emb(k, freqs)
 
         d_head = q.shape[-1]
-        scale = 1.0 / (d_head ** 0.5)
-        attn = q.mul(scale) @ k.transpose(-2, -1)
+        attn = q.mul(1.0 / (d_head ** 0.5)) @ k.transpose(-2, -1)
         if attn_mask is not None:
             attn = attn + attn_mask.to(attn.dtype)
-        attn_weight = attn.softmax(dim=-1)
-        out = attn_weight @ v
-        out = out.transpose(1, 2).reshape(B, L, -1)
+        out = (attn.softmax(dim=-1) @ v).transpose(1, 2).reshape(B, L, -1)
         out = self.out_proj(out)
-
         x = x + out
-        h = self.ffn_norm(x)
-        x = x + self.ffn(h)
+        x = x + self.ffn(self.ffn_norm(x))
         return x
 
 
 # ---------------------------------------------------------------------------
-# MMLDM VAE Model
+# MMLDM VAE Model v2 — Spectral Dual-Latent
 # ---------------------------------------------------------------------------
 
 
 class MMLDMVAEModel(PreTrainedModel):
-    """Conv1d-based VAE for MMLDM Stage 1.
+    """Spectral Dual-Latent VAE for MMLDM.
 
-    Encodes time series into a continuous latent space via per-sample
-    Conv1d encoding, then decodes back to time series via Conv1d decoding.
+    Innovation A: Splits latent into trend (low-freq) and residual (high-freq)
+    subspaces with FFT decomposition and separate encoders.
 
-    Text encoding is handled separately by ``encode_text_condition()``
-    for Stage 2 conditioning — it does NOT participate in VAE encode/decode.
+    Engineering: Spectral reconstruction loss + latent standardization.
+    Innovation C: Temporal Contrastive Latent Regularization (TCLR).
     """
 
     config_class = MMLDMVAEConfig
@@ -282,34 +283,40 @@ class MMLDMVAEModel(PreTrainedModel):
         self.config = config
         self.use_variation = config.use_variation
 
-        # ---- Conv1d TS Encoder ----
-        self.encoder = ConvEncoder(config.ts_channels, config.dim, config.num_conv_layers)
+        # Innovation A: Dual-latent dimensions
+        self.trend_dim = config.latent_dim // 2
+        self.residual_dim = config.latent_dim - self.trend_dim
 
-        # ---- Latent projection (Conv1d k=1: dim → latent_dim*2) ----
+        # Dual Conv1d Encoders
+        self.trend_encoder = ConvEncoder(config.ts_channels, config.dim, config.num_conv_layers)
+        self.residual_encoder = ConvEncoder(config.ts_channels, config.dim, config.num_conv_layers)
+
+        # Dual latent projections
         if config.use_variation:
-            self.final_layer = nn.Conv1d(config.dim, config.latent_dim * 2, kernel_size=1)
+            self.trend_proj = nn.Conv1d(config.dim, self.trend_dim * 2, kernel_size=1)
+            self.residual_proj = nn.Conv1d(config.dim, self.residual_dim * 2, kernel_size=1)
         else:
-            self.final_layer = nn.Conv1d(config.dim, config.latent_dim, kernel_size=1)
+            self.trend_proj = nn.Conv1d(config.dim, self.trend_dim, kernel_size=1)
+            self.residual_proj = nn.Conv1d(config.dim, self.residual_dim, kernel_size=1)
 
-        # ---- Conv1d TS Decoder ----
+        # Decoder (merged latent)
         self.decoder_in_layer = nn.Conv1d(config.latent_dim, config.dim, kernel_size=1)
         self.decoder = ConvDecoder(config.ts_channels, config.dim, config.decoder_num_blocks)
 
-        # ---- Standalone Text Encoder (for Stage 2 conditioning) ----
+        # Standalone Text Encoder
         self.text_proj = nn.Linear(config.text_dim, config.dim)
         self.text_encoder_blocks = nn.ModuleList([
-            TextTransformerBlock(
-                dim=config.dim,
-                num_heads=config.num_heads,
-                head_dim=config.head_dim,
-                ffn_dim=config.ffn_dim,
-                dropout=config.dropout,
-                layer_norm_eps=config.layer_norm_eps,
-            )
+            TextTransformerBlock(dim=config.dim, num_heads=config.num_heads, head_dim=config.head_dim,
+                                 ffn_dim=config.ffn_dim, dropout=config.dropout, layer_norm_eps=config.layer_norm_eps)
             for _ in range(config.encoder_num_blocks)
         ])
         self.text_final_layer = nn.Linear(config.dim, config.latent_dim)
         self.text_final_norm = nn.LayerNorm(config.latent_dim, eps=config.layer_norm_eps)
+
+        # Latent standardization buffers
+        self.register_buffer("latent_mean", torch.zeros(config.latent_dim))
+        self.register_buffer("latent_std", torch.ones(config.latent_dim))
+        self.register_buffer("_latent_stats_computed", torch.tensor(False))
 
         self.post_init()
 
@@ -328,131 +335,133 @@ class MMLDMVAEModel(PreTrainedModel):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
-    # ---------------------------------------------------------------
-    # Encode (TS only — no text)
-    # ---------------------------------------------------------------
-
     def encode(self, ot_list: list[torch.Tensor]) -> TextVAEEncoderOutput:
-        """Encode time series into latent space (per-sample Conv1d).
+        """Encode with FFT decomposition -> trend + residual dual latents.
 
-        Args:
-            ot_list: list of (L_i, C) time series tensors.
-
-        Returns:
-            TextVAEEncoderOutput with per-sample latents and distributions.
+        Returns distributions only — callers should sample once via:
+            trend_dists, residual_dists = output.latent_dists
+            z_list = [torch.cat([td.sample(), rd.sample()], dim=-1)
+                      for td, rd in zip(trend_dists, residual_dists)]
         """
-        per_sample_params = []
+        trend_params, residual_params = [], []
+
         for ot in ot_list:
-            # ot: (L, C) → (1, C, L)
-            x = ot.unsqueeze(0).permute(0, 2, 1)
-            x = self.encoder(x)  # (1, dim, L)
-            x = self.final_layer(x)  # (1, latent_dim*2, L)
-            x = x.permute(0, 2, 1).squeeze(0)  # (L, latent_dim*2)
-            per_sample_params.append(x)
+            x = ot.unsqueeze(0).permute(0, 2, 1)  # (1, C, L)
+            x_low, x_high = fft_decompose(x, cutoff_ratio=self.config.fft_cutoff_ratio)
 
-        latent_dists: Optional[list[DiagonalGaussianDistribution]] = None
-        if self.use_variation:
-            latent_dists = [DiagonalGaussianDistribution(p) for p in per_sample_params]
-            latents_mode = [d.mode() for d in latent_dists]
-        else:
-            latents_mode = per_sample_params
+            h_trend = self.trend_encoder(x_low)
+            h_residual = self.residual_encoder(x_high)
 
-        return TextVAEEncoderOutput(
-            latents_list=latents_mode,
-            latent_dists=latent_dists,
-        )
+            p_trend = self.trend_proj(h_trend).permute(0, 2, 1).squeeze(0)
+            p_residual = self.residual_proj(h_residual).permute(0, 2, 1).squeeze(0)
 
-    # ---------------------------------------------------------------
-    # Decode (TS only — no text, no block-causal)
-    # ---------------------------------------------------------------
+            trend_params.append(p_trend)
+            residual_params.append(p_residual)
+
+        trend_dists = [DiagonalGaussianDistribution(p) for p in trend_params]
+        residual_dists = [DiagonalGaussianDistribution(p) for p in residual_params]
+
+        return TextVAEEncoderOutput(latents_list=[], latent_dists=(trend_dists, residual_dists))
 
     def decode(self, z: torch.Tensor, ts_shape: torch.LongTensor) -> torch.Tensor:
-        """Decode latents into time series (per-sample Conv1d).
-
-        Args:
-            z: (L_total, latent_dim) flat latent tensor.
-            ts_shape: (B, 1) per-sample token counts.
-
-        Returns:
-            (1, L_total, ts_channels) reconstructed time series.
-        """
+        """Decode merged latents into time series."""
         lengths = ts_shape.flatten().tolist()
         z_list = z.split(lengths, dim=0)
         out_list = []
         for z_i in z_list:
-            # z_i: (L_i, latent_dim) → (1, latent_dim, L_i)
             x = z_i.unsqueeze(0).permute(0, 2, 1)
-            x = self.decoder_in_layer(x)  # (1, dim, L_i)
-            x = self.decoder(x)  # (1, C, L_i)
-            x = x.permute(0, 2, 1).squeeze(0)  # (L_i, C)
-            out_list.append(x)
-        recon = torch.cat(out_list, dim=0)  # (L_total, C)
-        return recon.unsqueeze(0)  # (1, L_total, C)
-
-    # ---------------------------------------------------------------
-    # Text condition encoding (for Stage 2 — no TS leakage)
-    # ---------------------------------------------------------------
+            x = self.decoder_in_layer(x)
+            x = self.decoder(x)
+            out_list.append(x.permute(0, 2, 1).squeeze(0))
+        return torch.cat(out_list, dim=0).unsqueeze(0)
 
     def encode_text_condition(self, text_embs: torch.Tensor) -> torch.Tensor:
-        """Encode text embeddings without seeing the target time series.
-
-        Stage 2 and inference use this path for conditioning. It runs
-        standalone TransformerBlocks over per-sample text tokens.
-
-        Args:
-            text_embs: (B, text_dim) raw text embeddings.
-
-        Returns:
-            (B, latent_dim) text latent tokens (one per sample).
-        """
-        B = text_embs.shape[0]
-        x = self.text_proj(text_embs)  # (B, dim)
-        x = x.unsqueeze(0)  # (1, B, dim) — each sample is one "token"
-
-        # Bidirectional attention across the batch of text tokens
+        """Encode text embeddings for Stage 2 conditioning."""
+        x = self.text_proj(text_embs).unsqueeze(0)
         for block in self.text_encoder_blocks:
             x = block(x, attn_mask=None)
+        return self.text_final_norm(self.text_final_layer(x.squeeze(0)))
 
-        x = self.text_final_norm(self.text_final_layer(x.squeeze(0)))  # (B, latent_dim)
-        return x
+    def compute_latent_stats(self, dataset_latents: list[torch.Tensor]):
+        """Compute mean/std for latent standardization (in-place buffer update)."""
+        all_latents = torch.cat(dataset_latents, dim=0)
+        self.latent_mean.copy_(all_latents.mean(dim=0))
+        self.latent_std.copy_(all_latents.std(dim=0).clamp(min=1e-6))
+        self._latent_stats_computed.fill_(True)
 
-    # ---------------------------------------------------------------
-    # Forward (for Stage 1 training)
-    # ---------------------------------------------------------------
+    def standardize_latent(self, z: torch.Tensor) -> torch.Tensor:
+        if self._latent_stats_computed.item():
+            return (z - self.latent_mean) / self.latent_std
+        return z
 
-    def forward(self, ot_list: list[torch.Tensor]) -> dict:
-        """Full forward pass: encode → sample → decode.
+    def unstandardize_latent(self, z: torch.Tensor) -> torch.Tensor:
+        if self._latent_stats_computed.item():
+            return z * self.latent_std + self.latent_mean
+        return z
 
-        Args:
-            ot_list: list of (L_i, C) time series tensors.
-
-        Returns:
-            dict with keys: recon, latent_dists, latents.
-        """
+    def forward(self, ot_list: list[torch.Tensor], tclr_weight: float = 0.1) -> dict:
+        """Full forward with spectral loss and TCLR."""
         enc_output = self.encode(ot_list)
+        trend_dists, residual_dists = enc_output.latent_dists
 
-        # Sample from posterior
-        if self.use_variation:
-            z_list = [d.sample() for d in enc_output.latent_dists]
-        else:
-            z_list = enc_output.latents_list
+        trend_samples = [d.sample() for d in trend_dists]
+        residual_samples = [d.sample() for d in residual_dists]
+        z_list = [torch.cat([t, r], dim=-1) for t, r in zip(trend_samples, residual_samples)]
 
-        z = torch.cat(z_list, dim=0)  # (L_total, latent_dim)
-        ts_shape = torch.tensor(
-            [[z_i.shape[0]] for z_i in z_list],
-            dtype=torch.long,
-            device=z.device,
-        )
-
+        z = torch.cat(z_list, dim=0)
+        ts_shape = torch.tensor([[z_i.shape[0]] for z_i in z_list], dtype=torch.long, device=z.device)
         recon = self.decode(z, ts_shape)
 
-        return {
-            "recon": recon,  # (1, L_total, ts_channels)
-            "latent_dists": enc_output.latent_dists,
-            "latents": z_list,
-        }
+        result = {"recon": recon, "latent_dists": (trend_dists, residual_dists), "latents": z_list}
+
+        # Spectral reconstruction loss — per-sample to avoid cross-boundary artifacts
+        spectral_losses = []
+        offset = 0
+        for i, ot_i in enumerate(ot_list):
+            L_i = ot_i.shape[0]
+            x_i = ot_i.permute(1, 0).unsqueeze(0)            # (1, C, L)
+            r_i = recon[:, offset:offset + L_i, :].permute(0, 2, 1)  # (1, C, L)
+            fft_x = torch.fft.rfft(x_i, dim=-1)
+            fft_r = torch.fft.rfft(r_i, dim=-1)
+            spectral_losses.append(
+                F.l1_loss(fft_r.real, fft_x.real) + F.l1_loss(fft_r.imag, fft_x.imag)
+            )
+            offset += L_i
+        result["spectral_loss"] = torch.stack(spectral_losses).mean()
+
+        # Innovation C: TCLR loss
+        if tclr_weight > 0:
+            result["tclr_loss"] = self._compute_tclr(z_list)
+        else:
+            result["tclr_loss"] = torch.tensor(0.0, device=z.device)
+
+        return result
+
+    def _compute_tclr(self, z_list: list[torch.Tensor], margin: float = 1.0) -> torch.Tensor:
+        """Temporal Contrastive Latent Regularization.
+
+        Vectorized implementation for gradient-correct accumulation.
+        """
+        losses = []
+        for z in z_list:
+            L = z.shape[0]
+            if L < 3:
+                continue
+            k = max(1, L // 4)
+            # Positive pairs: adjacent timesteps
+            d_pos = torch.norm(z[:-1] - z[1:], p=2, dim=-1)  # (L-1,)
+            # Negative pairs: k-step apart
+            neg_indices = torch.clamp(torch.arange(1, L, device=z.device) + k - 1, max=L - 1)
+            # Ensure negative index != positive index (i+1)
+            neg_indices = torch.where(neg_indices == torch.arange(1, L, device=z.device),
+                                      torch.clamp(neg_indices + 1, max=L - 1), neg_indices)
+            d_neg = torch.norm(z[:-1] - z[neg_indices], p=2, dim=-1)  # (L-1,)
+            hinge = torch.clamp(d_pos - d_neg + margin, min=0.0)
+            losses.append(hinge.mean())
+        if not losses:
+            return torch.tensor(0.0, device=z_list[0].device, requires_grad=True)
+        return torch.stack(losses).mean()
 
 
-# Register with HuggingFace
 AutoConfig.register("mmldm_vae", MMLDMVAEConfig)
 AutoModel.register(MMLDMVAEConfig, MMLDMVAEModel)

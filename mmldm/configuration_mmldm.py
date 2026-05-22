@@ -62,6 +62,7 @@ class MMLDMVAEConfig(PretrainedConfig):
         kl_anneal_start: float = 0.0,
         kl_anneal_end: float = 1e-6,
         kl_anneal_epochs: int = 5,
+        fft_cutoff_ratio: float = 0.3,
         scaling_factor: float = 1.0,
         shifting_factor: float = 0.0,
         **kwargs,
@@ -86,6 +87,7 @@ class MMLDMVAEConfig(PretrainedConfig):
         self.kl_anneal_start = kl_anneal_start
         self.kl_anneal_end = kl_anneal_end
         self.kl_anneal_epochs = kl_anneal_epochs
+        self.fft_cutoff_ratio = fft_cutoff_ratio
         self.scaling_factor = scaling_factor
         self.shifting_factor = shifting_factor
         super().__init__(**kwargs)

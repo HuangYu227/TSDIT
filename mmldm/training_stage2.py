@@ -34,6 +34,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
@@ -43,6 +44,172 @@ from .modeling_mmldm_dit import MMLDMDiTModel
 from .modeling_mmldm_vae import MMLDMVAEModel
 from .attention_utils import create_dit_readonly_text_mask
 from .semantic_router import SemanticRouter
+
+
+# ---------------------------------------------------------------------------
+# EMA (Exponential Moving Average) — Engineering improvement
+# ---------------------------------------------------------------------------
+
+
+class EMA:
+    """Exponential Moving Average for model parameters."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {name: p.data.clone() for name, p in model.named_parameters() if p.requires_grad}
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        for name, p in model.named_parameters():
+            if p.requires_grad and name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(p.data, alpha=1 - self.decay)
+
+    @torch.no_grad()
+    def apply(self, model: nn.Module):
+        """Swap model params with EMA params (call before eval)."""
+        self.backup = {}
+        for name, p in model.named_parameters():
+            if p.requires_grad and name in self.shadow:
+                self.backup[name] = p.data.clone()
+                p.data.copy_(self.shadow[name])
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module):
+        """Restore original params after eval."""
+        for name, p in model.named_parameters():
+            if p.requires_grad and name in self.backup:
+                p.data.copy_(self.backup[name])
+        self.backup = {}
+
+
+# ---------------------------------------------------------------------------
+# Innovation E: Text-Adaptive SNR Scheduling
+# ---------------------------------------------------------------------------
+
+
+def text_adaptive_timestep(
+    text_latent: torch.Tensor,
+    base_t: torch.Tensor,
+    snr_alpha: float = 0.3,
+) -> torch.Tensor:
+    """Adjust timesteps based on text complexity.
+
+    Simple texts (low-norm embeddings) get lower timesteps (easier denoising).
+    Complex texts (high-norm embeddings) get higher timesteps (harder denoising).
+
+    Args:
+        text_latent: (B, D) text latent embeddings.
+        base_t: (B,) uniformly sampled timesteps in [0, 1].
+        snr_alpha: strength of text-adaptive adjustment (0 = uniform).
+
+    Returns:
+        (B,) adjusted timesteps clamped to [0.01, 0.99].
+    """
+    # Text complexity proxy: L2 norm of text latent, normalized to [0, 1]
+    norms = text_latent.norm(dim=-1)  # (B,)
+    # Normalize to zero-mean unit-variance across batch
+    if norms.std() > 1e-6:
+        complexity = (norms - norms.mean()) / norms.std()
+    else:
+        complexity = torch.zeros_like(norms)
+    # Shift and scale: complex texts get higher t
+    adjusted = base_t + snr_alpha * complexity * base_t * (1 - base_t)
+    return adjusted.clamp(0.01, 0.99)
+
+
+# ---------------------------------------------------------------------------
+# Innovation F: Cross-Block Consistency Distillation
+# ---------------------------------------------------------------------------
+
+
+def compute_consistency_loss(
+    model: MMLDMDiTModel,
+    z0: torch.Tensor,
+    text_latent: torch.Tensor,
+    ts_shape: torch.LongTensor,
+    text_shape: torch.LongTensor,
+    noise: torch.Tensor,
+    attn_mask: Optional[torch.Tensor] = None,
+    delta: float = 0.05,
+) -> torch.Tensor:
+    """Cross-Block Consistency Distillation loss.
+
+    L_cons = ||DiT(z_t1, t1, c) - DiT(z_t2, t2, c)||²
+    where t1, t2 are nearby timesteps (|t1-t2| < delta).
+
+    This encourages the DiT vector field to be smooth, enabling fewer-step inference.
+
+    Args:
+        model: DiT model.
+        z0: clean latent (L_total, D).
+        text_latent: text condition (B, D).
+        ts_shape: per-sample TS lengths.
+        text_shape: per-sample text lengths.
+        noise: random noise (L_total, D).
+        attn_mask: optional attention mask.
+        delta: max timestep difference for consistency pairs.
+    """
+    L = z0.shape[0]
+    # Sample two nearby timesteps
+    t1 = torch.rand(1, device=z0.device).expand(L)
+    t2 = (t1 + delta * (torch.rand_like(t1) - 0.5)).clamp(0.01, 0.99)
+
+    z_t1 = q_sample_flow(z0, t1, noise)
+    z_t2 = q_sample_flow(z0, t2, noise)
+
+    out1 = model(ts=z_t1, text=text_latent, ts_shape=ts_shape,
+                 text_shape=text_shape, timestep=t1, attn_mask=attn_mask)
+    out2 = model(ts=z_t2, text=text_latent, ts_shape=ts_shape,
+                 text_shape=text_shape, timestep=t2, attn_mask=attn_mask)
+
+    return F.mse_loss(out1.ts_sample, out2.ts_sample)
+
+
+# ---------------------------------------------------------------------------
+# Innovation D: Semantic Curriculum — complexity-scored batch ordering
+# ---------------------------------------------------------------------------
+
+
+class CurriculumSampler:
+    """Sampler that orders by text complexity for early epochs, then random.
+
+    Uses text embedding L2 norm as complexity proxy. During curriculum
+    epochs, batches are ordered simple→complex. After curriculum, standard
+    random shuffle is used.
+    """
+
+    def __init__(self, dataset, num_epochs: int, curriculum_epochs: int, batch_size: int, seed: int = 42):
+        self.dataset = dataset
+        self.num_epochs = num_epochs
+        self.curriculum_epochs = curriculum_epochs
+        self.batch_size = batch_size
+        self.seed = seed
+        # Pre-compute complexity scores from text embeddings
+        self._scores = self._compute_scores()
+
+    def _compute_scores(self) -> np.ndarray:
+        scores = []
+        for i in range(len(self.dataset)):
+            sample = self.dataset[i]
+            emb = sample["text_embedding"]
+            scores.append(float(torch.norm(emb, p=2).item()))
+        return np.array(scores)
+
+    def get_indices(self, epoch: int) -> list[int]:
+        n = len(self.dataset)
+        rng = np.random.RandomState(self.seed + epoch)
+        if epoch < self.curriculum_epochs:
+            # Progressive curriculum: fraction of easy samples increases
+            progress = (epoch + 1) / self.curriculum_epochs
+            n_include = max(self.batch_size * 2, int(n * progress))
+            # Select n_include samples with lowest complexity
+            sorted_indices = np.argsort(self._scores)
+            indices = sorted_indices[:n_include].tolist()
+            rng.shuffle(indices)
+        else:
+            indices = list(range(n))
+            rng.shuffle(indices)
+        return indices
 
 
 # ---------------------------------------------------------------------------
@@ -84,8 +251,8 @@ def expand_timesteps_per_token(
 # ---------------------------------------------------------------------------
 
 
-def sample_lambda(batch_size: int, device: torch.device, alpha: float = 0.2) -> torch.Tensor:
-    """Sample mixing coefficient from Beta distribution."""
+def sample_lambda(batch_size: int, device: torch.device, alpha: float = 0.4) -> torch.Tensor:
+    """Sample mixing coefficient from Beta distribution (Engineering: Beta(0.4,0.4) for stronger mixing)."""
     dist = torch.distributions.Beta(alpha, alpha)
     return dist.sample((batch_size,)).to(device)
 
@@ -319,6 +486,15 @@ def main():
     parser.add_argument("--use_adaptive_routing", action="store_true", help="Use semantic router")
     parser.add_argument("--cfg_drop_prob", type=float, default=0.1, help="CFG condition dropout prob")
     parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps")
+    # Innovation E: Text-Adaptive SNR
+    parser.add_argument("--snr_alpha", type=float, default=0.3, help="Text-adaptive SNR strength (0=uniform)")
+    # Innovation F: Consistency Distillation
+    parser.add_argument("--gamma_cons", type=float, default=0.1, help="Consistency distillation loss weight")
+    parser.add_argument("--cons_delta", type=float, default=0.05, help="Timestep delta for consistency pairs")
+    # Innovation D: Curriculum
+    parser.add_argument("--curriculum_epochs", type=int, default=3, help="Epochs of curriculum (simple->complex)")
+    # Engineering: EMA
+    parser.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay rate (0=disabled)")
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--split_file", type=str, default=None, help="Path to splits.json for train/val split")
     parser.add_argument("--seed", type=int, default=42)
@@ -331,7 +507,7 @@ def main():
     device = torch.device(args.device)
 
     # Load VAE
-    vae_ckpt = torch.load(args.vae_checkpoint, map_location=device)
+    vae_ckpt = torch.load(args.vae_checkpoint, map_location=device, weights_only=False)
     vae_config = MMLDMVAEConfig(**vae_ckpt["config"])
     vae = MMLDMVAEModel(vae_config).to(device)
     vae.load_state_dict(vae_ckpt["model_state_dict"])
@@ -356,6 +532,11 @@ def main():
     dit = MMLDMDiTModel(dit_config).to(device)
     dit_param_count = sum(p.numel() for p in dit.parameters())
     print(f"DiT parameters: {dit_param_count:,}")
+
+    # Engineering: EMA
+    ema = EMA(dit, decay=args.ema_decay) if args.ema_decay > 0 else None
+    if ema:
+        print(f"EMA enabled with decay={args.ema_decay}")
 
     # Optional semantic router
     router = None
@@ -392,13 +573,31 @@ def main():
         train_ds, val_ds = random_split(dataset, [len(dataset) - val_size, val_size])
         print(f"Loaded {len(dataset)} samples (random split, no split_file)")
 
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        collate_fn=collate, num_workers=0, pin_memory=True,
-    )
+    # Innovation D: Curriculum sampler
+    curriculum = None
+    if args.curriculum_epochs > 0 and len(train_ds) > 0:
+        curriculum = CurriculumSampler(
+            train_ds, num_epochs=args.epochs,
+            curriculum_epochs=args.curriculum_epochs,
+            batch_size=args.batch_size, seed=args.seed,
+        )
+        print(f"Curriculum learning enabled for first {args.curriculum_epochs} epochs")
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         collate_fn=collate, num_workers=0,
+    )
+
+    # DataLoader — shuffle handled by curriculum or default
+    _sampler = None
+    _shuffle = True
+    if curriculum is not None:
+        from torch.utils.data import SubsetRandomSampler
+        _sampler = SubsetRandomSampler(curriculum.get_indices(0))
+        _shuffle = False
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=_shuffle,
+        sampler=_sampler, collate_fn=collate, num_workers=0, pin_memory=True,
     )
 
     # Optimizer with param groups (no weight decay for norms/biases)
@@ -442,9 +641,18 @@ def main():
     best_val_loss = float("inf")
 
     for epoch in range(args.epochs):
+        # Innovation D: Refresh curriculum indices each epoch
+        if curriculum is not None:
+            from torch.utils.data import SubsetRandomSampler
+            train_loader = DataLoader(
+                train_ds, batch_size=args.batch_size,
+                sampler=SubsetRandomSampler(curriculum.get_indices(epoch)),
+                collate_fn=collate, num_workers=0, pin_memory=True,
+            )
+
         dit.train()
         # Router stays in eval mode — it's a frozen heuristic module
-        epoch_losses = {"total": 0.0, "fm": 0.0, "dcd_mix": 0.0, "dcd_aux": 0.0}
+        epoch_losses = {"total": 0.0, "fm": 0.0, "dcd_mix": 0.0, "dcd_aux": 0.0, "cons": 0.0}
         t0 = time.time()
 
         optimizer.zero_grad()
@@ -462,7 +670,9 @@ def main():
             # Encode with VAE
             with torch.no_grad():
                 enc_output = vae.encode(ot_list)
-                z_list = [d.sample() for d in enc_output.latent_dists]
+                trend_dists, residual_dists = enc_output.latent_dists
+                z_list = [torch.cat([td.sample(), rd.sample()], dim=-1)
+                          for td, rd in zip(trend_dists, residual_dists)]
 
             z0 = torch.cat(z_list, dim=0)  # (L_total, latent_dim)
             ts_shape = torch.tensor(
@@ -482,8 +692,10 @@ def main():
             # Per-sample text: each sample gets 1 text token
             text_shape = torch.tensor([[1]] * B, dtype=torch.long, device=device)
 
-            # Sample per-sample timestep, then expand to per-token
+            # Innovation E: Text-Adaptive SNR — bias timesteps by text complexity
             t_per_sample = torch.rand(B, device=device)
+            if args.snr_alpha > 0:
+                t_per_sample = text_adaptive_timestep(text_latent, t_per_sample, args.snr_alpha)
             t_per_token = expand_timesteps_per_token(t_per_sample, ts_shape)
 
             noise = torch.randn_like(z0)
@@ -554,7 +766,16 @@ def main():
                     attn_mask=dcd_mask,
                 )
 
-            total = (l_fm + args.gamma1 * l_dcd_mix + args.gamma2 * l_dcd_aux)
+            # Innovation F: Consistency Distillation loss
+            l_cons = torch.tensor(0.0, device=device)
+            if args.gamma_cons > 0:
+                l_cons = compute_consistency_loss(
+                    dit, z0, text_latent, ts_shape, text_shape, noise,
+                    attn_mask=attn_mask, delta=args.cons_delta,
+                )
+
+            total = (l_fm + args.gamma1 * l_dcd_mix + args.gamma2 * l_dcd_aux
+                     + args.gamma_cons * l_cons)
             total = total / args.grad_accum_steps
             total.backward()
 
@@ -563,6 +784,9 @@ def main():
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                # Engineering: EMA update
+                if ema:
+                    ema.update(dit)
 
             global_step += 1
 
@@ -570,6 +794,7 @@ def main():
             epoch_losses["fm"] += l_fm.item()
             epoch_losses["dcd_mix"] += l_dcd_mix.item()
             epoch_losses["dcd_aux"] += l_dcd_aux.item()
+            epoch_losses["cons"] += l_cons.item()
 
             if (step + 1) % args.log_interval == 0:
                 avg = {k: v / (step + 1) for k, v in epoch_losses.items()}
@@ -577,6 +802,7 @@ def main():
                     f"  Epoch {epoch+1} Step {step+1}/{len(train_loader)}: "
                     f"loss={avg['total']:.4f} fm={avg['fm']:.4f} "
                     f"dcd_mix={avg['dcd_mix']:.4f} dcd_aux={avg['dcd_aux']:.4f} "
+                    f"cons={avg.get('cons', 0.0):.4f} "
                     f"lr={scheduler.get_last_lr()[0]:.2e} grad_norm={last_grad_norm:.2f}"
                 )
 
@@ -585,11 +811,14 @@ def main():
         print(
             f"Epoch {epoch+1}/{args.epochs} ({elapsed:.1f}s): "
             f"loss={avg['total']:.4f} fm={avg['fm']:.4f} "
-            f"dcd_mix={avg['dcd_mix']:.4f} dcd_aux={avg['dcd_aux']:.4f}"
+            f"dcd_mix={avg['dcd_mix']:.4f} dcd_aux={avg['dcd_aux']:.4f} "
+            f"cons={avg.get('cons', 0.0):.4f}"
         )
 
-        # Validation
+        # Validation (use EMA weights if available)
         dit.eval()
+        if ema:
+            ema.apply(dit)
         val_loss = 0.0
         val_fm = 0.0
         with torch.no_grad():
@@ -601,7 +830,9 @@ def main():
                 ot_list = [ot[i, :ot_lengths[i]] for i in range(B_v)]
 
                 enc_output_v = vae.encode(ot_list)
-                z_list = [d.sample() for d in enc_output_v.latent_dists]
+                trend_dists_v, residual_dists_v = enc_output_v.latent_dists
+                z_list = [torch.cat([td.sample(), rd.sample()], dim=-1)
+                          for td, rd in zip(trend_dists_v, residual_dists_v)]
                 z0_v = torch.cat(z_list, dim=0)
                 ts_shape_v = torch.tensor(
                     [[z.shape[0]] for z in z_list], dtype=torch.long, device=device,
@@ -621,11 +852,16 @@ def main():
 
         val_loss /= max(len(val_loader), 1)
         val_fm /= max(len(val_loader), 1)
+        if ema:
+            ema.restore(dit)
         print(f"  Val loss: {val_loss:.4f} (fm={val_fm:.4f})")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_ckpt_path = save_dir / "best.pt"
+            # Save EMA weights for best checkpoint (better inference quality)
+            if ema:
+                ema.apply(dit)
             torch.save(
                 {
                     "epoch": epoch + 1,
@@ -637,6 +873,8 @@ def main():
                 best_ckpt_path,
             )
             print(f"  New best model saved: {best_ckpt_path}")
+            if ema:
+                ema.restore(dit)
 
         # Save checkpoint
         ckpt_path = save_dir / f"epoch_{epoch+1}.pt"

@@ -401,20 +401,24 @@ def generate_timeseries(
 def _load_models(args, device):
     """Load VAE, DiT, and optional router from checkpoints."""
     # VAE
-    vae_ckpt = torch.load(args.vae_checkpoint, map_location=device)
+    vae_ckpt = torch.load(args.vae_checkpoint, map_location=device, weights_only=False)
     vae_config = MMLDMVAEConfig(**vae_ckpt["config"])
     vae = MMLDMVAEModel(vae_config).to(device)
-    vae.load_state_dict(vae_ckpt["model_state_dict"])
+    missing, unexpected = vae.load_state_dict(vae_ckpt["model_state_dict"], strict=False)
+    if missing:
+        print(f"  WARNING: VAE missing keys: {missing}")
     vae.eval()
     for p in vae.parameters():
         p.requires_grad = False
     print(f"Loaded VAE from {args.vae_checkpoint}")
 
     # DiT
-    dit_ckpt = torch.load(args.dit_checkpoint, map_location=device)
+    dit_ckpt = torch.load(args.dit_checkpoint, map_location=device, weights_only=False)
     dit_config = MMLDMDiTConfig(**dit_ckpt["config"])
     dit = MMLDMDiTModel(dit_config).to(device)
-    dit.load_state_dict(dit_ckpt["dit_state_dict"])
+    missing, unexpected = dit.load_state_dict(dit_ckpt["dit_state_dict"], strict=False)
+    if missing:
+        print(f"  WARNING: DiT missing keys: {missing}")
     dit.eval()
     for p in dit.parameters():
         p.requires_grad = False
@@ -433,7 +437,12 @@ def _load_models(args, device):
 
 
 def _encode_text_sbert(text_str: str, text_dim: int, device: torch.device) -> torch.Tensor:
-    """Encode text via Sentence-BERT, with fallback to random."""
+    """Encode text via Sentence-BERT with deterministic projection.
+
+    Uses mean-pooling of last hidden state, then projects to text_dim.
+    If SBERT unavailable, falls back to hash-based deterministic embeddings
+    (not random — random gives different results each run).
+    """
     try:
         from transformers import AutoModel, AutoTokenizer
 
@@ -444,12 +453,25 @@ def _encode_text_sbert(text_str: str, text_dim: int, device: torch.device) -> to
         inputs = tokenizer(text_str, return_tensors="pt", padding=True, truncation=True).to(device)
         with torch.no_grad():
             emb = sbert(**inputs).last_hidden_state.mean(dim=1)  # (1, 384)
-        if emb.shape[-1] != text_dim:
-            emb = torch.nn.Linear(emb.shape[-1], text_dim, device=device)(emb)
+        # Deterministic projection: use first `text_dim` dims (preserves more
+        # semantics than a random Linear; SBERT dims are roughly equally informative)
+        if emb.shape[-1] > text_dim:
+            emb = emb[:, :text_dim]
+        elif emb.shape[-1] < text_dim:
+            emb = F.pad(emb, (0, text_dim - emb.shape[-1]))
         del sbert, tokenizer
         return emb
-    except Exception:
-        return torch.randn(1, text_dim, device=device)
+    except Exception as e:
+        print(f"  WARNING: Sentence-BERT encoding failed ({e}), using hash-based embeddings")
+        # Deterministic fallback: hash-based pseudo-embedding
+        import hashlib
+        h = hashlib.sha256(text_str.encode()).digest()
+        vec = torch.tensor([b / 255.0 for b in h], dtype=torch.float32, device=device)
+        if vec.shape[0] < text_dim:
+            vec = vec.repeat((text_dim // vec.shape[0]) + 1)[:text_dim]
+        else:
+            vec = vec[:text_dim]
+        return vec.unsqueeze(0)
 
 
 def main():

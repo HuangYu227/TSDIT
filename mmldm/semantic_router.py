@@ -114,7 +114,10 @@ class AlignmentProjector(nn.Module):
 
         # Project to latent-length scores
         scores = self.proj(weighted_text)  # (B, latent_len)
-        scores = scores[:, :n_latent]  # truncate to actual latent length
+        if n_latent > scores.shape[-1]:
+            scores = scores.repeat(1, (n_latent // scores.shape[-1]) + 1)[:, :n_latent]
+        else:
+            scores = scores[:, :n_latent]
         return scores
 
 
@@ -214,6 +217,8 @@ class BlockAllocator(nn.Module):
                 # Safety: if no block can absorb, force into last block
                 if diff > 0:
                     block_sizes[-1] += diff
+                elif diff < 0:
+                    block_sizes[-1] = max(self.min_block_size, block_sizes[-1] + diff)
                 break
 
         return block_sizes
