@@ -409,6 +409,12 @@ class MMLDMVAEModel(PreTrainedModel):
         z_list = [torch.cat([t, r], dim=-1) for t, r in zip(trend_samples, residual_samples)]
 
         z = torch.cat(z_list, dim=0)
+        # Standardize latent to prevent decoder from receiving unbounded values
+        if self._latent_stats_computed.item():
+            z = self.standardize_latent(z)
+        else:
+            # Batch-level standardization as fallback (first few epochs)
+            z = (z - z.mean(dim=0)) / z.std(dim=0).clamp(min=1e-6)
         ts_shape = torch.tensor([[z_i.shape[0]] for z_i in z_list], dtype=torch.long, device=z.device)
         recon = self.decode(z, ts_shape)
 
