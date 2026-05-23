@@ -122,6 +122,7 @@ def main():
     parser.add_argument("--split_file", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_dir", type=str, default="./checkpoints/stage1_v2")
+    parser.add_argument("--resume_checkpoint", type=str, default=None, help="Resume finetuning from checkpoint")
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -158,7 +159,13 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                             collate_fn=collate, num_workers=0)
 
-    model = MMLDMVAEModel(config).to(device)
+    if args.resume_checkpoint:
+        ckpt = torch.load(args.resume_checkpoint, map_location=device, weights_only=False)
+        model = MMLDMVAEModel(config).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        print(f"Resumed from {args.resume_checkpoint} (epoch {ckpt.get('epoch', '?')})")
+    else:
+        model = MMLDMVAEModel(config).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     decay_params, no_decay_params = [], []

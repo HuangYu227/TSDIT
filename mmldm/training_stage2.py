@@ -491,6 +491,8 @@ def main():
     # Innovation F: Consistency Distillation
     parser.add_argument("--gamma_cons", type=float, default=0.1, help="Consistency distillation loss weight")
     parser.add_argument("--cons_delta", type=float, default=0.05, help="Timestep delta for consistency pairs")
+    parser.add_argument("--cons_warmup_epochs", type=int, default=10, help="Epochs before enabling cons loss")
+    parser.add_argument("--min_lr", type=float, default=1e-6, help="Minimum learning rate")
     # Innovation D: Curriculum
     parser.add_argument("--curriculum_epochs", type=int, default=3, help="Epochs of curriculum (simple->complex)")
     # Engineering: EMA
@@ -573,6 +575,34 @@ def main():
         train_ds, val_ds = random_split(dataset, [len(dataset) - val_size, val_size])
         print(f"Loaded {len(dataset)} samples (random split, no split_file)")
 
+    # Compute dataset-level latent statistics for standardization
+    print("Computing dataset-level latent statistics...")
+    _stat_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False,
+                              collate_fn=collate, num_workers=0)
+    _all_latents = []
+    with torch.no_grad():
+        for _batch in _stat_loader:
+            _ot = _batch["ot"].to(device)
+            _ot_lengths = _batch["ot_lengths"]
+            _ot_list = [_ot[i, :_ot_lengths[i]] for i in range(_ot.shape[0])]
+            _enc = vae.encode(_ot_list)
+            _trend_d, _res_d = _enc.latent_dists
+            _z = [torch.cat([td.mean, rd.mean], dim=-1)
+                  for td, rd in zip(_trend_d, _res_d)]
+            _all_latents.extend(_z)
+    vae.compute_latent_stats(_all_latents)
+    print(f"  Latent stats: mean={vae.latent_mean.mean():.4f}, std={vae.latent_std.mean():.4f}")
+    del _all_latents, _stat_loader
+
+    # Save VAE with latent stats for inference
+    vae_with_stats_path = Path(args.save_dir) / "vae_with_stats.pt"
+    vae_with_stats_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "model_state_dict": vae.state_dict(),
+        "config": vae_config.to_dict(),
+    }, vae_with_stats_path)
+    print(f"  Saved VAE with latent stats: {vae_with_stats_path}")
+
     # Innovation D: Curriculum sampler
     curriculum = None
     if args.curriculum_epochs > 0 and len(train_ds) > 0:
@@ -623,14 +653,15 @@ def main():
         lr=args.lr,
     )
 
-    # Warmup + cosine scheduler
+    # Warmup + cosine scheduler with minimum LR
+    min_lr_ratio = args.min_lr / max(args.lr, 1e-10)
     def lr_lambda(step):
         if step < args.warmup_steps:
             return step / max(args.warmup_steps, 1)
         progress = (step - args.warmup_steps) / max(
             len(train_loader) * args.epochs - args.warmup_steps, 1
         )
-        return 0.5 * (1 + np.cos(np.pi * progress))
+        return max(0.5 * (1 + np.cos(np.pi * progress)), min_lr_ratio)
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -667,14 +698,16 @@ def main():
             # Convert to list
             ot_list = [ot[i, :ot_lengths[i]] for i in range(B)]
 
-            # Encode with VAE
+            # Encode with VAE (use mean for stable targets)
             with torch.no_grad():
                 enc_output = vae.encode(ot_list)
                 trend_dists, residual_dists = enc_output.latent_dists
-                z_list = [torch.cat([td.sample(), rd.sample()], dim=-1)
+                z_list = [torch.cat([td.mean, rd.mean], dim=-1)
                           for td, rd in zip(trend_dists, residual_dists)]
 
             z0 = torch.cat(z_list, dim=0)  # (L_total, latent_dim)
+            # Standardize latent using dataset-level stats
+            z0 = vae.standardize_latent(z0)
             ts_shape = torch.tensor(
                 [[z.shape[0]] for z in z_list], dtype=torch.long, device=device
             )
@@ -766,9 +799,9 @@ def main():
                     attn_mask=dcd_mask,
                 )
 
-            # Innovation F: Consistency Distillation loss
+            # Innovation F: Consistency Distillation loss (delayed warmup)
             l_cons = torch.tensor(0.0, device=device)
-            if args.gamma_cons > 0:
+            if args.gamma_cons > 0 and epoch >= args.cons_warmup_epochs:
                 l_cons = compute_consistency_loss(
                     dit, z0, text_latent, ts_shape, text_shape, noise,
                     attn_mask=attn_mask, delta=args.cons_delta,
@@ -831,9 +864,11 @@ def main():
 
                 enc_output_v = vae.encode(ot_list)
                 trend_dists_v, residual_dists_v = enc_output_v.latent_dists
-                z_list = [torch.cat([td.sample(), rd.sample()], dim=-1)
+                z_list = [torch.cat([td.mean, rd.mean], dim=-1)
                           for td, rd in zip(trend_dists_v, residual_dists_v)]
                 z0_v = torch.cat(z_list, dim=0)
+                # Standardize latent using dataset-level stats
+                z0_v = vae.standardize_latent(z0_v)
                 ts_shape_v = torch.tensor(
                     [[z.shape[0]] for z in z_list], dtype=torch.long, device=device,
                 )
