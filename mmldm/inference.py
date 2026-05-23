@@ -386,6 +386,9 @@ def generate_timeseries(
     else:
         z = z_generated
 
+    # Standardize latent to match VAE decoder's training distribution
+    # (VAE forward applies batch-level standardization before decode)
+    z = (z - z.mean(dim=0)) / z.std(dim=0).clamp(min=1e-6)
     z_shape = _shape_tensor([z.shape[0]], device)
     recon = vae.decode(z, z_shape)
     ts_out = recon[:, :output_len, :]
