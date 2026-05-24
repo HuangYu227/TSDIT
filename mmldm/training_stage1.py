@@ -110,6 +110,7 @@ def main():
     parser.add_argument("--kl_anneal_end", type=float, default=1e-5)
     parser.add_argument("--gamma_spectral", type=float, default=0.1, help="Spectral loss weight")
     parser.add_argument("--gamma_tclr", type=float, default=0.1, help="TCLR loss weight")
+    parser.add_argument("--fft_cutoff_ratio", type=float, default=0.3, help="FFT cutoff ratio for trend/residual split")
     parser.add_argument("--dim", type=int, default=256)
     parser.add_argument("--latent_dim", type=int, default=64)
     parser.add_argument("--num_heads", type=int, default=4)
@@ -137,6 +138,7 @@ def main():
         encoder_num_blocks=args.encoder_blocks, decoder_num_blocks=args.decoder_blocks,
         block_size=args.block_size, kl_anneal_start=args.kl_anneal_start,
         kl_anneal_end=args.kl_anneal_end, kl_anneal_epochs=args.kl_anneal_epochs,
+        fft_cutoff_ratio=args.fft_cutoff_ratio,
     )
 
     if args.split_file is not None:
