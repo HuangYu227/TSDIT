@@ -134,6 +134,9 @@ class MMLDMDiTConfig(PretrainedConfig):
         block_size: int = 8,
         text_latent_dim: int = 0,
         n_text_views: int = 1,
+        use_anchor_residual: bool = False,
+        anchor_hidden_dim: int = 256,
+        residual_gate_alpha: float = 0.3,
         **kwargs,
     ):
         self.ts_in_channels = ts_in_channels
@@ -153,4 +156,7 @@ class MMLDMDiTConfig(PretrainedConfig):
         self.block_size = block_size
         self.text_latent_dim = text_latent_dim
         self.n_text_views = n_text_views
+        self.use_anchor_residual = use_anchor_residual
+        self.anchor_hidden_dim = anchor_hidden_dim
+        self.residual_gate_alpha = residual_gate_alpha
         super().__init__(**kwargs)

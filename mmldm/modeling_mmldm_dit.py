@@ -372,6 +372,107 @@ class MultiViewTextPooler(nn.Module):
         return [v(text_emb) for v in self.views]
 
 
+class LatentAnchorNet(nn.Module):
+    """Text-conditioned latent anchor for FAARD-Causal.
+
+    Predicts the conditional-mean latent trajectory in standardized VAE latent
+    space. The residual DiT then models ``z0 - stopgrad(z_anchor)``.
+    """
+
+    def __init__(
+        self,
+        text_dim: int,
+        raw_text_dim: int,
+        latent_dim: int,
+        hidden_dim: int = 256,
+    ):
+        super().__init__()
+        self.text_dim = text_dim
+        self.raw_text_dim = raw_text_dim
+        cond_dim = text_dim + raw_text_dim
+
+        self.cond_proj = nn.Sequential(
+            nn.Linear(cond_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.token_mlp = nn.Sequential(
+            nn.Linear(hidden_dim + 4, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def _condition(
+        self,
+        text: torch.Tensor,
+        text_raw: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        B = text.shape[0]
+        if self.raw_text_dim == 0:
+            text_raw = torch.empty(B, 0, device=text.device, dtype=text.dtype)
+        elif text_raw is None:
+            text_raw = torch.zeros(
+                B, self.raw_text_dim, device=text.device, dtype=text.dtype,
+            )
+        else:
+            text_raw = text_raw.to(device=text.device, dtype=text.dtype)
+            if text_raw.shape[-1] > self.raw_text_dim:
+                text_raw = text_raw[..., :self.raw_text_dim]
+            elif text_raw.shape[-1] < self.raw_text_dim:
+                pad = torch.zeros(
+                    B,
+                    self.raw_text_dim - text_raw.shape[-1],
+                    device=text.device,
+                    dtype=text.dtype,
+                )
+                text_raw = torch.cat([text_raw, pad], dim=-1)
+        cond = torch.cat([text, text_raw], dim=-1)
+        return self.cond_proj(cond)
+
+    def forward(
+        self,
+        text: torch.Tensor,
+        ts_shape: torch.LongTensor,
+        text_raw: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(z_anchor, residual_gate_logits)`` in flat NA layout."""
+        cond = self._condition(text, text_raw)
+        anchors = []
+        gates = []
+        lengths = ts_shape.flatten().tolist()
+        for i, length in enumerate(lengths):
+            if length <= 0:
+                continue
+            if length == 1:
+                pos = torch.zeros(1, 1, device=text.device, dtype=text.dtype)
+            else:
+                pos = torch.linspace(0.0, 1.0, length, device=text.device, dtype=text.dtype).unsqueeze(-1)
+            pos_feat = torch.cat([
+                pos,
+                pos * pos,
+                torch.sin(2 * torch.pi * pos),
+                torch.cos(2 * torch.pi * pos),
+            ], dim=-1)
+            cond_i = cond[i].unsqueeze(0).expand(length, -1)
+            anchors.append(self.token_mlp(torch.cat([cond_i, pos_feat], dim=-1)))
+            gates.append(self.gate_mlp(cond[i]).expand(length, 1))
+
+        if not anchors:
+            latent_dim = self.token_mlp[-1].out_features
+            empty_anchor = torch.empty(0, latent_dim, device=text.device, dtype=text.dtype)
+            empty_gate = torch.empty(0, 1, device=text.device, dtype=text.dtype)
+            return empty_anchor, empty_gate
+        return torch.cat(anchors, dim=0), torch.cat(gates, dim=0)
+
+
 # ---------------------------------------------------------------------------
 # Multimodal Joint Attention (for DiT)
 # ---------------------------------------------------------------------------
@@ -679,6 +780,8 @@ class MMLDMDiTModel(PreTrainedModel):
         self.heads = config.heads
         self.text_latent_dim = getattr(config, 'text_latent_dim', 0)
         self.n_text_views = getattr(config, 'n_text_views', 1)
+        self.use_anchor_residual = getattr(config, 'use_anchor_residual', False)
+        self.residual_gate_alpha = getattr(config, 'residual_gate_alpha', 0.3)
 
         # Multi-View Text Pooler (MVTC)
         if self.text_latent_dim > 0 and self.n_text_views > 1:
@@ -688,6 +791,16 @@ class MMLDMDiTModel(PreTrainedModel):
             )
         else:
             self.text_pooler = None
+
+        if self.use_anchor_residual:
+            self.anchor_net = LatentAnchorNet(
+                text_dim=config.text_in_channels,
+                raw_text_dim=max(0, self.text_latent_dim),
+                latent_dim=config.ts_out_channels,
+                hidden_dim=getattr(config, 'anchor_hidden_dim', config.txt_dim),
+            )
+        else:
+            self.anchor_net = None
 
         # Patch embedding
         self.ts_in = PatchIn1D(
@@ -773,6 +886,26 @@ class MMLDMDiTModel(PreTrainedModel):
         nn.init.zeros_(self.ts_out.proj.bias)
         nn.init.zeros_(self.text_out.proj.weight)
         nn.init.zeros_(self.text_out.proj.bias)
+
+    def predict_anchor(
+        self,
+        text: torch.FloatTensor,
+        ts_shape: torch.LongTensor,
+        text_raw: Optional[torch.FloatTensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict FAARD anchor and residual gate logits in flat latent layout."""
+        if self.anchor_net is None:
+            z_anchor = torch.zeros(
+                int(ts_shape.sum().item()),
+                self.config.ts_out_channels,
+                device=text.device,
+                dtype=text.dtype,
+            )
+            gate_logits = torch.zeros(
+                z_anchor.shape[0], 1, device=text.device, dtype=text.dtype,
+            )
+            return z_anchor, gate_logits
+        return self.anchor_net(text=text, text_raw=text_raw, ts_shape=ts_shape)
 
     def forward(
         self,

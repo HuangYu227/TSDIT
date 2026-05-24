@@ -545,6 +545,10 @@ def main():
     parser.add_argument("--gamma_weighted", type=float, default=0.05, help="Frequency-weighted 1/k loss weight")
     # Innovation: Diffusion Batch Multiplication
     parser.add_argument("--batch_mul", type=int, default=1, help="Repeat each sample N times with different t (1=disabled)")
+    # FAARD-Causal v1: latent anchor + residual diffusion target
+    parser.add_argument("--disable_anchor_residual", action="store_true", help="Disable FAARD anchor-residual training")
+    parser.add_argument("--anchor_loss_weight", type=float, default=1.0, help="Weight for MSE(z_anchor, z0)")
+    parser.add_argument("--residual_gate_alpha", type=float, default=0.3, help="Inference residual gate scale")
     # Innovation E: Text-Adaptive SNR
     parser.add_argument("--snr_alpha", type=float, default=0.3, help="Text-adaptive SNR strength (0=uniform)")
     # Innovation F: Consistency Distillation
@@ -591,10 +595,18 @@ def main():
         block_size=args.block_size,
         text_latent_dim=128,  # TGFM: raw SBERT embedding dim
         n_text_views=4,       # MVTC: K orthogonal text views
+        use_anchor_residual=not args.disable_anchor_residual,
+        anchor_hidden_dim=args.dit_dim,
+        residual_gate_alpha=args.residual_gate_alpha,
     )
     dit = MMLDMDiTModel(dit_config).to(device)
     dit_param_count = sum(p.numel() for p in dit.parameters())
     print(f"DiT parameters: {dit_param_count:,}")
+    if dit.use_anchor_residual:
+        print(
+            f"FAARD anchor-residual enabled "
+            f"(anchor_loss_weight={args.anchor_loss_weight}, residual_gate_alpha={args.residual_gate_alpha})"
+        )
 
     # Engineering: EMA
     ema = EMA(dit, decay=args.ema_decay) if args.ema_decay > 0 else None
@@ -749,7 +761,7 @@ def main():
 
         dit.train()
         # Router stays in eval mode — it's a frozen heuristic module
-        epoch_losses = {"total": 0.0, "fm": 0.0, "dcd_mix": 0.0, "dcd_aux": 0.0, "cons": 0.0}
+        epoch_losses = {"total": 0.0, "fm": 0.0, "anchor": 0.0, "dcd_mix": 0.0, "dcd_aux": 0.0, "cons": 0.0}
         t0 = time.time()
 
         optimizer.zero_grad()
@@ -824,9 +836,17 @@ def main():
                         args.block_size, device=device, dtype=z0.dtype,
                     )
 
+            # FAARD-Causal: anchor predicts conditional-mean latent; DiT learns residual flow.
+            l_anchor = torch.tensor(0.0, device=device)
+            z0_flow = z0
+            if dit.use_anchor_residual:
+                z_anchor, _ = dit.predict_anchor(text_latent, ts_shape, text_raw=text_emb)
+                l_anchor = F.mse_loss(z_anchor, z0)
+                z0_flow = z0 - z_anchor.detach()
+
             # Flow Matching loss
             l_fm = compute_flow_matching_loss(
-                dit, z0, text_latent, ts_shape, text_shape, t_per_token, noise,
+                dit, z0_flow, text_latent, ts_shape, text_shape, t_per_token, noise,
                 attn_mask=attn_mask, text_raw=text_emb,
                 gamma_freq=args.gamma_freq, gamma_weighted=args.gamma_weighted,
             )
@@ -841,8 +861,8 @@ def main():
                 # When B is odd, the last sample is silently dropped.
                 cut_a = ts_shape[:half].sum().item()
                 cut_b = ts_shape[:half * 2].sum().item()
-                z0_a = z0[:cut_a]
-                z0_b = z0[cut_a:cut_b]
+                z0_a = z0_flow[:cut_a]
+                z0_b = z0_flow[cut_a:cut_b]
                 ts_shape_a = ts_shape[:half]
                 ts_shape_b = ts_shape[half:half * 2]
 
@@ -888,12 +908,13 @@ def main():
             l_cons = torch.tensor(0.0, device=device)
             if args.gamma_cons > 0 and epoch >= args.cons_warmup_epochs:
                 l_cons = compute_consistency_loss(
-                    dit, z0, text_latent, ts_shape, text_shape, noise,
+                    dit, z0_flow, text_latent, ts_shape, text_shape, noise,
                     attn_mask=attn_mask, delta=args.cons_delta,
                     text_raw=text_emb,
                 )
 
-            total = (l_fm + args.gamma1 * l_dcd_mix + args.gamma2 * l_dcd_aux
+            total = (l_fm + args.anchor_loss_weight * l_anchor
+                     + args.gamma1 * l_dcd_mix + args.gamma2 * l_dcd_aux
                      + args.gamma_cons * l_cons)
             total = total / args.grad_accum_steps
             total.backward()
@@ -911,6 +932,7 @@ def main():
 
             epoch_losses["total"] += (total.item() * args.grad_accum_steps)
             epoch_losses["fm"] += l_fm.item()
+            epoch_losses["anchor"] += l_anchor.item()
             epoch_losses["dcd_mix"] += l_dcd_mix.item()
             epoch_losses["dcd_aux"] += l_dcd_aux.item()
             epoch_losses["cons"] += l_cons.item()
@@ -920,6 +942,7 @@ def main():
                 print(
                     f"  Epoch {epoch+1} Step {step+1}/{len(train_loader)}: "
                     f"loss={avg['total']:.4f} fm={avg['fm']:.4f} "
+                    f"anchor={avg['anchor']:.4f} "
                     f"dcd_mix={avg['dcd_mix']:.4f} dcd_aux={avg['dcd_aux']:.4f} "
                     f"cons={avg.get('cons', 0.0):.4f} "
                     f"lr={scheduler.get_last_lr()[0]:.2e} grad_norm={last_grad_norm:.2f}"
@@ -930,6 +953,7 @@ def main():
         print(
             f"Epoch {epoch+1}/{args.epochs} ({elapsed:.1f}s): "
             f"loss={avg['total']:.4f} fm={avg['fm']:.4f} "
+            f"anchor={avg['anchor']:.4f} "
             f"dcd_mix={avg['dcd_mix']:.4f} dcd_aux={avg['dcd_aux']:.4f} "
             f"cons={avg.get('cons', 0.0):.4f}"
         )
@@ -940,6 +964,7 @@ def main():
             ema.apply(dit)
         val_loss = 0.0
         val_fm = 0.0
+        val_anchor = 0.0
         with torch.no_grad():
             for val_batch in val_loader:
                 ot = val_batch["ot"].to(device)
@@ -965,20 +990,28 @@ def main():
                     t_v = text_adaptive_timestep(text_latent_v, t_v, args.snr_alpha)
                 t_pt_v = expand_timesteps_per_token(t_v, ts_shape_v)
                 noise_v = torch.randn_like(z0_v)
+                l_anchor_v = torch.tensor(0.0, device=device)
+                z0_flow_v = z0_v
+                if dit.use_anchor_residual:
+                    z_anchor_v, _ = dit.predict_anchor(text_latent_v, ts_shape_v, text_raw=text_emb)
+                    l_anchor_v = F.mse_loss(z_anchor_v, z0_v)
+                    z0_flow_v = z0_v - z_anchor_v
 
                 l_fm_v = compute_flow_matching_loss(
-                    dit, z0_v, text_latent_v, ts_shape_v, text_shape_v,
+                    dit, z0_flow_v, text_latent_v, ts_shape_v, text_shape_v,
                     t_pt_v, noise_v, text_raw=text_emb,
                     gamma_freq=args.gamma_freq, gamma_weighted=args.gamma_weighted,
                 )
-                val_loss += l_fm_v.item()
+                val_loss += (l_fm_v + args.anchor_loss_weight * l_anchor_v).item()
                 val_fm += l_fm_v.item()
+                val_anchor += l_anchor_v.item()
 
         val_loss /= max(len(val_loader), 1)
         val_fm /= max(len(val_loader), 1)
+        val_anchor /= max(len(val_loader), 1)
         if ema:
             ema.restore(dit)
-        print(f"  Val loss: {val_loss:.4f} (fm={val_fm:.4f})")
+        print(f"  Val loss: {val_loss:.4f} (fm={val_fm:.4f}, anchor={val_anchor:.4f})")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss

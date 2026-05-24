@@ -365,7 +365,8 @@ def generate_timeseries(
     if use_adaptive_routing and router is not None:
         router_tokens = text_embs.unsqueeze(1)  # (1, 1, text_dim)
 
-    # Step 2: Generate latent blocks via DiT
+    # Step 2: Generate latent blocks via DiT.
+    # For FAARD checkpoints this is residual latent; older checkpoints generate full latent.
     z_generated = generate_latent_blocks(
         dit=dit,
         text_latent=text_latent,
@@ -383,17 +384,26 @@ def generate_timeseries(
         text_raw=text_embs,
     )
 
-    # Step 3: Decode latent -> time series
+    # Step 3: Build final latent and decode -> time series
     if z_generated.shape[0] > n_latent_tokens:
-        z = z_generated[:n_latent_tokens]
+        z_residual = z_generated[:n_latent_tokens]
     elif z_generated.shape[0] < n_latent_tokens:
         pad = torch.zeros(
             n_latent_tokens - z_generated.shape[0], latent_dim,
             device=device, dtype=z_generated.dtype,
         )
-        z = torch.cat([z_generated, pad], dim=0)
+        z_residual = torch.cat([z_generated, pad], dim=0)
     else:
-        z = z_generated
+        z_residual = z_generated
+
+    if getattr(dit, "use_anchor_residual", False):
+        z_shape = _shape_tensor([n_latent_tokens], device)
+        z_anchor, gate_logits = dit.predict_anchor(text_latent, z_shape, text_raw=text_embs)
+        gate = torch.sigmoid(gate_logits).to(dtype=z_residual.dtype)
+        alpha = float(getattr(dit, "residual_gate_alpha", 0.3))
+        z = z_anchor.to(dtype=z_residual.dtype) + alpha * gate * z_residual
+    else:
+        z = z_residual
 
     # DiT already generates in standardized latent space (trained on standardized z0).
     # Do NOT call standardize_latent again — that would double-standardize.

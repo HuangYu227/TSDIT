@@ -1,0 +1,475 @@
+﻿# MMLDM V4 / FAARD-Causal 实验框架设计提示词
+
+本文档用于提示 AI 或研究助理设计 MMLDM 下一代实验框架。目标不是继续堆叠工程 trick，而是围绕 T2S 的核心指标短板，设计一个指标友好、论文叙事清晰、可验证的文本驱动时间序列生成框架。
+
+## 1. 框架名称
+
+**FAARD-Causal**
+
+全称：
+
+```text
+Factor-Aligned Anchor-Residual Diffusion with Causal Semantic Slots
+```
+
+中文解释：
+
+```text
+因素对齐的锚点-残差扩散模型，结合因果语义槽进行文本到时间序列生成。
+```
+
+核心思想：
+
+```text
+用文本条件锚点学习条件均值 latent，
+用残差扩散建模随机时序细节，
+用 factor-slot alignment 支撑多模态融合、可解释性和因果可验证性。
+```
+
+## 2. 为什么需要 FAARD-Causal
+
+当前 MMLDM-v3 的主要问题是：Stage2 DiT 被迫从噪声直接生成完整 latent。它同时承担三类任务：
+
+```text
+1. 保证 MSE/WAPE 足够低
+2. 保证文本语义和时间序列一致
+3. 保留随机细节、频域结构和多样性
+```
+
+这对还没有追平 T2S 的系统来说任务过载。T2S 的主指标 `MSE/WAPE/MRR@10` 中，`MSE/WAPE` 本质偏向条件均值。对 MSE 而言，理论最优预测是：
+
+```text
+E[y | text]
+```
+
+因此，下一版不应该让 diffusion 从随机噪声直接生成完整序列，而应该先学习文本条件下的 deterministic anchor，再让 diffusion 只补 residual。
+
+## 3. 核心公式
+
+```text
+z_anchor = f_anchor(text)
+delta_z  ~ p_theta(delta_z | text, z_anchor)
+z_final  = z_anchor + gate(text) * delta_z
+x_hat    = VAE.decode(z_final)
+```
+
+其中：
+
+```text
+z_anchor ≈ E[z0 | text]
+delta_z0 = z0 - stopgrad(z_anchor)
+```
+
+解释：
+
+```text
+z_anchor:
+  文本条件均值 latent，主攻 MSE/WAPE。
+
+delta_z:
+  anchor 无法解释的随机残差，主攻 MRR@10、频域结构和生成细节。
+
+gate(text):
+  控制 residual 强度，防止 residual 破坏 anchor 已经学好的点值精度。
+```
+
+## 4. 第一阶段只实现三个模块
+
+### 4.1 AnchorNet
+
+目标：
+
+```text
+text -> z_anchor
+```
+
+输入：
+
+```text
+text_latent: VAE.encode_text_condition(text_raw) 得到的文本 latent
+text_raw: 原始 SBERT embedding，可选
+```
+
+输出：
+
+```text
+z_anchor: shape 与 z0 一致，位于 VAE latent 空间
+```
+
+损失：
+
+```text
+L_anchor = MSE(z_anchor, z0)
+```
+
+第一阶段最重要的验证：
+
+```text
+decode(z_anchor) vs current MMLDM-v3
+```
+
+如果 `decode(z_anchor)` 的 `MSE/WAPE` 不能明显优于 current MMLDM-v3，说明当前 Stage1 latent 或 text embedding 到 latent 的可预测性不足，后续不应继续堆复杂模块。
+
+### 4.2 Gated Residual Diffusion
+
+训练目标从完整 latent 改成 residual latent。
+
+原始方式：
+
+```text
+z_t = (1 - t) * z0 + t * noise
+target = noise - z0
+```
+
+FAARD-Causal 方式：
+
+```text
+delta_z0 = z0 - stopgrad(z_anchor)
+z_t = (1 - t) * delta_z0 + t * noise
+target = noise - delta_z0
+```
+
+推理组合：
+
+```text
+z_final = z_anchor + alpha * sigmoid(g_text) * delta_z
+```
+
+第一版建议：
+
+```text
+alpha = 0.3
+```
+
+原因：先限制 residual 的破坏力，避免 `MSE/WAPE` 被随机细节拖坏。等 A2 稳定后，再考虑增大 residual 权重。
+
+### 4.3 Factor-Slot Alignment
+
+文本侧 semantic slots：
+
+```text
+s_trend
+s_period
+s_amplitude
+s_volatility
+s_event
+```
+
+时间序列 latent factors：
+
+```text
+z_trend
+z_period
+z_amplitude
+z_volatility
+z_event
+```
+
+弱监督标签从时间序列直接计算：
+
+```text
+trend      = slope(x)
+period     = dominant FFT peak
+amplitude  = std(x) or quantile range
+volatility = std(diff(x))
+event      = max z-score / spike score
+```
+
+损失：
+
+```text
+L_factor = factor prediction loss
+L_align  = InfoNCE(text_slot_k, latent_factor_k)
+```
+
+目的：
+
+```text
+把当前 MVTC 从“多个正交文本投影”升级为“文本语义因素与时序谱因素显式对齐”。
+```
+
+这比单纯 orthogonal initialization 更有理论支撑，也更容易设计可视化和消融实验。
+
+## 5. 第一阶段消融实验
+
+只先跑：
+
+```text
+ETTh1-24
+ETTm1-24
+```
+
+消融顺序：
+
+```text
+A0: current MMLDM-v3
+A1: + latent anchor
+A2: + gated residual diffusion
+A3: + factor weak supervision
+A4: + semantic slot alignment
+```
+
+### A0: current MMLDM-v3
+
+作用：
+
+```text
+作为当前代码版本的指标基准。
+```
+
+指标：
+
+```text
+MSE
+WAPE
+MRR@10
+Spectral distance
+ACF / ACD
+```
+
+### A1: + latent anchor
+
+作用：
+
+```text
+验证 text -> z_anchor 是否能学习条件均值 latent。
+```
+
+成功标准：
+
+```text
+decode(z_anchor) 的 MSE/WAPE 明显优于 A0。
+```
+
+失败含义：
+
+```text
+如果 A1 不涨，不要继续做 A2/A3/A4。
+优先回查 Stage1 latent 质量、text embedding 信息量、split/eval 流程。
+```
+
+### A2: + gated residual diffusion
+
+作用：
+
+```text
+验证 residual diffusion 能否补充 anchor 无法解释的随机细节。
+```
+
+成功标准：
+
+```text
+MRR@10 或频域指标提升，
+同时 MSE/WAPE 相比 A1 不严重回退。
+```
+
+失败含义：
+
+```text
+如果 MSE/WAPE 明显变差，说明 residual gate 太强。
+需要降低 alpha，或只在高频 latent 上加 residual。
+```
+
+### A3: + factor weak supervision
+
+作用：
+
+```text
+让 latent factors 具有可解释分工。
+```
+
+成功标准：
+
+```text
+factor probe 能预测对应统计量；
+z_trend/z_period/z_amplitude/z_volatility/z_event 出现功能分化；
+Spectral/ACF 指标改善或不变差。
+```
+
+失败含义：
+
+```text
+如果 reconstruction 变差，说明 factor loss 权重过大，或 latent_dim 不够。
+```
+
+### A4: + semantic slot alignment
+
+作用：
+
+```text
+验证文本语义因素是否真的对齐时序 latent factors。
+```
+
+成功标准：
+
+```text
+slot-factor heatmap 出现对角结构；
+counterfactual prompt 能定向改变趋势、周期、幅度或异常；
+MRR@10 提升。
+```
+
+失败含义：
+
+```text
+如果 learnable slots 无法提升 MRR@10，
+需要引入规则 parser 或 LLM-assisted semantic factor extractor。
+```
+
+## 6. 成功/失败判据汇总
+
+### 必须成功
+
+```text
+A1: MSE/WAPE 明显优于 current MMLDM-v3
+A2: MRR@10 或 spectral 指标提升，且 MSE/WAPE 不严重回退
+A3: factor probe 出现明确分工
+A4: slot-factor heatmap 出现对角结构
+```
+
+### 必须停止继续堆模块的情况
+
+```text
+A1 不涨:
+  说明问题不在 DiT 创新，而在 Stage1 latent、text embedding 或评估链路。
+
+A2 严重回退:
+  说明 residual 破坏 anchor，需要降低 gate 或限制 residual 作用范围。
+
+A3 破坏 reconstruction:
+  说明 factor weak supervision 权重过大或 latent 容量不足。
+
+A4 不涨 MRR:
+  说明单纯 learnable slot 不够，需要更强的文本 factor 提取。
+```
+
+## 7. 论文主张建议
+
+不要直接写：
+
+```text
+We propose a complete causal generative model.
+```
+
+这个说法风险太高，除非有严格的因果干预实验和跨环境不变性证明。
+
+更稳妥的主张：
+
+```text
+We propose a factor-aligned anchor-residual latent diffusion framework for text-to-series generation. A deterministic text-conditioned anchor captures conditional temporal expectation for point-wise fidelity, while residual diffusion models stochastic temporal details. Semantic text slots are explicitly aligned with measurable spectral-temporal factors for controllable and interpretable generation.
+```
+
+中文主张：
+
+```text
+本文提出因素对齐的锚点-残差潜空间扩散框架，用文本条件锚点学习条件均值轨迹，用残差扩散建模随机时序细节，并通过语义因素与可测时序谱因素的显式对齐，实现指标友好、可控、可解释的文本到时间序列生成。
+```
+
+## 8. 理论支撑
+
+### 8.1 条件均值与 MSE 最优性
+
+对 MSE 来说，Bayes optimal predictor 是：
+
+```text
+E[y | text]
+```
+
+因此 anchor 分支直接服务 T2S 的 `MSE/WAPE` 主指标。
+
+### 8.2 残差建模降低 diffusion 难度
+
+完整 latent 的生成分布复杂，既包含条件均值也包含随机细节。把任务拆成：
+
+```text
+z0 = z_anchor + delta_z
+```
+
+后，diffusion 只需建模 `delta_z`，目标分布方差更小，训练难度更低。
+
+### 8.3 弱监督解耦比无监督解耦更可信
+
+单纯 orthogonal projection 不能保证语义分工。通过 slope、FFT peak、amplitude、volatility、spike score 等可计算因素约束 latent，可以把解耦从无监督假设变成弱监督归纳偏置。
+
+### 8.4 多模态融合从 embedding-level 升级到 factor-level
+
+当前 MVTC 是多个文本视图循环调制 DiT。FAARD-Causal 进一步要求：
+
+```text
+trend text slot      -> trend latent
+period text slot     -> period latent
+amplitude text slot  -> amplitude latent
+volatility text slot -> volatility latent
+event text slot      -> event latent
+```
+
+这使多模态融合具有明确结构和可验证性。
+
+## 9. 第二阶段可选增强
+
+这些不建议第一轮实现，避免归因困难。
+
+```text
+1. Hierarchical DiT:
+   按 trend -> period -> amplitude -> volatility -> event 的顺序生成 latent。
+
+2. Environment adversarial / invariance:
+   把 dataset/time_interval 当作 environment，约束 causal factors 跨环境稳定。
+
+3. LLM-assisted semantic factor parser:
+   用规则或 LLM 从 prompt 中显式抽取 trend/period/amplitude 等描述。
+
+4. MMD/ACF/Spectral 扩展指标:
+   用于论文附表，不作为第一轮主优化目标。
+```
+
+## 10. 下一轮执行原则
+
+如果开始修改代码，第一步只做：
+
+```text
+AnchorNet + residual target rewrite
+```
+
+不要同时改：
+
+```text
+VAE 主体
+FactorSlotProjector
+因果模块
+评估脚本
+复杂指标
+Hierarchical DiT
+```
+
+先回答唯一关键问题：
+
+```text
+text -> z_anchor 能不能把 MSE/WAPE 拉近或超过 T2S？
+```
+
+如果这个问题成立，FAARD-Causal 值得继续；如果不成立，优先修 Stage1 latent 和 text-latent 对齐。
+
+## 11. 给 AI 的具体任务提示词
+
+请基于当前 MMLDM-v3 代码，设计并实现 MMLDM V4 / FAARD-Causal 的第一阶段实验框架。不要推翻现有两阶段结构，优先在 Stage2 中加入 latent anchor 与 residual target rewrite。
+
+实现目标：
+
+```text
+1. 新增 AnchorNet，使 text_latent/text_raw 能预测 z_anchor。
+2. 新增 L_anchor = MSE(z_anchor, z0)。
+3. 将 DiT 的 flow matching 目标从 z0 改为 delta_z0 = z0 - stopgrad(z_anchor)。
+4. 推理时组合 z_final = z_anchor + alpha * sigmoid(g_text) * delta_z。
+5. 第一版 alpha 默认 0.3。
+6. 保留当前 VAE、DiT 主体、latent standardization、CFG、MVTC、frequency loss。
+7. 先不实现 hierarchical DiT、environment adversarial、LLM parser。
+8. 先跑 ETTh1-24 和 ETTm1-24，比较 A0/A1/A2。
+```
+
+验收要求：
+
+```text
+A1 必须证明 decode(z_anchor) 的 MSE/WAPE 优于 current MMLDM-v3。
+A2 必须证明 residual diffusion 不严重破坏 A1 的 MSE/WAPE，同时提升 MRR@10 或频域指标。
+如果 A1 失败，停止继续添加模块，回查 Stage1 latent 与文本 embedding。
+```
