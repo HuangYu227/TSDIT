@@ -132,6 +132,8 @@ class MMLDMDiTConfig(PretrainedConfig):
         patch_size: int = 1,
         rope_dim: int = 32,
         block_size: int = 8,
+        text_latent_dim: int = 0,
+        n_text_views: int = 1,
         **kwargs,
     ):
         self.ts_in_channels = ts_in_channels
@@ -149,4 +151,6 @@ class MMLDMDiTConfig(PretrainedConfig):
         self.patch_size = patch_size
         self.rope_dim = rope_dim
         self.block_size = block_size
+        self.text_latent_dim = text_latent_dim
+        self.n_text_views = n_text_views
         super().__init__(**kwargs)

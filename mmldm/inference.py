@@ -85,6 +85,7 @@ def euler_ode_step(
     prefix_kv: Optional[PrefixKVCache] = None,
     prefix_kv_uncond: Optional[PrefixKVCache] = None,
     pos_offset: int = 0,
+    text_raw: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Single Euler ODE step with optional CFG and KV cache."""
     device = z_t.device
@@ -99,10 +100,11 @@ def euler_ode_step(
         ts_shape=ts_shape, text_shape=text_shape,
         timestep=t_batch, attn_mask=attn_mask,
         prefix_kv=prefix_kv, pos_offset=pos_offset,
+        text_latent=text_raw,
     )
     v_cond = output_cond.ts_sample
 
-    # Unconditional prediction (empty text)
+    # Unconditional prediction (empty text, no TGFM)
     if guidance_scale > 1.0:
         empty_text = torch.zeros_like(text_latent)
         empty_text_shape = text_shape.clone()
@@ -111,6 +113,7 @@ def euler_ode_step(
             ts_shape=ts_shape, text_shape=empty_text_shape,
             timestep=t_batch, attn_mask=attn_mask,
             prefix_kv=prefix_kv_uncond, pos_offset=pos_offset,
+            text_latent=None,
         )
         v_uncond = output_uncond.ts_sample
         v = guidance_scale * (v_cond - v_uncond) + v_uncond
@@ -144,6 +147,7 @@ def generate_latent_blocks(
     use_adaptive_mask: bool = False,
     router: Optional[SemanticRouter] = None,
     text_tokens_for_router: Optional[torch.Tensor] = None,
+    text_raw: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Generate latent tokens block-by-block with Euler ODE integration.
 
@@ -233,6 +237,7 @@ def generate_latent_blocks(
                     prefix_kv=prefix_kv_cond,
                     prefix_kv_uncond=prefix_kv_uncond,
                     pos_offset=prefix_len,
+                    text_raw=text_raw,
                 )
             z_clean = z_block
         else:
@@ -249,6 +254,7 @@ def generate_latent_blocks(
                     T=T,
                     attn_mask=attn_mask,
                     guidance_scale=guidance_scale,
+                    text_raw=text_raw,
                 )
             z_clean = z_block
 
@@ -262,6 +268,7 @@ def generate_latent_blocks(
                 ts=z_clean, text=text_latent,
                 ts_shape=curr_ts_shape, text_shape=text_shape,
                 timestep=0.0,
+                text_latent=text_raw,
             )
         else:
             prefix_kv_cond = dit.extend_prefix_kv(
@@ -270,6 +277,7 @@ def generate_latent_blocks(
                 new_ts_shape=curr_ts_shape, text_shape=text_shape,
                 timestep=0.0,
                 pos_offset=prefix_len,
+                text_latent=text_raw,
             )
         if guidance_scale > 1.0:
             empty_text = torch.zeros_like(text_latent)
@@ -372,6 +380,7 @@ def generate_timeseries(
         use_adaptive_mask=use_adaptive_routing,
         router=router,
         text_tokens_for_router=router_tokens,
+        text_raw=text_embs,
     )
 
     # Step 3: Decode latent -> time series
@@ -386,8 +395,8 @@ def generate_timeseries(
     else:
         z = z_generated
 
-    # Standardize latent using dataset-level stats (computed during Stage 2)
-    z = vae.standardize_latent(z)
+    # DiT already generates in standardized latent space (trained on standardized z0).
+    # Do NOT call standardize_latent again — that would double-standardize.
     z_shape = _shape_tensor([z.shape[0]], device)
     recon = vae.decode(z, z_shape)
     ts_out = recon[:, :output_len, :]
@@ -485,7 +494,7 @@ def main():
     parser.add_argument("--block_size", type=int, default=8)
     parser.add_argument("--T", type=float, default=1.0)
     parser.add_argument("--timestep_num", type=int, default=20)
-    parser.add_argument("--guidance_scale", type=float, default=2.0)
+    parser.add_argument("--guidance_scale", type=float, default=7.0)
     parser.add_argument("--use_adaptive_routing", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     # Single-sample mode
@@ -497,7 +506,7 @@ def main():
     parser.add_argument("--eval_time_intervals", type=int, nargs="+", default=[24])
     parser.add_argument("--eval_seed", type=int, default=42, help="Must match training split seed")
     parser.add_argument("--split_file", type=str, default=None, help="Path to splits.json for test split")
-    parser.add_argument("--n_runs", type=int, default=1, help="Generation runs per sample (for MRR)")
+    parser.add_argument("--n_runs", type=int, default=10, help="Generation runs per sample (for MRR@K)")
     parser.add_argument("--metrics", type=str, default="MSE,WAPE,MRR")
     parser.add_argument("--eval_output", type=str, default=None, help="JSON path for eval results")
     parser.add_argument("--max_eval_samples", type=int, default=None)

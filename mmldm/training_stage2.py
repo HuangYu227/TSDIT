@@ -131,6 +131,7 @@ def compute_consistency_loss(
     noise: torch.Tensor,
     attn_mask: Optional[torch.Tensor] = None,
     delta: float = 0.05,
+    text_raw: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Cross-Block Consistency Distillation loss.
 
@@ -158,9 +159,11 @@ def compute_consistency_loss(
     z_t2 = q_sample_flow(z0, t2, noise)
 
     out1 = model(ts=z_t1, text=text_latent, ts_shape=ts_shape,
-                 text_shape=text_shape, timestep=t1, attn_mask=attn_mask)
+                 text_shape=text_shape, timestep=t1, attn_mask=attn_mask,
+                 text_latent=text_raw)
     out2 = model(ts=z_t2, text=text_latent, ts_shape=ts_shape,
-                 text_shape=text_shape, timestep=t2, attn_mask=attn_mask)
+                 text_shape=text_shape, timestep=t2, attn_mask=attn_mask,
+                 text_latent=text_raw)
 
     return F.mse_loss(out1.ts_sample, out2.ts_sample)
 
@@ -273,6 +276,43 @@ def q_sample_flow(
     return (1 - t) * z0 + t * noise
 
 
+def frequency_weighted_flow_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    ts_shape: torch.LongTensor,
+    gamma_freq: float = 0.1,
+    gamma_weighted: float = 0.05,
+) -> torch.Tensor:
+    """Fused time-domain MSE + frequency-domain L1 + frequency-weighted loss.
+
+    Computes per-sample to avoid cross-boundary FFT artifacts.
+    """
+    # Time-domain MSE (flat — no boundary issue)
+    l_time = F.mse_loss(pred, target)
+
+    # Frequency and weighted losses: per-sample to avoid cross-boundary FFT
+    lengths = ts_shape.flatten().tolist()
+    pred_list = pred.split(lengths, dim=0)
+    target_list = target.split(lengths, dim=0)
+
+    l_freq_total = torch.tensor(0.0, device=pred.device)
+    l_weighted_total = torch.tensor(0.0, device=pred.device)
+
+    for p_i, t_i in zip(pred_list, target_list):
+        L_i = p_i.shape[0]
+        # Frequency L1 (DiMTS-inspired)
+        fft_p = torch.fft.rfft(p_i, dim=0)
+        fft_t = torch.fft.rfft(t_i, dim=0)
+        l_freq_total = l_freq_total + (F.l1_loss(fft_p.real, fft_t.real) +
+                                        F.l1_loss(fft_p.imag, fft_t.imag))
+        # Frequency-weighted (CPiRi-inspired)
+        weights = 1.0 / torch.arange(1, L_i + 1, device=pred.device, dtype=pred.dtype)
+        l_weighted_total = l_weighted_total + (weights.unsqueeze(-1) * (p_i - t_i).abs()).mean()
+
+    n = len(lengths)
+    return l_time + gamma_freq * (l_freq_total / n) + gamma_weighted * (l_weighted_total / n)
+
+
 def compute_flow_matching_loss(
     model: MMLDMDiTModel,
     z0: torch.Tensor,
@@ -282,6 +322,9 @@ def compute_flow_matching_loss(
     t_per_token: torch.Tensor,
     noise: torch.Tensor,
     attn_mask: Optional[torch.Tensor] = None,
+    text_raw: Optional[torch.Tensor] = None,
+    gamma_freq: float = 0.0,
+    gamma_weighted: float = 0.0,
 ) -> torch.Tensor:
     """Compute Flow Matching loss L_FM.
 
@@ -293,6 +336,9 @@ def compute_flow_matching_loss(
         t_per_token: per-token timestep ``(L_total,)``.
         noise: random noise ``(L_total, latent_dim)``.
         attn_mask: optional precomputed attention mask.
+        text_raw: ``(B, text_raw_dim)`` raw text embedding for TGFM.
+        gamma_freq: frequency-domain L1 loss weight.
+        gamma_weighted: frequency-weighted loss weight.
     """
     z_t = q_sample_flow(z0, t_per_token, noise)
     u_t = noise - z0  # target velocity
@@ -302,10 +348,14 @@ def compute_flow_matching_loss(
         ts_shape=ts_shape, text_shape=text_shape,
         timestep=t_per_token,
         attn_mask=attn_mask,
+        text_latent=text_raw,
     )
 
     ts_pred = output.ts_sample
-    loss = 0.5 * F.mse_loss(ts_pred, u_t)
+    if gamma_freq > 0 or gamma_weighted > 0:
+        loss = 0.5 * frequency_weighted_flow_loss(ts_pred, u_t, ts_shape, gamma_freq, gamma_weighted)
+    else:
+        loss = 0.5 * F.mse_loss(ts_pred, u_t)
     return loss
 
 
@@ -323,6 +373,8 @@ def compute_dcd_losses(
     t_per_token_a: torch.Tensor,
     noise: torch.Tensor,
     attn_mask: Optional[torch.Tensor] = None,
+    text_raw_a: Optional[torch.Tensor] = None,
+    text_raw_b: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute DCD losses L_DCD_mix and L_DCD_aux.
 
@@ -377,6 +429,7 @@ def compute_dcd_losses(
         ts_shape=ts_shape_mix, text_shape=text_shape_a,
         timestep=t_mix,
         attn_mask=attn_mask,
+        text_latent=text_raw_a,
     )
     v_a = output_a.ts_sample
 
@@ -385,6 +438,7 @@ def compute_dcd_losses(
         ts_shape=ts_shape_mix, text_shape=text_shape_b,
         timestep=t_mix,
         attn_mask=attn_mask,
+        text_latent=text_raw_b,
     )
     v_b = output_b.ts_sample
 
@@ -484,8 +538,13 @@ def main():
     parser.add_argument("--dit_heads", type=int, default=4, help="DiT heads")
     parser.add_argument("--block_size", type=int, default=8, help="Default block size")
     parser.add_argument("--use_adaptive_routing", action="store_true", help="Use semantic router")
-    parser.add_argument("--cfg_drop_prob", type=float, default=0.1, help="CFG condition dropout prob")
+    parser.add_argument("--cfg_drop_prob", type=float, default=0.3, help="CFG condition dropout prob")
     parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps")
+    # Innovation: Frequency-Weighted Flow Loss
+    parser.add_argument("--gamma_freq", type=float, default=0.1, help="Frequency-domain L1 loss weight")
+    parser.add_argument("--gamma_weighted", type=float, default=0.05, help="Frequency-weighted 1/k loss weight")
+    # Innovation: Diffusion Batch Multiplication
+    parser.add_argument("--batch_mul", type=int, default=1, help="Repeat each sample N times with different t (1=disabled)")
     # Innovation E: Text-Adaptive SNR
     parser.add_argument("--snr_alpha", type=float, default=0.3, help="Text-adaptive SNR strength (0=uniform)")
     # Innovation F: Consistency Distillation
@@ -530,6 +589,8 @@ def main():
         head_dim=args.dit_dim // args.dit_heads,
         num_layers=args.dit_layers,
         block_size=args.block_size,
+        text_latent_dim=128,  # TGFM: raw SBERT embedding dim
+        n_text_views=4,       # MVTC: K orthogonal text views
     )
     dit = MMLDMDiTModel(dit_config).to(device)
     dit_param_count = sum(p.numel() for p in dit.parameters())
@@ -576,23 +637,27 @@ def main():
         print(f"Loaded {len(dataset)} samples (random split, no split_file)")
 
     # Compute dataset-level latent statistics for standardization
-    print("Computing dataset-level latent statistics...")
-    _stat_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False,
-                              collate_fn=collate, num_workers=0)
-    _all_latents = []
-    with torch.no_grad():
-        for _batch in _stat_loader:
-            _ot = _batch["ot"].to(device)
-            _ot_lengths = _batch["ot_lengths"]
-            _ot_list = [_ot[i, :_ot_lengths[i]] for i in range(_ot.shape[0])]
-            _enc = vae.encode(_ot_list)
-            _trend_d, _res_d = _enc.latent_dists
-            _z = [torch.cat([td.mean, rd.mean], dim=-1)
-                  for td, rd in zip(_trend_d, _res_d)]
-            _all_latents.extend(_z)
-    vae.compute_latent_stats(_all_latents)
-    print(f"  Latent stats: mean={vae.latent_mean.mean():.4f}, std={vae.latent_std.mean():.4f}")
-    del _all_latents, _stat_loader
+    # Only if not already loaded from Stage1 checkpoint
+    if vae._latent_stats_computed.item():
+        print(f"Using latent stats from Stage1 checkpoint: mean={vae.latent_mean.mean():.4f}, std={vae.latent_std.mean():.4f}")
+    else:
+        print("Computing dataset-level latent statistics...")
+        _stat_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False,
+                                  collate_fn=collate, num_workers=0)
+        _all_latents = []
+        with torch.no_grad():
+            for _batch in _stat_loader:
+                _ot = _batch["ot"].to(device)
+                _ot_lengths = _batch["ot_lengths"]
+                _ot_list = [_ot[i, :_ot_lengths[i]] for i in range(_ot.shape[0])]
+                _enc = vae.encode(_ot_list)
+                _trend_d, _res_d = _enc.latent_dists
+                _z = [torch.cat([td.mean, rd.mean], dim=-1)
+                      for td, rd in zip(_trend_d, _res_d)]
+                _all_latents.extend(_z)
+        vae.compute_latent_stats(_all_latents)
+        print(f"  Latent stats: mean={vae.latent_mean.mean():.4f}, std={vae.latent_std.mean():.4f}")
+        del _all_latents, _stat_loader
 
     # Save VAE with latent stats for inference
     vae_with_stats_path = Path(args.save_dir) / "vae_with_stats.pt"
@@ -653,17 +718,18 @@ def main():
         lr=args.lr,
     )
 
-    # Warmup + cosine scheduler with minimum LR
-    min_lr_ratio = args.min_lr / max(args.lr, 1e-10)
-    def lr_lambda(step):
-        if step < args.warmup_steps:
-            return step / max(args.warmup_steps, 1)
-        progress = (step - args.warmup_steps) / max(
-            len(train_loader) * args.epochs - args.warmup_steps, 1
-        )
-        return max(0.5 * (1 + np.cos(np.pi * progress)), min_lr_ratio)
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    # OneCycleLR: single-cycle schedule matching T2S's approach
+    # Ramps lr up then decays over the entire training run
+    total_steps = len(train_loader) * args.epochs
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=args.lr,
+        total_steps=total_steps,
+        pct_start=0.05,       # 5% warmup (short, since we have many epochs)
+        anneal_strategy="cos",
+        div_factor=25,        # initial lr = max_lr / 25
+        final_div_factor=1e4, # final lr = max_lr / 10000
+    )
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -716,11 +782,14 @@ def main():
             text_latent = vae.encode_text_condition(text_emb)  # (B, latent_dim)
 
             # CFG training: randomly drop text condition per sample
+            # Must drop BOTH text_latent AND text_emb (text_raw) to ensure
+            # the unconditional path truly sees no text information.
             if args.cfg_drop_prob > 0:
                 drop_mask = (
                     torch.rand(B, 1, device=device) > args.cfg_drop_prob
                 ).to(text_latent.dtype)
                 text_latent = text_latent * drop_mask
+                text_emb = text_emb * drop_mask
 
             # Per-sample text: each sample gets 1 text token
             text_shape = torch.tensor([[1]] * B, dtype=torch.long, device=device)
@@ -732,6 +801,19 @@ def main():
             t_per_token = expand_timesteps_per_token(t_per_sample, ts_shape)
 
             noise = torch.randn_like(z0)
+
+            # Diffusion Batch Multiplication: repeat each sample with different t
+            if args.batch_mul > 1:
+                z0 = z0.repeat_interleave(args.batch_mul, dim=0)
+                text_latent = text_latent.repeat_interleave(args.batch_mul, dim=0)
+                ts_shape = ts_shape.repeat_interleave(args.batch_mul, dim=0)
+                text_shape = text_shape.repeat_interleave(args.batch_mul, dim=0)
+                text_emb = text_emb.repeat_interleave(args.batch_mul, dim=0)
+                t_per_sample = torch.rand(B * args.batch_mul, device=device)
+                if args.snr_alpha > 0:
+                    t_per_sample = text_adaptive_timestep(text_latent, t_per_sample, args.snr_alpha)
+                t_per_token = expand_timesteps_per_token(t_per_sample, ts_shape)
+                noise = torch.randn_like(z0)
 
             # Build attention mask (adaptive from router, or fixed default)
             attn_mask = None
@@ -745,7 +827,8 @@ def main():
             # Flow Matching loss
             l_fm = compute_flow_matching_loss(
                 dit, z0, text_latent, ts_shape, text_shape, t_per_token, noise,
-                attn_mask=attn_mask,
+                attn_mask=attn_mask, text_raw=text_emb,
+                gamma_freq=args.gamma_freq, gamma_weighted=args.gamma_weighted,
             )
 
             # DCD loss
@@ -797,6 +880,8 @@ def main():
                     text_shape_b=text_shape[half:half * 2],
                     lam=lam, t_per_token_a=t_a, noise=noise_a,
                     attn_mask=dcd_mask,
+                    text_raw_a=text_emb[:half],
+                    text_raw_b=text_emb[half:half * 2],
                 )
 
             # Innovation F: Consistency Distillation loss (delayed warmup)
@@ -805,6 +890,7 @@ def main():
                 l_cons = compute_consistency_loss(
                     dit, z0, text_latent, ts_shape, text_shape, noise,
                     attn_mask=attn_mask, delta=args.cons_delta,
+                    text_raw=text_emb,
                 )
 
             total = (l_fm + args.gamma1 * l_dcd_mix + args.gamma2 * l_dcd_aux
@@ -875,12 +961,15 @@ def main():
                 text_latent_v = vae.encode_text_condition(text_emb)
                 text_shape_v = torch.tensor([[1]] * B_v, dtype=torch.long, device=device)
                 t_v = torch.rand(B_v, device=device)
+                if args.snr_alpha > 0:
+                    t_v = text_adaptive_timestep(text_latent_v, t_v, args.snr_alpha)
                 t_pt_v = expand_timesteps_per_token(t_v, ts_shape_v)
                 noise_v = torch.randn_like(z0_v)
 
                 l_fm_v = compute_flow_matching_loss(
                     dit, z0_v, text_latent_v, ts_shape_v, text_shape_v,
-                    t_pt_v, noise_v,
+                    t_pt_v, noise_v, text_raw=text_emb,
+                    gamma_freq=args.gamma_freq, gamma_weighted=args.gamma_weighted,
                 )
                 val_loss += l_fm_v.item()
                 val_fm += l_fm_v.item()

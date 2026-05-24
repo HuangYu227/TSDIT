@@ -376,10 +376,23 @@ class MMLDMVAEModel(PreTrainedModel):
         return torch.cat(out_list, dim=0).unsqueeze(0)
 
     def encode_text_condition(self, text_embs: torch.Tensor) -> torch.Tensor:
-        """Encode text embeddings for Stage 2 conditioning."""
-        x = self.text_proj(text_embs).unsqueeze(0)
+        """Encode text embeddings for Stage 2 conditioning.
+
+        Each sample is encoded independently — no cross-sample attention.
+        """
+        x = self.text_proj(text_embs).unsqueeze(0)  # (1, B, dim)
+        # Diagonal mask: each sample attends only to itself (no cross-sample leakage)
+        B = text_embs.shape[0]
+        mask = torch.zeros(B, B, device=x.device, dtype=x.dtype)
+        # Default: all positions see themselves. No need to fill — zeros = attend.
+        # But we need to BLOCK cross-sample attention:
+        mask.fill_(float("-inf"))
+        for i in range(B):
+            mask[i, i] = 0.0
+        # Expand for multi-head: (1, 1, B, B) → broadcast over heads
+        attn_mask = mask.unsqueeze(0).unsqueeze(0)
         for block in self.text_encoder_blocks:
-            x = block(x, attn_mask=None)
+            x = block(x, attn_mask=attn_mask)
         return self.text_final_norm(self.text_final_layer(x.squeeze(0)))
 
     def compute_latent_stats(self, dataset_latents: list[torch.Tensor]):
@@ -409,12 +422,10 @@ class MMLDMVAEModel(PreTrainedModel):
         z_list = [torch.cat([t, r], dim=-1) for t, r in zip(trend_samples, residual_samples)]
 
         z = torch.cat(z_list, dim=0)
-        # Standardize latent to prevent decoder from receiving unbounded values
+        # Standardize latent using dataset-level stats (computed after first epoch)
         if self._latent_stats_computed.item():
             z = self.standardize_latent(z)
-        else:
-            # Batch-level standardization as fallback (first few epochs)
-            z = (z - z.mean(dim=0)) / z.std(dim=0).clamp(min=1e-6)
+        # Before stats are available, KL loss naturally constrains z ~ N(0,I)
         ts_shape = torch.tensor([[z_i.shape[0]] for z_i in z_list], dtype=torch.long, device=z.device)
         recon = self.decode(z, ts_shape)
 

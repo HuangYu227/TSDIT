@@ -236,6 +236,22 @@ def main():
         val_loss /= max(len(val_loader), 1)
         print(f"  Val loss: {val_loss:.4f}")
 
+        # Compute latent stats after first epoch (for standardization in later epochs)
+        if epoch == 0:
+            model.eval()
+            with torch.no_grad():
+                all_latents = []
+                for batch in train_loader:
+                    ot = batch["ot"].to(device)
+                    ot_lengths = batch["ot_lengths"]
+                    ot_list = [ot[i, :ot_lengths[i]] for i in range(ot.shape[0])]
+                    enc_output = model.encode(ot_list)
+                    trend_dists, residual_dists = enc_output.latent_dists
+                    for td, rd in zip(trend_dists, residual_dists):
+                        all_latents.append(torch.cat([td.mean, rd.mean], dim=-1))
+                model.compute_latent_stats(all_latents)
+            print("  Latent stats computed for standardization.")
+
         ckpt_path = save_dir / f"epoch_{epoch+1}.pt"
         torch.save({
             "epoch": epoch + 1, "global_step": global_step,

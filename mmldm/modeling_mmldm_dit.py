@@ -299,6 +299,80 @@ class MLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Text-Guided Feature Modulation (TGFM)
+# ---------------------------------------------------------------------------
+
+
+class TextModulator(nn.Module):
+    """Per-block text-guided feature modulation.
+
+    Generates (scale, shift) from a text latent vector to modulate
+    TS features.  This provides a direct text-conditioning pathway
+    independent of the timestep-based adaLN used in the DiT blocks.
+
+    The modulation is: output = scale * input + shift, where scale/shift
+    are derived from the text latent via a small MLP.
+    """
+
+    def __init__(self, dim: int, text_dim: int):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(text_dim, dim * 2),
+            nn.SiLU(),
+            nn.Linear(dim * 2, dim * 2),
+        )
+        # Zero-init for safe residual start
+        nn.init.zeros_(self.proj[-1].weight)
+        nn.init.zeros_(self.proj[-1].bias)
+
+    def forward(self, ts: torch.Tensor, text_latent: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            ts: ``(B, L, dim)`` TS token features.
+            text_latent: ``(B, text_dim)`` text latent vector (global, per-sample).
+        Returns:
+            ``(B, L, dim)`` modulation output (scale * ts + shift).
+        """
+        # text_latent: (B, D) → (B, 1, D) for broadcast over L
+        params = self.proj(text_latent.unsqueeze(1))  # (B, 1, dim*2)
+        scale, shift = params.chunk(2, dim=-1)
+        return scale * ts + shift
+
+
+class MultiViewTextPooler(nn.Module):
+    """Generate K orthogonal text views from a single SBERT embedding.
+
+    Inspired by CaTSG's Environment Bank but driven by text semantics
+    rather than data distribution. Each linear projection extracts a
+    different semantic "view" of the same text (e.g., trend description,
+    amplitude description, periodicity description).
+
+    Orthogonal initialization ensures views are diverse by default.
+    """
+
+    def __init__(self, text_dim: int = 128, n_views: int = 4):
+        super().__init__()
+        self.n_views = n_views
+        # Each view is a learnable rotation in text_dim space (no dimension change).
+        # TextModulator in each block expects text_dim, so views must stay in that space.
+        self.views = nn.ModuleList([
+            nn.Linear(text_dim, text_dim) for _ in range(n_views)
+        ])
+        for v in self.views:
+            nn.init.orthogonal_(v.weight)
+            nn.init.zeros_(v.bias)
+
+    def forward(self, text_emb: torch.Tensor) -> list[torch.Tensor]:
+        """
+        Args:
+            text_emb: ``(B, text_dim)`` raw SBERT embedding.
+        Returns:
+            List of K ``(B, latent_dim)`` text views.
+        """
+        return [v(text_emb) for v in self.views]
+
+
+# ---------------------------------------------------------------------------
 # Multimodal Joint Attention (for DiT)
 # ---------------------------------------------------------------------------
 
@@ -460,6 +534,7 @@ class MultimodalDiTBlock(nn.Module):
         norm_eps: float = 1e-5,
         qk_bias: bool = False,
         rope_dim: int = 32,
+        text_latent_dim: int = 0,
     ):
         super().__init__()
         # Attention norms (adaptive)
@@ -501,6 +576,13 @@ class MultimodalDiTBlock(nn.Module):
         nn.init.zeros_(self.text_post_ff_gamma[-1].weight)
         nn.init.zeros_(self.text_post_ff_gamma[-1].bias)
 
+        # Text-Guided Feature Modulation (TGFM)
+        self.use_tgfm = text_latent_dim > 0
+        if self.use_tgfm:
+            self.text_modulator = TextModulator(ts_dim, text_latent_dim)
+            # Init to 0.1 (not 0) — zero gate + zero-modulator = double dead gradient
+            self.text_mod_gate = nn.Parameter(torch.full((1,), 0.1))
+
     def forward(
         self,
         ts_tokens: torch.Tensor,
@@ -511,6 +593,7 @@ class MultimodalDiTBlock(nn.Module):
         prefix_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         pos_offset: int = 0,
         return_kv: bool = False,
+        text_latent: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, tuple]:
 
         # Attention branch
@@ -545,6 +628,10 @@ class MultimodalDiTBlock(nn.Module):
 
         ts_tokens = ts_tokens + ts_ff
         text_tokens = text_tokens + text_ff
+
+        # Text-Guided Feature Modulation (TGFM) — after FFN, before return
+        if self.use_tgfm and text_latent is not None:
+            ts_tokens = ts_tokens + self.text_mod_gate * self.text_modulator(ts_tokens, text_latent)
 
         if return_kv:
             return ts_tokens, text_tokens, kv
@@ -590,6 +677,17 @@ class MMLDMDiTModel(PreTrainedModel):
         self.config = config
         self.block_size = config.block_size
         self.heads = config.heads
+        self.text_latent_dim = getattr(config, 'text_latent_dim', 0)
+        self.n_text_views = getattr(config, 'n_text_views', 1)
+
+        # Multi-View Text Pooler (MVTC)
+        if self.text_latent_dim > 0 and self.n_text_views > 1:
+            self.text_pooler = MultiViewTextPooler(
+                text_dim=self.text_latent_dim,
+                n_views=self.n_text_views,
+            )
+        else:
+            self.text_pooler = None
 
         # Patch embedding
         self.ts_in = PatchIn1D(
@@ -622,6 +720,7 @@ class MMLDMDiTModel(PreTrainedModel):
                 norm_eps=config.norm_eps,
                 qk_bias=config.qk_bias,
                 rope_dim=config.rope_dim,
+                text_latent_dim=self.text_latent_dim,
             )
             for _ in range(config.num_layers)
         ])
@@ -686,6 +785,7 @@ class MMLDMDiTModel(PreTrainedModel):
         prefix_kv: Optional[PrefixKVCache] = None,
         pos_offset: int = 0,
         text_timestep: Optional[Union[int, float, torch.IntTensor, torch.FloatTensor]] = None,
+        text_latent: Optional[torch.FloatTensor] = None,
     ) -> MMLDMDiTOutput:
         """NA-form forward pass.
 
@@ -696,6 +796,8 @@ class MMLDMDiTModel(PreTrainedModel):
             text_shape: ``(B, 1)`` per-sample text lengths.
             timestep: Flow Matching time ``t``.
             attn_mask: optional block-causal mask.
+            text_latent: ``(B, text_latent_dim)`` raw text embedding for TGFM.
+                If None or text_latent_dim=0, TGFM is skipped.
 
         Returns:
             :class:`MMLDMDiTOutput` with velocity field predictions.
@@ -750,8 +852,16 @@ class MMLDMDiTModel(PreTrainedModel):
         text_emb = text_emb.unsqueeze(0)  # (1, 1, emb_dim)
 
         # DiT blocks
+        # If MVTC is active, pre-compute K text views and cycle through them.
+        # Each block sees a different semantic "view" of the same text.
+        text_views = None
+        if self.text_pooler is not None and text_latent is not None:
+            text_views = self.text_pooler(text_latent)  # K × (B, text_dim)
+
         for i, block in enumerate(self.blocks):
             layer_prefix_kv = prefix_kv.layers[i] if prefix_kv is not None and i < len(prefix_kv.layers) else None
+            # Cycle through views if available, else use original text_latent
+            block_text_latent = text_views[i % len(text_views)] if text_views is not None else text_latent
             ts, text = block(
                 ts, text,
                 ts_emb=ts_emb,
@@ -759,6 +869,7 @@ class MMLDMDiTModel(PreTrainedModel):
                 attn_mask=attn_mask,
                 prefix_kv=layer_prefix_kv,
                 pos_offset=pos_offset,
+                text_latent=block_text_latent,
             )
 
         # Output norm + unpatch
@@ -780,6 +891,7 @@ class MMLDMDiTModel(PreTrainedModel):
         timestep: Union[float, torch.FloatTensor],
         attn_mask: Optional[torch.Tensor] = None,
         text_timestep: Optional[Union[int, float, torch.IntTensor, torch.FloatTensor]] = None,
+        text_latent: Optional[torch.FloatTensor] = None,
     ) -> PrefixKVCache:
         """Compute and cache KV for prefix tokens (inference only)."""
         # Patch embed
@@ -826,14 +938,20 @@ class MMLDMDiTModel(PreTrainedModel):
         text_emb = text_emb.unsqueeze(0)
 
         # Run all blocks, collecting KV from each
+        text_views = None
+        if self.text_pooler is not None and text_latent is not None:
+            text_views = self.text_pooler(text_latent)
+
         cache = PrefixKVCache()
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
+            block_text_latent = text_views[i % len(text_views)] if text_views is not None else text_latent
             ts, text, kv = block(
                 ts, text,
                 ts_emb=ts_emb,
                 text_emb=text_emb,
                 attn_mask=attn_mask,
                 return_kv=True,
+                text_latent=block_text_latent,
             )
             cache.layers.append(kv)
 
@@ -851,6 +969,7 @@ class MMLDMDiTModel(PreTrainedModel):
         timestep: Union[float, torch.FloatTensor],
         pos_offset: int = 0,
         text_timestep: Optional[Union[int, float, torch.IntTensor, torch.FloatTensor]] = None,
+        text_latent: Optional[torch.FloatTensor] = None,
     ) -> PrefixKVCache:
         """Incrementally extend a PrefixKVCache with new tokens.
 
@@ -879,14 +998,20 @@ class MMLDMDiTModel(PreTrainedModel):
         text_emb = text_emb.unsqueeze(0)
 
         # Run new tokens through all blocks, collecting KV
+        text_views = None
+        if self.text_pooler is not None and text_latent is not None:
+            text_views = self.text_pooler(text_latent)
+
         new_cache = PrefixKVCache()
         for i, block in enumerate(self.blocks):
+            block_text_latent = text_views[i % len(text_views)] if text_views is not None else text_latent
             ts, text, kv = block(
                 ts, text,
                 ts_emb=ts_emb,
                 text_emb=text_emb,
                 pos_offset=pos_offset,
                 return_kv=True,
+                text_latent=block_text_latent,
             )
             # Append to existing layer KV
             old_ts_k, old_ts_v = existing_cache.layers[i]
