@@ -334,7 +334,9 @@ class TextModulator(nn.Module):
             ``(B, L, dim)`` modulation output (scale * ts + shift).
         """
         # text_latent: (B, D) → (B, 1, D) for broadcast over L
-        params = self.proj(text_latent.unsqueeze(1))  # (B, 1, dim*2)
+        if text_latent.ndim == 2:
+            text_latent = text_latent.unsqueeze(1)
+        params = self.proj(text_latent)  # (B, 1 or L, dim*2)
         scale, shift = params.chunk(2, dim=-1)
         return scale * ts + shift
 
@@ -907,6 +909,26 @@ class MMLDMDiTModel(PreTrainedModel):
             return z_anchor, gate_logits
         return self.anchor_net(text=text, text_raw=text_raw, ts_shape=ts_shape)
 
+    def _expand_text_latent_to_ts(
+        self,
+        text_latent: Optional[torch.Tensor],
+        ts_shape: torch.LongTensor,
+    ) -> Optional[torch.Tensor]:
+        """Align per-sample text conditions to the flat TS token layout."""
+        if text_latent is None or text_latent.ndim != 2:
+            return text_latent
+        lengths = ts_shape.flatten().tolist()
+        if text_latent.shape[0] == 1 or text_latent.shape[0] != len(lengths):
+            return text_latent
+        expanded = [
+            text_latent[i].unsqueeze(0).expand(int(length), -1)
+            for i, length in enumerate(lengths)
+            if int(length) > 0
+        ]
+        if not expanded:
+            return text_latent[:1]
+        return torch.cat(expanded, dim=0).unsqueeze(0)
+
     def forward(
         self,
         ts: torch.FloatTensor,
@@ -995,6 +1017,7 @@ class MMLDMDiTModel(PreTrainedModel):
             layer_prefix_kv = prefix_kv.layers[i] if prefix_kv is not None and i < len(prefix_kv.layers) else None
             # Cycle through views if available, else use original text_latent
             block_text_latent = text_views[i % len(text_views)] if text_views is not None else text_latent
+            block_text_latent = self._expand_text_latent_to_ts(block_text_latent, ts_shape_patched)
             ts, text = block(
                 ts, text,
                 ts_emb=ts_emb,
@@ -1078,6 +1101,7 @@ class MMLDMDiTModel(PreTrainedModel):
         cache = PrefixKVCache()
         for i, block in enumerate(self.blocks):
             block_text_latent = text_views[i % len(text_views)] if text_views is not None else text_latent
+            block_text_latent = self._expand_text_latent_to_ts(block_text_latent, ts_shape_patched)
             ts, text, kv = block(
                 ts, text,
                 ts_emb=ts_emb,
@@ -1138,6 +1162,7 @@ class MMLDMDiTModel(PreTrainedModel):
         new_cache = PrefixKVCache()
         for i, block in enumerate(self.blocks):
             block_text_latent = text_views[i % len(text_views)] if text_views is not None else text_latent
+            block_text_latent = self._expand_text_latent_to_ts(block_text_latent, ts_shape_patched)
             ts, text, kv = block(
                 ts, text,
                 ts_emb=ts_emb,
