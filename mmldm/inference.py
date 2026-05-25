@@ -496,6 +496,13 @@ def _encode_text_sbert(text_str: str, text_dim: int, device: torch.device) -> to
 
 def main():
     parser = argparse.ArgumentParser(description="MMLDM Inference & Evaluation")
+    parser.add_argument("--dataset_type", type=str, default="csv",
+                        choices=["csv", "weather_npy"],
+                        help="Dataset format: csv (TSFragment-600K) or weather_npy (VerbalTS Weather)")
+    parser.add_argument("--weather_data_dir", type=str, default=None,
+                        help="Path to Weather .npy data (for weather_npy mode)")
+    parser.add_argument("--ts_channels", type=int, default=1,
+                        help="TS channels for output (inferred from VAE config if not set)")
     # Shared
     parser.add_argument("--dit_checkpoint", type=str, required=True)
     parser.add_argument("--vae_checkpoint", type=str, required=True)
@@ -519,6 +526,8 @@ def main():
     parser.add_argument("--metrics", type=str, default="MSE,WAPE,MRR")
     parser.add_argument("--eval_output", type=str, default=None, help="JSON path for eval results")
     parser.add_argument("--max_eval_samples", type=int, default=None)
+    parser.add_argument("--save_generated_npy", type=str, default=None,
+                        help="Save all generated TS as .npy (N, L, C) for external evaluation")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -531,7 +540,14 @@ def main():
         needs_multi = "MRR" in metrics
 
         # Load test split (SampleID-level, no data leakage)
-        if args.split_file is not None:
+        if args.dataset_type == "weather_npy":
+            if args.weather_data_dir is None:
+                raise ValueError("--weather_data_dir is required when --dataset_type weather_npy")
+            from .data.weather_dataset import WeatherDataset
+            test_ds = WeatherDataset(weather_data_dir=args.weather_data_dir, split="test",
+                                     max_samples=args.max_eval_samples)
+            print(f"Eval dataset (Weather .npy): {len(test_ds)} test samples")
+        elif args.split_file is not None:
             test_ds = TSFragmentDataset(
                 data_dir=args.eval_data_dir,
                 datasets=args.eval_datasets,
@@ -589,6 +605,16 @@ def main():
 
             if (idx + 1) % 50 == 0:
                 print(f"  Generated {idx + 1}/{len(test_ds)} samples")
+
+        # Save generated TS for external evaluation (e.g., VerbalTS metrics)
+        if args.save_generated_npy is not None:
+            # Use median across runs as the final prediction (matching VerbalTS convention)
+            gen_med = np.array([
+                np.median(np.stack([g[:min(o.shape[0], g.shape[0])] for g in runs]), axis=0)
+                for runs, o in zip(all_gen_runs, all_ori)
+            ])
+            np.save(args.save_generated_npy, gen_med)
+            print(f"Saved generated TS ({gen_med.shape}) to {args.save_generated_npy}")
 
         # Align all to common min length
         min_L = min(o.shape[0] for o in all_ori)

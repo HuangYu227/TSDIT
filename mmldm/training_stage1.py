@@ -39,6 +39,7 @@ from torch.utils.data import DataLoader, random_split
 
 from .configuration_mmldm import MMLDMVAEConfig
 from .data.tsfragment_dataset import CollateFn, TSFragmentDataset
+from .data.weather_dataset import WeatherCollateFn, WeatherDataset
 from .modeling_mmldm_vae import MMLDMVAEModel
 
 
@@ -98,6 +99,13 @@ def train_step(
 
 def main():
     parser = argparse.ArgumentParser(description="MMLDM Stage 1: Spectral Dual-Latent VAE")
+    parser.add_argument("--dataset_type", type=str, default="csv",
+                        choices=["csv", "weather_npy"],
+                        help="Dataset format: csv (TSFragment-600K) or weather_npy (VerbalTS Weather)")
+    parser.add_argument("--weather_data_dir", type=str, default=None,
+                        help="Path to Weather .npy data (required when --dataset_type weather_npy)")
+    parser.add_argument("--ts_channels", type=int, default=1,
+                        help="Number of TS channels/variables (1 for univariate, 21 for Weather)")
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--datasets", type=str, nargs="+", default=["ETTh1"])
     parser.add_argument("--time_intervals", type=int, nargs="+", default=[24])
@@ -132,7 +140,7 @@ def main():
     device = torch.device(args.device)
 
     config = MMLDMVAEConfig(
-        ts_channels=1, dim=args.dim, ffn_dim=args.dim * 4,
+        ts_channels=args.ts_channels, dim=args.dim, ffn_dim=args.dim * 4,
         latent_dim=args.latent_dim, num_heads=args.num_heads,
         head_dim=args.dim // args.num_heads, num_conv_layers=args.num_conv_layers,
         encoder_num_blocks=args.encoder_blocks, decoder_num_blocks=args.decoder_blocks,
@@ -141,21 +149,30 @@ def main():
         fft_cutoff_ratio=args.fft_cutoff_ratio,
     )
 
-    if args.split_file is not None:
+    if args.dataset_type == "weather_npy":
+        if args.weather_data_dir is None:
+            raise ValueError("--weather_data_dir is required when --dataset_type weather_npy")
+        train_ds = WeatherDataset(weather_data_dir=args.weather_data_dir, split="train",
+                                  max_samples=args.max_samples)
+        val_ds = WeatherDataset(weather_data_dir=args.weather_data_dir, split="valid",
+                                max_samples=args.max_samples)
+        collate = WeatherCollateFn()
+        print(f"Train: {len(train_ds)}, Val: {len(val_ds)} (Weather .npy)")
+    elif args.split_file is not None:
         train_ds = TSFragmentDataset(data_dir=args.data_dir, datasets=args.datasets,
                                      time_intervals=args.time_intervals, max_samples=args.max_samples,
                                      split="train", split_file=args.split_file)
         val_ds = TSFragmentDataset(data_dir=args.data_dir, datasets=args.datasets,
                                    time_intervals=args.time_intervals, split="val", split_file=args.split_file)
+        collate = CollateFn()
         print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
     else:
         dataset = TSFragmentDataset(data_dir=args.data_dir, datasets=args.datasets,
                                     time_intervals=args.time_intervals, max_samples=args.max_samples)
         val_size = min(len(dataset) // 10, 1000)
         train_ds, val_ds = random_split(dataset, [len(dataset) - val_size, val_size])
+        collate = CollateFn()
         print(f"Loaded {len(dataset)} samples")
-
-    collate = CollateFn()
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               collate_fn=collate, num_workers=0, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,

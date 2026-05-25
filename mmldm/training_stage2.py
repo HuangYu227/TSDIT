@@ -40,6 +40,7 @@ from torch.utils.data import DataLoader
 
 from .configuration_mmldm import MMLDMDiTConfig, MMLDMVAEConfig
 from .data.tsfragment_dataset import CollateFn, TSFragmentDataset
+from .data.weather_dataset import WeatherCollateFn, WeatherDataset
 from .modeling_mmldm_dit import MMLDMDiTModel
 from .modeling_mmldm_vae import MMLDMVAEModel
 from .attention_utils import create_dit_readonly_text_mask
@@ -523,6 +524,11 @@ def _shape_tensor(lens: list[int], device: torch.device) -> torch.LongTensor:
 
 def main():
     parser = argparse.ArgumentParser(description="MMLDM Stage 2: DiT + DCD Training")
+    parser.add_argument("--dataset_type", type=str, default="csv",
+                        choices=["csv", "weather_npy"],
+                        help="Dataset format: csv (TSFragment-600K) or weather_npy (VerbalTS Weather)")
+    parser.add_argument("--weather_data_dir", type=str, default=None,
+                        help="Path to Weather .npy data (required when --dataset_type weather_npy)")
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--vae_checkpoint", type=str, required=True, help="Stage 1 VAE checkpoint")
     parser.add_argument("--datasets", type=str, nargs="+", default=["ETTh1"])
@@ -623,10 +629,17 @@ def main():
         ).to(device)
         print("Semantic router enabled")
 
-    # Build dataset with SampleID-level split
-    collate = CollateFn()
-
-    if args.split_file is not None:
+    # Build dataset
+    if args.dataset_type == "weather_npy":
+        if args.weather_data_dir is None:
+            raise ValueError("--weather_data_dir is required when --dataset_type weather_npy")
+        train_ds = WeatherDataset(weather_data_dir=args.weather_data_dir, split="train",
+                                  max_samples=args.max_samples)
+        val_ds = WeatherDataset(weather_data_dir=args.weather_data_dir, split="valid",
+                                max_samples=args.max_samples)
+        collate = WeatherCollateFn()
+        print(f"Train: {len(train_ds)}, Val: {len(val_ds)} (Weather .npy)")
+    elif args.split_file is not None:
         train_ds = TSFragmentDataset(
             data_dir=args.data_dir, datasets=args.datasets,
             time_intervals=args.time_intervals, max_samples=args.max_samples,
@@ -637,6 +650,7 @@ def main():
             time_intervals=args.time_intervals,
             split="val", split_file=args.split_file,
         )
+        collate = CollateFn()
         print(f"Train: {len(train_ds)} samples, Val: {len(val_ds)} samples (from {args.split_file})")
     else:
         # Fallback: random row-level split (may leak for ETTh1 sliding windows)
