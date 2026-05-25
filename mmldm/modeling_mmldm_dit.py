@@ -329,12 +329,17 @@ class TextModulator(nn.Module):
         """
         Args:
             ts: ``(B, L, dim)`` TS token features.
-            text_latent: ``(B, text_dim)`` text latent vector (global, per-sample).
+            text_latent: ``(B, text_dim)`` global text vector, or
+                ``(B, L, text_dim)`` per-token expanded text latents.
         Returns:
             ``(B, L, dim)`` modulation output (scale * ts + shift).
         """
-        # text_latent: (B, D) → (B, 1, D) for broadcast over L
-        params = self.proj(text_latent.unsqueeze(1))  # (B, 1, dim*2)
+        if text_latent.ndim == 3:
+            # Already per-token expanded: (B, L, D) — no unsqueeze needed
+            params = self.proj(text_latent)  # (B, L, dim*2)
+        else:
+            # Global vector: (B, D) → (B, 1, D) for broadcast over L
+            params = self.proj(text_latent.unsqueeze(1))  # (B, 1, dim*2)
         scale, shift = params.chunk(2, dim=-1)
         return scale * ts + shift
 
