@@ -135,8 +135,7 @@ class WeatherDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         ot = self.ts[idx].copy()  # (L, C)
-        cap_idx = np.random.randint(0, len(self.caps[idx]))
-        cap_str = str(self.caps[idx][cap_idx])
+        cap_str = str(self.caps[idx][0])
 
         # Z-normalization per variable independently
         mean = ot.mean(axis=0, keepdims=True)  # (1, C)

@@ -2,9 +2,12 @@
 """Evaluate MMLDM-generated time series using VerbalTS's CTTP metrics.
 
 Computes CTTP score, FID, and JFTSD on externally generated time series.
-Must be run from the VerbalTS repo root (depends on models.cttp module).
 
-Usage (in VerbalTS conda env):
+IMPORTANT: This script imports ``models.cttp.cttp_model.CTTP``, so it MUST be
+copied to and run from the VerbalTS repo root (not the MMLDM repo).
+
+Usage (in VerbalTS repo root, with VerbalTS conda env):
+    cp /path/to/mmldm/eval_verbalts.py .
     python eval_verbalts.py \
         --weather_data_dir ./datasets/Weather \
         --cttp_checkpoint ./save/Weather_cttp/clip_model_best.pth \
@@ -18,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 
 import numpy as np
 import torch
@@ -47,8 +49,7 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
 
 def load_cttp(checkpoint_path: str, config_path: str, device: str = "cuda"):
     """Load pre-trained CTTP model."""
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from models.cttp.cttp_model import CTTP
+    from models.cttp.cttp_model import CTTP  # requires running from VerbalTS repo root
 
     configs = yaml.safe_load(open(config_path))
     configs["device"] = device

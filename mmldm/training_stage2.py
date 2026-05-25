@@ -529,7 +529,7 @@ def main():
                         help="Dataset format: csv (TSFragment-600K) or weather_npy (VerbalTS Weather)")
     parser.add_argument("--weather_data_dir", type=str, default=None,
                         help="Path to Weather .npy data (required when --dataset_type weather_npy)")
-    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--data_dir", type=str, default="")
     parser.add_argument("--vae_checkpoint", type=str, required=True, help="Stage 1 VAE checkpoint")
     parser.add_argument("--datasets", type=str, nargs="+", default=["ETTh1"])
     parser.add_argument("--time_intervals", type=int, nargs="+", default=[24])
@@ -640,6 +640,8 @@ def main():
         collate = WeatherCollateFn()
         print(f"Train: {len(train_ds)}, Val: {len(val_ds)} (Weather .npy)")
     elif args.split_file is not None:
+        if not args.data_dir:
+            raise ValueError("--data_dir is required when --dataset_type csv")
         train_ds = TSFragmentDataset(
             data_dir=args.data_dir, datasets=args.datasets,
             time_intervals=args.time_intervals, max_samples=args.max_samples,

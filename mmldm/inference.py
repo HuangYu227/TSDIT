@@ -570,16 +570,20 @@ def main():
         print(f"Eval dataset: {len(test_ds)} test samples")
 
         # Collect ground truth and generations
-        all_ori = []       # list of (T, 1) arrays
-        all_gen_runs = []  # list of list-of-(T, 1) arrays (one per run)
+        all_ori = []       # list of (T, C) arrays (normalized)
+        all_means = []     # list of (C,) arrays (per-variable original mean)
+        all_stds = []      # list of (C,) arrays (per-variable original std)
+        all_gen_runs = []  # list of list-of-(T, C) arrays (one per run)
 
         for idx in range(len(test_ds)):
             sample = test_ds[idx]
             text_emb = sample["text_embedding"].unsqueeze(0).to(device)  # (1, 128)
-            gt_ot = sample["ot"].numpy()  # (L, 1)
+            gt_ot = sample["ot"].numpy()  # (L, C) normalized
             L = gt_ot.shape[0]
 
-            all_ori.append(gt_ot)  # keep original length
+            all_ori.append(gt_ot)
+            all_means.append(sample["ot_means"].numpy())  # (C,)
+            all_stds.append(sample["ot_stds"].numpy())    # (C,)
             run_gens = []
 
             for run in range(args.n_runs):
@@ -596,7 +600,7 @@ def main():
                     use_adaptive_routing=args.use_adaptive_routing,
                     router=router,
                 )
-                gen_np = ts_out.squeeze(0).cpu().numpy()  # (L, 1)
+                gen_np = ts_out.squeeze(0).cpu().numpy()  # (L, C) normalized
                 # Trim to min length in case of mismatch
                 min_len = min(gt_ot.shape[0], gen_np.shape[0])
                 run_gens.append(gen_np[:min_len])
@@ -608,13 +612,19 @@ def main():
 
         # Save generated TS for external evaluation (e.g., VerbalTS metrics)
         if args.save_generated_npy is not None:
-            # Use median across runs as the final prediction (matching VerbalTS convention)
-            gen_med = np.array([
+            # Use median across runs, then un-normalize to raw space
+            # gen_med is (N, L, C) in normalized space
+            gen_med_norm = np.array([
                 np.median(np.stack([g[:min(o.shape[0], g.shape[0])] for g in runs]), axis=0)
                 for runs, o in zip(all_gen_runs, all_ori)
             ])
-            np.save(args.save_generated_npy, gen_med)
-            print(f"Saved generated TS ({gen_med.shape}) to {args.save_generated_npy}")
+            # Un-normalize: raw = norm * std + mean (per-variable, per-sample)
+            means_arr = np.array(all_means)   # (N, C)
+            stds_arr = np.array(all_stds)     # (N, C)
+            # Broadcast to (N, L, C)
+            gen_med_raw = gen_med_norm * stds_arr[:, np.newaxis, :] + means_arr[:, np.newaxis, :]
+            np.save(args.save_generated_npy, gen_med_raw)
+            print(f"Saved generated TS ({gen_med_raw.shape}) to {args.save_generated_npy}")
 
         # Align all to common min length
         min_L = min(o.shape[0] for o in all_ori)
