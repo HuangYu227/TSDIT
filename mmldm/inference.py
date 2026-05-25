@@ -533,8 +533,13 @@ def main():
     device = torch.device(args.device)
     vae, vae_config, dit, dit_config, router = _load_models(args, device)
 
-    # ---- Evaluation mode ----
-    if args.eval_data_dir is not None:
+    # ---- Evaluation / batch generation mode ----
+    weather_batch_mode = (
+        args.dataset_type == "weather_npy"
+        and args.weather_data_dir is not None
+        and args.save_generated_npy is not None
+    )
+    if args.eval_data_dir is not None or weather_batch_mode:
         metrics = [m.strip() for m in args.metrics.split(",")]
         needs_single = any(m in metrics for m in ("MSE", "WAPE"))
         needs_multi = "MRR" in metrics
@@ -548,6 +553,8 @@ def main():
                                      max_samples=args.max_eval_samples)
             print(f"Eval dataset (Weather .npy): {len(test_ds)} test samples")
         elif args.split_file is not None:
+            if args.eval_data_dir is None:
+                raise ValueError("--eval_data_dir is required for CSV evaluation")
             test_ds = TSFragmentDataset(
                 data_dir=args.eval_data_dir,
                 datasets=args.eval_datasets,
@@ -556,6 +563,8 @@ def main():
                 split="test", split_file=args.split_file,
             )
         else:
+            if args.eval_data_dir is None:
+                raise ValueError("--eval_data_dir is required for CSV evaluation")
             # Fallback: random split (may leak for ETTh1 sliding windows)
             from torch.utils.data import random_split
             dataset = TSFragmentDataset(
@@ -667,7 +676,11 @@ def main():
 
     # ---- Single-sample generation mode ----
     if args.text is None:
-        parser.error("Provide --text for single generation, or --eval_data_dir for evaluation.")
+        parser.error(
+            "Provide --text for single generation, --eval_data_dir for CSV evaluation, "
+            "or --dataset_type weather_npy --weather_data_dir ... --save_generated_npy ... "
+            "for Weather batch generation."
+        )
 
     text_embedding = _encode_text_sbert(args.text, vae_config.text_dim, device)
     print(f"Text condition: '{args.text[:80]}'")

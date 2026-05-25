@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 
 import numpy as np
 import torch
@@ -47,8 +48,15 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     return float(diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean)
 
 
-def load_cttp(checkpoint_path: str, config_path: str, device: str = "cuda"):
+def load_cttp(
+    checkpoint_path: str,
+    config_path: str,
+    device: str = "cuda",
+    verbalts_repo: str | None = None,
+):
     """Load pre-trained CTTP model."""
+    if verbalts_repo is not None:
+        sys.path.insert(0, os.path.abspath(verbalts_repo))
     from models.cttp.cttp_model import CTTP  # requires running from VerbalTS repo root
 
     configs = yaml.safe_load(open(config_path))
@@ -73,13 +81,14 @@ def compute_or_load_stats(
     cache_dir: str,
     batch_size: int,
     device: str,
+    rng: np.random.Generator,
 ):
     """Load cached FID statistics or compute from training set."""
     os.makedirs(cache_dir, exist_ok=True)
-    fid_mean_path = os.path.join(cache_dir, "fid_mean.npy")
-    fid_cov_path = os.path.join(cache_dir, "fid_cov.npy")
-    jftsd_mean_path = os.path.join(cache_dir, "jftsd_mean.npy")
-    jftsd_cov_path = os.path.join(cache_dir, "jftsd_cov.npy")
+    fid_mean_path = os.path.join(cache_dir, "fid_mean_random_caps.npy")
+    fid_cov_path = os.path.join(cache_dir, "fid_cov_random_caps.npy")
+    jftsd_mean_path = os.path.join(cache_dir, "jftsd_mean_random_caps.npy")
+    jftsd_cov_path = os.path.join(cache_dir, "jftsd_cov_random_caps.npy")
 
     if all(os.path.exists(p) for p in [fid_mean_path, fid_cov_path, jftsd_mean_path, jftsd_cov_path]):
         ts_mean = np.load(fid_mean_path)
@@ -105,8 +114,11 @@ def compute_or_load_stats(
             ts = torch.from_numpy(train_ts[start:end]).float().to(device)
             ts_len = torch.full((ts.shape[0],), ts.shape[1], dtype=torch.long).to(device)
 
-            # Get first caption per sample (consistent with WeatherDataset)
-            caps = [str(c[0]) for c in train_caps[start:end]]
+            # Match VerbalTS CustomSplit: randomly choose one caption per sample.
+            caps = [
+                str(sample_caps[rng.integers(0, len(sample_caps))])
+                for sample_caps in train_caps[start:end]
+            ]
 
             ts_emb = cttp.get_ts_coemb(ts, ts_len)
             cap_emb = cttp.get_text_coemb(caps, None)
@@ -144,18 +156,28 @@ def main():
                         help="Cache directory for FID statistics")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Seed for VerbalTS-style random caption selection")
+    parser.add_argument("--verbalts_repo", type=str, default=None,
+                        help="Optional VerbalTS repo root when not running this script from that repo")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    rng = np.random.default_rng(args.seed)
     print(f"Device: {device}")
 
     # 1. Load CTTP model
     print("Loading CTTP model...")
-    cttp = load_cttp(args.cttp_checkpoint, args.cttp_config, str(device))
+    cttp = load_cttp(
+        args.cttp_checkpoint,
+        args.cttp_config,
+        str(device),
+        verbalts_repo=args.verbalts_repo,
+    )
 
     # 2. Load/compute FID statistics
     ts_mean, ts_cov, joint_mean, joint_cov = compute_or_load_stats(
-        cttp, args.weather_data_dir, args.cache_dir, args.batch_size, str(device),
+        cttp, args.weather_data_dir, args.cache_dir, args.batch_size, str(device), rng,
     )
 
     # 3. Load generated TS
@@ -181,7 +203,11 @@ def main():
             end = min(start + args.batch_size, len(gen_ts))
             ts = torch.from_numpy(gen_ts[start:end]).float().to(device)
             ts_len = torch.full((ts.shape[0],), ts.shape[1], dtype=torch.long).to(device)
-            caps = [str(c[0]) for c in test_caps[start:end]]
+            # Match VerbalTS CustomSplit: randomly choose one caption per sample.
+            caps = [
+                str(sample_caps[rng.integers(0, len(sample_caps))])
+                for sample_caps in test_caps[start:end]
+            ]
 
             gen_emb = cttp.get_ts_coemb(ts, ts_len)
             cap_emb = cttp.get_text_coemb(caps, None)

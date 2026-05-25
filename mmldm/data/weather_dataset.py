@@ -7,7 +7,6 @@ with the MMLDM training/inference pipeline.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -49,26 +48,37 @@ def _encode_captions_sbert(captions: list[str], device: str = "cpu") -> np.ndarr
         return np.stack(emb_list, axis=0)
 
 
-def _load_or_encode_captions(weather_data_dir: str) -> np.ndarray:
-    """Load cached embeddings or encode all captions and cache."""
-    cache_path = os.path.join(weather_data_dir, "text_embeddings_128.npy")
-    if os.path.exists(cache_path):
-        return np.load(cache_path)
+def _load_or_encode_captions(weather_data_dir: str) -> tuple[np.ndarray, np.ndarray]:
+    """Load or encode embeddings for every caption of every Weather sample.
+
+    The returned embedding array is flat, while ``caption_counts`` records how
+    many captions belong to each sample in split order: train, valid, test.
+    This mirrors VerbalTS's random-caption dataset behavior without assuming
+    every sample has the same number of captions.
+    """
+    cache_path = os.path.join(weather_data_dir, "text_embeddings_128_all_caps.npy")
+    counts_path = os.path.join(weather_data_dir, "text_embedding_caption_counts.npy")
+    if os.path.exists(cache_path) and os.path.exists(counts_path):
+        return np.load(cache_path), np.load(counts_path)
 
     # Collect all captions from all splits
     all_captions = []
+    caption_counts = []
     for split in ["train", "valid", "test"]:
         caps_file = os.path.join(weather_data_dir, f"{split}_text_caps.npy")
         if os.path.exists(caps_file):
             caps = np.load(caps_file, allow_pickle=True)  # (n_samples, n_captions_per_sample)
             for sample_caps in caps:
-                all_captions.append(str(sample_caps[0]))  # use first caption per sample
+                sample_caption_list = [str(cap) for cap in sample_caps]
+                caption_counts.append(len(sample_caption_list))
+                all_captions.extend(sample_caption_list)
 
     print(f"  Encoding {len(all_captions)} captions with SBERT...")
     embeddings = _encode_captions_sbert(all_captions)
     np.save(cache_path, embeddings)
+    np.save(counts_path, np.asarray(caption_counts, dtype=np.int64))
     print(f"  Saved cached embeddings to {cache_path}")
-    return embeddings
+    return embeddings, np.asarray(caption_counts, dtype=np.int64)
 
 
 class WeatherDataset(Dataset):
@@ -109,12 +119,20 @@ class WeatherDataset(Dataset):
             self.ts = self.ts[:self.n_samples]
             self.caps = self.caps[:self.n_samples]
 
-        # Pre-compute or load SBERT embeddings for all captions (shared across splits)
-        all_embeddings = _load_or_encode_captions(weather_data_dir)
-        # Map to this split's samples
-        self.text_embeddings: np.ndarray = all_embeddings[
-            self._split_offset() : self._split_offset() + self.n_samples
-        ].copy()
+        # Pre-compute or load SBERT embeddings for all captions (shared across splits).
+        all_embeddings, caption_counts = _load_or_encode_captions(weather_data_dir)
+        sample_offset = self._split_offset()
+        selected_counts = caption_counts[sample_offset : sample_offset + self.n_samples]
+        caption_start = int(caption_counts[:sample_offset].sum())
+        caption_end = caption_start + int(selected_counts.sum())
+        split_embeddings = all_embeddings[caption_start:caption_end]
+
+        self.text_embeddings: list[np.ndarray] = []
+        pos = 0
+        for count in selected_counts:
+            next_pos = pos + int(count)
+            self.text_embeddings.append(split_embeddings[pos:next_pos].copy())
+            pos = next_pos
 
         print(f"  WeatherDataset [{split}]: {self.n_samples} samples, "
               f"seq_len={self.seq_len}, n_vars={self.n_vars}")
@@ -135,7 +153,8 @@ class WeatherDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         ot = self.ts[idx].copy()  # (L, C)
-        cap_str = str(self.caps[idx][0])
+        cap_idx = np.random.randint(0, len(self.caps[idx]))
+        cap_str = str(self.caps[idx][cap_idx])
 
         # Z-normalization per variable independently
         mean = ot.mean(axis=0, keepdims=True)  # (1, C)
@@ -144,7 +163,7 @@ class WeatherDataset(Dataset):
         ot_norm = (ot - mean) / std
 
         return {
-            "text_embedding": torch.from_numpy(self.text_embeddings[idx].copy()),
+            "text_embedding": torch.from_numpy(self.text_embeddings[idx][cap_idx].copy()),
             "ot": torch.from_numpy(ot_norm),                               # (L, C) normalized
             "ot_lengths": torch.tensor(self.seq_len, dtype=torch.long),
             "ot_means": torch.from_numpy(mean.flatten()).float(),          # (C,)
