@@ -435,6 +435,15 @@ def _load_models(args, device):
         p.requires_grad = False
     print(f"Loaded DiT from {args.dit_checkpoint}")
 
+    # Load Stage2-trained VAE text encoder weights (cross-modal alignment)
+    if "vae_text_encoder_state_dict" in dit_ckpt:
+        missing_t, unexpected_t = vae.load_state_dict(
+            dit_ckpt["vae_text_encoder_state_dict"], strict=False
+        )
+        if missing_t:
+            print(f"  WARNING: VAE text encoder missing keys: {missing_t}")
+        print(f"Loaded VAE text encoder weights from Stage2 checkpoint")
+
     # Optional router
     router = None
     if args.use_adaptive_routing:
