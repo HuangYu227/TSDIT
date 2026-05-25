@@ -577,9 +577,22 @@ def main():
     vae = MMLDMVAEModel(vae_config).to(device)
     vae.load_state_dict(vae_ckpt["model_state_dict"])
     vae.eval()
+    # Freeze TS encoder/decoder — keep frozen
     for p in vae.parameters():
         p.requires_grad = False
+    # Unfreeze text encoder — trained by FM loss for cross-modal alignment
+    for p in vae.text_proj.parameters():
+        p.requires_grad = True
+    for block in vae.text_encoder_blocks:
+        for p in block.parameters():
+            p.requires_grad = True
+    for p in vae.text_final_norm.parameters():
+        p.requires_grad = True
+    for p in vae.text_final_layer.parameters():
+        p.requires_grad = True
+    text_enc_params = sum(p.numel() for p in vae.parameters() if p.requires_grad)
     print(f"Loaded VAE from {args.vae_checkpoint}")
+    print(f"  TS encoder/decoder: frozen | Text encoder: {text_enc_params:,} params trainable via FM")
 
     # Build DiT
     dit_config = MMLDMDiTConfig(
@@ -708,8 +721,9 @@ def main():
     )
 
     # Optimizer with param groups (no weight decay for norms/biases)
-    # Only DiT is trained. Text latent comes from frozen VAE text encoder.
-    trainable_models = [dit]
+    # DiT + VAE text encoder jointly trained.
+    # TS encoder/decoder frozen; text encoder receives FM gradient for cross-modal alignment.
+    trainable_models = [dit, vae]
 
     decay_params = []
     no_decay_params = []
@@ -809,7 +823,7 @@ def main():
             # Innovation E: Text-Adaptive SNR — bias timesteps by text complexity
             t_per_sample = torch.rand(B, device=device)
             if args.snr_alpha > 0:
-                t_per_sample = text_adaptive_timestep(text_latent, t_per_sample, args.snr_alpha)
+                t_per_sample = text_adaptive_timestep(text_latent.detach(), t_per_sample, args.snr_alpha)
             t_per_token = expand_timesteps_per_token(t_per_sample, ts_shape)
 
             noise = torch.randn_like(z0)
@@ -823,7 +837,7 @@ def main():
                 text_emb = text_emb.repeat_interleave(args.batch_mul, dim=0)
                 t_per_sample = torch.rand(B * args.batch_mul, device=device)
                 if args.snr_alpha > 0:
-                    t_per_sample = text_adaptive_timestep(text_latent, t_per_sample, args.snr_alpha)
+                    t_per_sample = text_adaptive_timestep(text_latent.detach(), t_per_sample, args.snr_alpha)
                 t_per_token = expand_timesteps_per_token(t_per_sample, ts_shape)
                 noise = torch.randn_like(z0)
 
@@ -920,7 +934,8 @@ def main():
             total.backward()
 
             if (step + 1) % args.grad_accum_steps == 0:
-                last_grad_norm = torch.nn.utils.clip_grad_norm_(dit.parameters(), 1.0)
+                trainable_params = [p for group in optimizer.param_groups for p in group["params"]]
+                last_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -1013,6 +1028,11 @@ def main():
             ema.restore(dit)
         print(f"  Val loss: {val_loss:.4f} (fm={val_fm:.4f}, anchor={val_anchor:.4f})")
 
+        # Extract VAE text encoder weights (trained during Stage 2)
+        vae_text_enc_state = {k: v for k, v in vae.state_dict().items()
+                              if k.startswith(("text_proj", "text_encoder_blocks",
+                                               "text_final_norm", "text_final_layer"))}
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_ckpt_path = save_dir / "best.pt"
@@ -1024,6 +1044,7 @@ def main():
                     "epoch": epoch + 1,
                     "global_step": global_step,
                     "dit_state_dict": dit.state_dict(),
+                    "vae_text_encoder_state_dict": vae_text_enc_state,
                     "config": dit_config.to_dict(),
                     "val_loss": val_loss,
                 },
@@ -1040,6 +1061,7 @@ def main():
                 "epoch": epoch + 1,
                 "global_step": global_step,
                 "dit_state_dict": dit.state_dict(),
+                "vae_text_encoder_state_dict": vae_text_enc_state,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "config": dit_config.to_dict(),
