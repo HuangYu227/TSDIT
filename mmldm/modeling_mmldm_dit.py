@@ -448,7 +448,17 @@ class MultimodalJointAttention(nn.Module):
         L_text = text_tokens.shape[1]
 
         # Project to QKV
-        ts_qkv = self.ts_to_qkv(ts_tokens).reshape(B, L_ts, 3, self.heads, self.head_dim)
+        ts_qkv_flat = self.ts_to_qkv(ts_tokens)
+        if ts_qkv_flat.numel() != B * L_ts * 3 * self.heads * self.head_dim:
+            raise RuntimeError(
+                f"SHAPE MISMATCH: ts_tokens.shape={tuple(ts_tokens.shape)}, "
+                f"text_tokens.shape={tuple(text_tokens.shape)}, "
+                f"B={B}, L_ts={L_ts}, L_text={L_text}, "
+                f"ts_to_qkv_out.shape={tuple(ts_qkv_flat.shape)}, "
+                f"expected={B * L_ts * 3 * self.heads * self.head_dim}, "
+                f"got={ts_qkv_flat.numel()}"
+            )
+        ts_qkv = ts_qkv_flat.reshape(B, L_ts, 3, self.heads, self.head_dim)
         text_qkv = self.text_to_qkv(text_tokens).reshape(B, L_text, 3, self.heads, self.head_dim)
 
         ts_q, ts_k, ts_v = ts_qkv.unbind(2)
