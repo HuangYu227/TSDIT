@@ -817,12 +817,15 @@ def main():
             noise = torch.randn_like(z0)
 
             # Diffusion Batch Multiplication: repeat each sample with different t
+            # Use .repeat() (not .repeat_interleave()) to preserve sample
+            # boundaries in flat token layout. repeat_interleave duplicates
+            # individual tokens, corrupting per-sample groupings.
             if args.batch_mul > 1:
-                z0 = z0.repeat_interleave(args.batch_mul, dim=0)
-                text_latent = text_latent.repeat_interleave(args.batch_mul, dim=0)
-                ts_shape = ts_shape.repeat_interleave(args.batch_mul, dim=0)
-                text_shape = text_shape.repeat_interleave(args.batch_mul, dim=0)
-                text_emb = text_emb.repeat_interleave(args.batch_mul, dim=0)
+                z0 = z0.repeat(args.batch_mul, 1)
+                text_latent = text_latent.repeat(args.batch_mul, 1)
+                ts_shape = ts_shape.repeat(args.batch_mul, 1)
+                text_shape = text_shape.repeat(args.batch_mul, 1)
+                text_emb = text_emb.repeat(args.batch_mul, 1)
                 t_per_sample = torch.rand(B * args.batch_mul, device=device)
                 if args.snr_alpha > 0:
                     t_per_sample = text_adaptive_timestep(text_latent.detach(), t_per_sample, args.snr_alpha)
