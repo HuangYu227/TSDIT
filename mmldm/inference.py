@@ -435,8 +435,16 @@ def _load_models(args, device):
         p.requires_grad = False
     print(f"Loaded DiT from {args.dit_checkpoint}")
 
-    # Load Stage2-trained VAE text encoder weights (cross-modal alignment)
-    if "vae_text_encoder_state_dict" in dit_ckpt:
+    # Load Stage2-trained VAE weights (text encoder or full VAE for joint training)
+    if "vae_state_dict" in dit_ckpt:
+        # Joint training mode: full VAE state dict
+        missing_t, unexpected_t = vae.load_state_dict(
+            dit_ckpt["vae_state_dict"], strict=False
+        )
+        if missing_t:
+            print(f"  WARNING: VAE missing keys: {missing_t}")
+        print(f"Loaded full VAE weights from Stage2 checkpoint (joint training)")
+    elif "vae_text_encoder_state_dict" in dit_ckpt:
         missing_t, unexpected_t = vae.load_state_dict(
             dit_ckpt["vae_text_encoder_state_dict"], strict=False
         )

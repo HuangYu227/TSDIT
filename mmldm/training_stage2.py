@@ -582,15 +582,17 @@ def main():
     vae_config = MMLDMVAEConfig(**vae_ckpt["config"])
     vae = MMLDMVAEModel(vae_config).to(device)
     vae.load_state_dict(vae_ckpt["model_state_dict"])
-    vae.eval()
     if args.unfreeze_ts:
-        # Keep entire VAE trainable — TS + text encoder jointly tuned by FM loss
+        # Joint training: TS encoder + text encoder tuned by FM loss.
+        # Decoder is not in the forward path but stays in train mode for consistency.
+        vae.train()
         for p in vae.parameters():
             p.requires_grad = True
         vae_params = sum(p.numel() for p in vae.parameters() if p.requires_grad)
         print(f"Loaded VAE from {args.vae_checkpoint}")
         print(f"  ALL unfrozen: {vae_params:,} params trainable via FM (TS + Text)")
     else:
+        vae.eval()
         # Freeze TS encoder/decoder — keep frozen
         for p in vae.parameters():
             p.requires_grad = False
@@ -763,7 +765,7 @@ def main():
     # OneCycleLR: single-cycle schedule matching T2S's approach
     # Ramps lr up then decays over the entire training run
     total_steps = len(train_loader) * args.epochs
-    pct_start = args.warmup_steps / total_steps if args.warmup_steps > 0 else 0.05
+    pct_start = min(max(args.warmup_steps / total_steps, 1e-6), 0.3) if args.warmup_steps > 0 else 0.05
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=args.lr,
@@ -807,12 +809,16 @@ def main():
             # Convert to list
             ot_list = [ot[i, :ot_lengths[i]] for i in range(B)]
 
-            # Encode with VAE (use mean for stable targets)
-            with torch.no_grad():
+            # Encode with VAE. In joint (unfreeze_ts) mode gradients flow
+            # through the TS encoder into the FM loss for cross-modal alignment.
+            if args.unfreeze_ts:
                 enc_output = vae.encode(ot_list)
-                trend_dists, residual_dists = enc_output.latent_dists
-                z_list = [torch.cat([td.mean, rd.mean], dim=-1)
-                          for td, rd in zip(trend_dists, residual_dists)]
+            else:
+                with torch.no_grad():
+                    enc_output = vae.encode(ot_list)
+            trend_dists, residual_dists = enc_output.latent_dists
+            z_list = [torch.cat([td.mean, rd.mean], dim=-1)
+                      for td, rd in zip(trend_dists, residual_dists)]
 
             z0 = torch.cat(z_list, dim=0)  # (L_total, latent_dim)
             # Standardize latent using dataset-level stats
@@ -983,6 +989,8 @@ def main():
 
         # Validation (use EMA weights if available)
         dit.eval()
+        if args.unfreeze_ts:
+            vae.eval()
         if ema:
             ema.apply(dit)
         val_loss = 0.0
@@ -1025,12 +1033,19 @@ def main():
         val_fm /= max(len(val_loader), 1)
         if ema:
             ema.restore(dit)
+        if args.unfreeze_ts:
+            vae.train()
         print(f"  Val loss: {val_loss:.4f} (fm={val_fm:.4f})")
 
-        # Extract VAE text encoder weights (trained during Stage 2)
-        vae_text_enc_state = {k: v for k, v in vae.state_dict().items()
+        # Extract VAE weights. In joint mode save full VAE; otherwise text encoder only.
+        if args.unfreeze_ts:
+            vae_save_state = {k: v for k, v in vae.state_dict().items()}
+            vae_save_key = "vae_state_dict"
+        else:
+            vae_save_state = {k: v for k, v in vae.state_dict().items()
                               if k.startswith(("text_proj", "text_encoder_blocks",
                                                "text_final_norm", "text_final_layer"))}
+            vae_save_key = "vae_text_encoder_state_dict"
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -1043,7 +1058,7 @@ def main():
                     "epoch": epoch + 1,
                     "global_step": global_step,
                     "dit_state_dict": dit.state_dict(),
-                    "vae_text_encoder_state_dict": vae_text_enc_state,
+                    vae_save_key: vae_save_state,
                     "config": dit_config.to_dict(),
                     "val_loss": val_loss,
                 },
@@ -1060,7 +1075,7 @@ def main():
                 "epoch": epoch + 1,
                 "global_step": global_step,
                 "dit_state_dict": dit.state_dict(),
-                "vae_text_encoder_state_dict": vae_text_enc_state,
+                vae_save_key: vae_save_state,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "config": dit_config.to_dict(),
