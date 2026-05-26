@@ -735,11 +735,12 @@ def main():
     # OneCycleLR: single-cycle schedule matching T2S's approach
     # Ramps lr up then decays over the entire training run
     total_steps = len(train_loader) * args.epochs
+    pct_start = args.warmup_steps / total_steps if args.warmup_steps > 0 else 0.05
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=args.lr,
         total_steps=total_steps,
-        pct_start=0.05,       # 5% warmup (short, since we have many epochs)
+        pct_start=pct_start,
         anneal_strategy="cos",
         div_factor=25,        # initial lr = max_lr / 25
         final_div_factor=1e4, # final lr = max_lr / 10000
