@@ -562,6 +562,8 @@ def main():
     parser.add_argument("--min_lr", type=float, default=1e-6, help="Minimum learning rate")
     # Innovation D: Curriculum
     parser.add_argument("--curriculum_epochs", type=int, default=3, help="Epochs of curriculum (simple->complex)")
+    parser.add_argument("--unfreeze_ts", action="store_true",
+                        help="Unfreeze VAE TS encoder/decoder in Stage 2 (jointly trained by FM loss)")
     # Engineering: EMA
     parser.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay rate (0=disabled)")
     parser.add_argument("--max_samples", type=int, default=None)
@@ -581,22 +583,30 @@ def main():
     vae = MMLDMVAEModel(vae_config).to(device)
     vae.load_state_dict(vae_ckpt["model_state_dict"])
     vae.eval()
-    # Freeze TS encoder/decoder — keep frozen
-    for p in vae.parameters():
-        p.requires_grad = False
-    # Unfreeze text encoder — trained by FM loss for cross-modal alignment
-    for p in vae.text_proj.parameters():
-        p.requires_grad = True
-    for block in vae.text_encoder_blocks:
-        for p in block.parameters():
+    if args.unfreeze_ts:
+        # Keep entire VAE trainable — TS + text encoder jointly tuned by FM loss
+        for p in vae.parameters():
             p.requires_grad = True
-    for p in vae.text_final_norm.parameters():
-        p.requires_grad = True
-    for p in vae.text_final_layer.parameters():
-        p.requires_grad = True
-    text_enc_params = sum(p.numel() for p in vae.parameters() if p.requires_grad)
-    print(f"Loaded VAE from {args.vae_checkpoint}")
-    print(f"  TS encoder/decoder: frozen | Text encoder: {text_enc_params:,} params trainable via FM")
+        vae_params = sum(p.numel() for p in vae.parameters() if p.requires_grad)
+        print(f"Loaded VAE from {args.vae_checkpoint}")
+        print(f"  ALL unfrozen: {vae_params:,} params trainable via FM (TS + Text)")
+    else:
+        # Freeze TS encoder/decoder — keep frozen
+        for p in vae.parameters():
+            p.requires_grad = False
+        # Unfreeze text encoder — trained by FM loss for cross-modal alignment
+        for p in vae.text_proj.parameters():
+            p.requires_grad = True
+        for block in vae.text_encoder_blocks:
+            for p in block.parameters():
+                p.requires_grad = True
+        for p in vae.text_final_norm.parameters():
+            p.requires_grad = True
+        for p in vae.text_final_layer.parameters():
+            p.requires_grad = True
+        text_enc_params = sum(p.numel() for p in vae.parameters() if p.requires_grad)
+        print(f"Loaded VAE from {args.vae_checkpoint}")
+        print(f"  TS encoder/decoder: frozen | Text encoder: {text_enc_params:,} params trainable via FM")
 
     # Build DiT
     dit_config = MMLDMDiTConfig(
