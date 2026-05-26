@@ -591,8 +591,9 @@ def main():
             L = gt_ot.shape[0]
 
             all_ori.append(gt_ot)
-            all_means.append(sample["ot_means"].numpy())  # (C,)
-            all_stds.append(sample["ot_stds"].numpy())    # (C,)
+            if "ot_means" in sample:
+                all_means.append(sample["ot_means"].numpy())  # (C,)
+                all_stds.append(sample["ot_stds"].numpy())    # (C,)
             run_gens = []
 
             for run in range(args.n_runs):
@@ -628,10 +629,12 @@ def main():
                 for runs, o in zip(all_gen_runs, all_ori)
             ])
             # Un-normalize: raw = norm * std + mean (per-variable, per-sample)
-            means_arr = np.array(all_means)   # (N, C)
-            stds_arr = np.array(all_stds)     # (N, C)
-            # Broadcast to (N, L, C)
-            gen_med_raw = gen_med_norm * stds_arr[:, np.newaxis, :] + means_arr[:, np.newaxis, :]
+            if all_means:
+                means_arr = np.array(all_means)   # (N, C)
+                stds_arr = np.array(all_stds)     # (N, C)
+                gen_med_raw = gen_med_norm * stds_arr[:, np.newaxis, :] + means_arr[:, np.newaxis, :]
+            else:
+                gen_med_raw = gen_med_norm  # CSV mode: no normalization to undo
             np.save(args.save_generated_npy, gen_med_raw)
             print(f"Saved generated TS ({gen_med_raw.shape}) to {args.save_generated_npy}")
 
