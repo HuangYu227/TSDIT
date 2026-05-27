@@ -347,11 +347,11 @@ def parse_args():
     p.add_argument("--model_path", type=str, default="", help="Resume from checkpoint")
 
     # Data
-    p.add_argument("--dataset_type", type=str, default="weather_npy",
+    p.add_argument("--dataset_type", type=str, default=None,
                     choices=["weather_npy", "csv"])
     p.add_argument("--datasets", type=str, nargs="+", default=None,
                     help="T2S dataset names, e.g. --datasets ETTh1 traffic")
-    p.add_argument("--time_interval", type=int, default=24,
+    p.add_argument("--time_interval", type=int, default=None,
                     choices=[24, 48, 96], help="T2S series length")
     p.add_argument("--image_size", type=int, default=64)
     p.add_argument("--n_fft", type=int, default=64)
@@ -406,13 +406,16 @@ def main():
         "display_interval": args.display_interval,
         "save_interval": args.save_interval,
     })
+    if args.dataset_type is not None:
+        config["data"]["dataset_type"] = args.dataset_type
+    if args.datasets is not None:
+        config["data"]["datasets"] = args.datasets
+    if args.time_interval is not None:
+        config["data"]["time_interval"] = args.time_interval
     config["data"].update({
-        "dataset_type": args.dataset_type,
         "image_size": args.image_size,
         "n_fft": args.n_fft,
         "hop_length": args.hop_length,
-        "datasets": args.datasets,
-        "time_interval": args.time_interval,
     })
     config["diffusion"].update({
         "num_steps": args.num_steps,
