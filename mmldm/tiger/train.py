@@ -68,13 +68,16 @@ def get_default_config() -> dict:
             "layers": 8,
             "n_var": 16,
             "multipatch_num": 1,
-            "patch_size": 4,
+            "base_patch": 4,
+            "patch_scale": 2,
+            "diffusion_embedding_dim": 64,
+            "in_channels": 3,
             "condition_type": "adaLN",
             "attention_mask_type": "parallel",
         },
 
         "condition": {
-            "use_text": True,
+            "cond_mode": "text+image",   # "text+image" | "text_only" | "image_only"
             "image_encoder_type": "cnn",
             "num_stages": 4,
             "text": {

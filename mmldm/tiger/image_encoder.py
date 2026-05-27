@@ -83,8 +83,16 @@ class ImageEncoder(nn.Module):
             (all patch tokens plus the CLS token).
         """
         if isinstance(images, torch.Tensor):
-            # Expect (B, 3, H, W) float tensor
-            outputs = self.model(pixel_values=images.to(self.device))
+            # Expect (B, 3, H, W) float tensor in [0, 1].
+            # CLIP expects 224x224 with specific normalization.
+            x = images.to(self.device)
+            if x.shape[-1] != 224 or x.shape[-2] != 224:
+                x = F.interpolate(x, size=(224, 224), mode="bicubic", align_corners=False)
+            # CLIP image normalization (ImageNet stats)
+            mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=x.device).view(1, 3, 1, 1)
+            std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=x.device).view(1, 3, 1, 1)
+            x = (x - mean) / std
+            outputs = self.model(pixel_values=x)
         else:
             # List of PIL images — apply the CLIP image processor
             from transformers import CLIPProcessor

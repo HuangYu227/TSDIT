@@ -167,9 +167,15 @@ def stft_image_to_ts(
     frames = max(1, math.ceil(ts_length / (hop_length or (n_fft // 4))))
 
     # Interpolate to the required spectrogram shape.
+    # bicubic requires (N, C, H, W) — add channel dim if needed.
+    needs_squeeze = stft_img.ndim == 3
+    if needs_squeeze:
+        stft_img = stft_img.unsqueeze(1)  # (B, 1, H, W)
     mag = F.interpolate(
         stft_img, size=(F_bins, frames), mode="bicubic", align_corners=False
     )
+    if needs_squeeze:
+        mag = mag.squeeze(1)  # (B, F, frames)
     mag = mag.clamp(min=0.0)
 
     # Flatten batch dims for griffin_lim.
@@ -193,7 +199,7 @@ def stft_image_to_ts(
 # Main decoder
 # ---------------------------------------------------------------------------
 
-class ImageToTSDecoder:
+class ImageToTSDecoder(nn.Module):
     """Decodes generated 3-channel images back into time series.
 
     Two modes:
@@ -225,6 +231,7 @@ class ImageToTSDecoder:
             win_length: window length (must match the encoder).
             griffin_lim_iters: number of Griffin-Lim iterations.
         """
+        super().__init__()
         self.mode = mode
         self.n_fft = n_fft
         self.hop_length = hop_length

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from .dit_model import TIGERDiT
 from .image_encoder import ImageEncoder, CNNEncoder
-from .cond_projector import ImageTextProjector, ImageOnlyProjector
+from .cond_projector import ImageTextProjector, ImageOnlyProjector, TextOnlyProjector
 from .samplers import DDPMSampler, DDIMSampler
 
 
@@ -67,20 +67,29 @@ class TIGERGenerator(nn.Module):
         n_scale = diff_config.get("multipatch_num", 1)
         n_steps = diff_config["num_steps"]
         n_stages = cond_config.get("num_stages", 4)
+        cond_mode = cond_config.get("cond_mode", "text+image")
 
-        if cond_config.get("use_text", True):
+        if cond_mode == "text+image":
             self.cond_projector = ImageTextProjector(
                 n_var=n_var, n_scale=n_scale, n_steps=n_steps, n_stages=n_stages,
                 dim_in_text=cond_config["text"]["text_emb"],
                 dim_in_image=cond_config["image"]["image_emb"],
                 dim_out=diff_config["channels"]
             ).to(self.device)
-        else:
-            self.cond_projector = ImageOnlyProjector(
+        elif cond_mode == "text_only":
+            self.cond_projector = TextOnlyProjector(
                 n_var=n_var, n_scale=n_scale, n_steps=n_steps, n_stages=n_stages,
-                dim_in=cond_config["image"]["image_emb"],
+                dim_in_text=cond_config["text"]["text_emb"],
                 dim_out=diff_config["channels"]
             ).to(self.device)
+        elif cond_mode == "image_only":
+            self.cond_projector = ImageOnlyProjector(
+                n_var=n_var, n_scale=n_scale, n_steps=n_steps, n_stages=n_stages,
+                dim_in_image=cond_config["image"]["image_emb"],
+                dim_out=diff_config["channels"]
+            ).to(self.device)
+        else:
+            raise ValueError(f"Unknown cond_mode: {cond_mode}")
 
     def _init_dit(self, diff_config):
         self.dit = TIGERDiT(diff_config).to(self.device)
@@ -104,15 +113,22 @@ class TIGERGenerator(nn.Module):
         return self.image_encoder(images)
 
     def compute_condition(self, images, texts, diffusion_step):
-        """Compute fused text+image condition embedding."""
-        image_emb = self.encode_image(images)
-        
-        if texts is not None and self.text_model is not None:
+        """Compute condition embedding based on cond_mode."""
+        cond_mode = self.config["condition"].get("cond_mode", "text+image")
+
+        if cond_mode == "text+image":
+            image_emb = self.encode_image(images)
             text_emb = self.encode_text(texts)
             attr_emb = self.cond_projector(text_emb, image_emb, diffusion_step)
-        else:
+        elif cond_mode == "text_only":
+            text_emb = self.encode_text(texts)
+            attr_emb = self.cond_projector(text_emb, diffusion_step)
+        elif cond_mode == "image_only":
+            image_emb = self.encode_image(images)
             attr_emb = self.cond_projector(image_emb, diffusion_step)
-        
+        else:
+            raise ValueError(f"Unknown cond_mode: {cond_mode}")
+
         return attr_emb
 
     def _noise_estimation_loss(self, x, attr_emb, t):

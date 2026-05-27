@@ -290,20 +290,18 @@ class TSToImageEncoder:
         ts_2d, is_multi, n_vars = self._to_2d(ts)
         B_flat, T = ts_2d.shape
 
-        # Handle very short sequences (STFT needs at least n_fft samples).
-        min_len = max(self.n_fft, 4)
-        ts_2d, _ = self._pad_short(ts_2d, min_len)
-
-        # Normalize to [0, 1].
+        # Normalize original-length data to [0, 1].
         ts_norm, min_val, max_val = _normalize_01(ts_2d)
-
-        # Replace NaN with 0 after normalization (rare but possible).
         ts_norm = torch.nan_to_num(ts_norm, nan=0.0, posinf=1.0, neginf=0.0)
 
-        # Compute the three channels.
+        # GASF and RP use original-length data (preserves diagonal bijectivity).
         r = self._compute_gasf(ts_norm)                    # (B_flat, 1, img, img)
-        g = self._compute_stft(ts_2d)                      # (B_flat, 1, img, img)
         b = self._compute_rp(ts_norm)                      # (B_flat, 1, img, img)
+
+        # Only STFT needs padding (requires at least n_fft samples).
+        min_len = max(self.n_fft, 4)
+        ts_padded, _ = self._pad_short(ts_2d, min_len)
+        g = self._compute_stft(ts_padded)                  # (B_flat, 1, img, img)
 
         image = torch.cat([r, g, b], dim=1)                # (B_flat, 3, img, img)
 

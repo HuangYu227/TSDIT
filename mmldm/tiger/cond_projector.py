@@ -270,3 +270,38 @@ class ImageOnlyProjector(nn.Module):
         out = self.image_projector(image_emb, diffusion_step)
         out = out.permute(0, 3, 1, 2)  # (B, dim_out, n_var, n_scale)
         return out
+
+
+# ---------------------------------------------------------------------------
+# Public: text-only projector (for fair comparison with T2S/VerbalTS)
+# ---------------------------------------------------------------------------
+
+class TextOnlyProjector(nn.Module):
+    """Text-only conditioning projector (no image path).
+
+    Identical to :class:`ImageOnlyProjector` but operates on text embeddings.
+    Used for fair comparison with text-only baselines (T2S, VerbalTS).
+    """
+
+    def __init__(self, n_var: int, n_scale: int, n_steps: int,
+                 n_stages: int, dim_in_text: int = 512,
+                 dim_out: int = 128):
+        super().__init__()
+        self.dim_out = dim_out
+        self.n_var = n_var
+        self.n_scale = n_scale
+
+        self.text_projector = _AnchorProjector(
+            n_var=n_var, n_scale=n_scale,
+            n_steps=n_steps, n_stages=n_stages,
+            dim_in=dim_in_text, dim_out=dim_out,
+        )
+
+    def forward(
+        self,
+        text_emb: torch.Tensor,
+        diffusion_step: torch.Tensor,
+    ) -> torch.Tensor:
+        out = self.text_projector(text_emb, diffusion_step)
+        out = out.permute(0, 3, 1, 2)  # (B, dim_out, n_var, n_scale)
+        return out
