@@ -840,8 +840,9 @@ def main():
         _sample_ot = _sample_batch["ot"].to(device)
         with torch.no_grad():
             _enc = vae.encode([_sample_ot[i] for i in range(_sample_ot.shape[0])])
-            _trend_d, _res_d = _enc.latent_dists
-            _sample_z = torch.cat([_trend_d.mean, _res_d.mean], dim=-1)
+            _trend_dists, _res_dists = _enc.latent_dists
+            _sample_z = torch.cat([torch.cat([td.mean, rd.mean], dim=-1)
+                                   for td, rd in zip(_trend_dists, _res_dists)], dim=0)
             _sample_z = vae.standardize_latent(_sample_z)
         for _blk in dit.blocks:
             if _blk.joint_attn.tpci is not None:
