@@ -29,6 +29,7 @@ from torch.utils.tensorboard import SummaryWriter
 from .data.dataset import TIGERDataset, TIGERCollateFn
 from .generator import TIGERGenerator
 from .image_to_ts import ImageToTSDecoder
+from .ts_to_image import NormParams
 
 
 def set_seed(seed: int = 42):
@@ -157,6 +158,39 @@ class WarmupCosineScheduler:
 
 
 # ---------------------------------------------------------------------------
+# Evaluation metrics
+# ---------------------------------------------------------------------------
+
+def calc_mse(real: np.ndarray, gen: np.ndarray) -> float:
+    """MSE between real and generated time series. Both (B, T)."""
+    return float(np.mean((real - gen) ** 2))
+
+
+def calc_mape(real: np.ndarray, gen: np.ndarray, eps: float = 1e-8) -> float:
+    """MAPE between real and generated time series. Both (B, T)."""
+    return float(np.mean(np.abs(real - gen) / (np.abs(real) + eps)))
+
+
+def calc_mrr(real: np.ndarray, gen_samples: np.ndarray, k: int = 10) -> float:
+    """MRR@k: Mean Reciprocal Rank by cosine similarity.
+    real: (B, T), gen_samples: (n_samples, B, T).
+    """
+    from numpy.linalg import norm
+    n_samples = min(k, gen_samples.shape[0])
+    B = real.shape[0]
+    mrr = 0.0
+    for i in range(B):
+        sims = []
+        for s in range(n_samples):
+            a, b = real[i], gen_samples[s, i]
+            sim = np.dot(a, b) / (norm(a) * norm(b) + 1e-8)
+            sims.append(sim)
+        rank = int(np.argmax(sims)) + 1  # best match rank (1-indexed for argmax)
+        mrr += 1.0 / rank
+    return mrr / B
+
+
+# ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
 
@@ -170,6 +204,7 @@ class TIGERTrainer:
         self.val_interval = config["val_interval"]
         self.display_interval = config["display_interval"]
         self.save_interval = config["save_interval"]
+        self.eval_gen_interval = config.get("eval_gen_interval", 10)
 
         os.makedirs(config["save_dir"], exist_ok=True)
         os.makedirs(config["log_dir"], exist_ok=True)
@@ -178,6 +213,11 @@ class TIGERTrainer:
         self._init_model()
         self._init_opt()
         self._init_logging()
+
+        dc = self.config["data"]
+        self.decoder = ImageToTSDecoder(
+            mode="gasf", n_fft=dc["n_fft"], hop_length=dc["hop_length"]
+        ).to(self.device)
 
         self.best_val_loss = float("inf")
         self.global_step = 0
@@ -315,12 +355,73 @@ class TIGERTrainer:
         self.writer.add_scalar("val/loss", avg_loss, epoch)
         print(f"         | val_loss  ={avg_loss:.6f}")
 
+        # Generation metrics every eval_gen_interval epochs
+        if (epoch + 1) % self.eval_gen_interval == 0:
+            self._compute_gen_metrics(epoch)
+
         if avg_loss < self.best_val_loss:
             self.best_val_loss = avg_loss
             self._save_checkpoint(epoch, tag="best")
             print(f"         *** New best val loss: {avg_loss:.6f}")
 
         return avg_loss
+
+    @torch.no_grad()
+    def _compute_gen_metrics(self, epoch: int):
+        """Generate samples and compute MSE, MAPE, MRR@10."""
+        self.model.eval()
+        dc = self.config["data"]
+        ts_len = dc.get("time_interval", 24)
+
+        all_real, all_gen = [], []
+        for batch in self.val_loader:
+            images = batch["image"].to(self.device).float()
+            texts = batch.get("cap", None)
+            ts_real = batch["ts"].to(self.device).float()
+            ts_min = batch["ts_min"].to(self.device).float()
+            ts_max = batch["ts_max"].to(self.device).float()
+
+            # Generate 1 image sample (for MSE/MAPE)
+            gen_imgs = self.model.generate(images, texts, n_samples=1)
+            gen_img = gen_imgs[0]  # (B, 3, H, W)
+
+            # Decode to time series
+            norm_params = NormParams(min_val=ts_min, max_val=ts_max, n_vars=1, original_length=ts_len)
+            gen_ts = self.decoder.decode(gen_img, ts_len, norm_params)  # (B, T)
+
+            # Real TS in original scale
+            real_ts = ts_real * (ts_max.unsqueeze(-1) - ts_min.unsqueeze(-1)) + ts_min.unsqueeze(-1)
+
+            all_real.append(real_ts.cpu().numpy())
+            all_gen.append(gen_ts.cpu().numpy())
+
+        real_np = np.concatenate(all_real, axis=0)
+        gen_np = np.concatenate(all_gen, axis=0)
+
+        mse = calc_mse(real_np, gen_np)
+        mape = calc_mape(real_np, gen_np)
+
+        # MRR@10: generate 10 samples
+        all_gen10 = []
+        for s in range(10):
+            gen_list = []
+            for batch in self.val_loader:
+                images = batch["image"].to(self.device).float()
+                texts = batch.get("cap", None)
+                ts_min = batch["ts_min"].to(self.device).float()
+                ts_max = batch["ts_max"].to(self.device).float()
+                gen_imgs = self.model.generate(images, texts, n_samples=1)
+                norm_params = NormParams(min_val=ts_min, max_val=ts_max, n_vars=1, original_length=ts_len)
+                gen_ts = self.decoder.decode(gen_imgs[0], ts_len, norm_params)
+                gen_list.append(gen_ts.cpu().numpy())
+            all_gen10.append(np.concatenate(gen_list, axis=0))
+        gen10_np = np.stack(all_gen10, axis=0)  # (10, B, T)
+        mrr = calc_mrr(real_np, gen10_np, k=10)
+
+        self.writer.add_scalar("val/MSE", mse, epoch)
+        self.writer.add_scalar("val/MAPE", mape, epoch)
+        self.writer.add_scalar("val/MRR@10", mrr, epoch)
+        print(f"         | MSE={mse:.6f} | MAPE={mape:.4f} | MRR@10={mrr:.4f}")
 
     def _save_checkpoint(self, epoch: int, val_loss: float = None, tag: str = None):
         if tag is None:
