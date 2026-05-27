@@ -63,6 +63,8 @@ class MMLDMVAEConfig(PretrainedConfig):
         kl_anneal_end: float = 1e-6,
         kl_anneal_epochs: int = 5,
         fft_cutoff_ratio: float = 0.3,
+        use_tri_band: bool = False,
+        text_num_tokens: int = 1,
         scaling_factor: float = 1.0,
         shifting_factor: float = 0.0,
         **kwargs,
@@ -88,6 +90,8 @@ class MMLDMVAEConfig(PretrainedConfig):
         self.kl_anneal_end = kl_anneal_end
         self.kl_anneal_epochs = kl_anneal_epochs
         self.fft_cutoff_ratio = fft_cutoff_ratio
+        self.use_tri_band = use_tri_band
+        self.text_num_tokens = text_num_tokens
         self.scaling_factor = scaling_factor
         self.shifting_factor = shifting_factor
         super().__init__(**kwargs)
@@ -187,4 +191,10 @@ class MMLDMDiTConfig(PretrainedConfig):
         self.tpci_gamma_init = tpci_gamma_init
         self.tpci_use_period_bias = tpci_use_period_bias
         self.tpci_period = tpci_period
+        # Dual-Stream DiT (Innovation I4)
+        self.use_dual_stream = kwargs.pop("use_dual_stream", False)
+        self.n_vars = kwargs.pop("n_vars", 1)
+        # REPA (P3-1)
+        self.use_repa = kwargs.pop("use_repa", False)
+        self.repa_weight = kwargs.pop("repa_weight", 0.01)
         super().__init__(**kwargs)

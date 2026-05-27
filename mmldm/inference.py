@@ -87,8 +87,16 @@ def euler_ode_step(
     pos_offset: int = 0,
     text_raw: Optional[torch.Tensor] = None,
     causal_features: Optional[torch.Tensor] = None,
+    temporal_guidance_scale: float = 0.0,
 ) -> torch.Tensor:
-    """Single Euler ODE step with optional CFG and KV cache."""
+    """Single Euler ODE step with optional decoupled CFG and KV cache.
+
+    Decoupled CFG (Innovation I7) separates text and temporal guidance:
+        v = v_cond + w_text * (v_cond - v_text_uncond)
+                + w_temp * (v_cond - v_temporal_uncond)
+
+    When temporal_guidance_scale=0, falls back to standard CFG.
+    """
     device = z_t.device
     dtype = z_t.dtype
     L_total = z_t.shape[0]
@@ -106,11 +114,11 @@ def euler_ode_step(
     )
     v_cond = output_cond.ts_sample
 
-    # Unconditional prediction (empty text, no TGFM)
     if guidance_scale > 1.0:
+        # Text-unconditional prediction (empty text, no TGFM)
         empty_text = torch.zeros_like(text_latent)
         empty_text_shape = text_shape.clone()
-        output_uncond = dit(
+        output_text_uncond = dit(
             ts=z_t, text=empty_text,
             ts_shape=ts_shape, text_shape=empty_text_shape,
             timestep=t_batch, attn_mask=attn_mask,
@@ -118,8 +126,27 @@ def euler_ode_step(
             text_latent=None,
             causal_features=causal_features,
         )
-        v_uncond = output_uncond.ts_sample
-        v = guidance_scale * (v_cond - v_uncond) + v_uncond
+        v_text_uncond = output_text_uncond.ts_sample
+
+        if temporal_guidance_scale > 0:
+            # Temporal-unconditional: use fixed mid-timestep to break temporal structure
+            t_uniform = torch.full((L_total,), 0.5, device=device, dtype=dtype)
+            output_temp_uncond = dit(
+                ts=z_t, text=text_latent,
+                ts_shape=ts_shape, text_shape=text_shape,
+                timestep=t_uniform, attn_mask=attn_mask,
+                prefix_kv=prefix_kv, pos_offset=pos_offset,
+                text_latent=text_raw,
+                causal_features=causal_features,
+            )
+            v_temporal_uncond = output_temp_uncond.ts_sample
+            # Decoupled CFG — anchor on text-unconditional for correct scale
+            v = (v_text_uncond
+                 + guidance_scale * (v_cond - v_text_uncond)
+                 + temporal_guidance_scale * (v_cond - v_temporal_uncond))
+        else:
+            # Standard CFG
+            v = guidance_scale * (v_cond - v_text_uncond) + v_text_uncond
     else:
         v = v_cond
 
@@ -151,6 +178,7 @@ def generate_latent_blocks(
     router: Optional[SemanticRouter] = None,
     text_tokens_for_router: Optional[torch.Tensor] = None,
     text_raw: Optional[torch.Tensor] = None,
+    temporal_guidance_scale: float = 0.0,
 ) -> torch.Tensor:
     """Generate latent tokens block-by-block with Euler ODE integration.
 
@@ -243,6 +271,7 @@ def generate_latent_blocks(
                     pos_offset=prefix_len,
                     text_raw=text_raw,
                     causal_features=causal_features,
+                    temporal_guidance_scale=temporal_guidance_scale,
                 )
             z_clean = z_block
         else:
@@ -261,6 +290,7 @@ def generate_latent_blocks(
                     guidance_scale=guidance_scale,
                     text_raw=text_raw,
                     causal_features=causal_features,
+                    temporal_guidance_scale=temporal_guidance_scale,
                 )
             z_clean = z_block
 
@@ -332,6 +362,7 @@ def generate_timeseries(
     use_adaptive_routing: bool = False,
     router: Optional[SemanticRouter] = None,
     text_str: Optional[str] = None,
+    temporal_guidance_scale: float = 0.0,
 ) -> torch.Tensor:
     """End-to-end time series generation from text condition.
 
@@ -366,13 +397,14 @@ def generate_timeseries(
     n_latent_tokens = output_len // patch_size
     n_blocks = max(1, (n_latent_tokens + block_size - 1) // block_size)
 
-    # Step 1: Encode text -> text latent via frozen VAE text encoder
+    # Step 1: Encode text -> K semantic text latents via frozen VAE text encoder
     text_embs = text_embedding.to(device)  # (1, text_dim)
 
     with torch.no_grad():
-        text_latent = vae.encode_text_condition(text_embs)  # (B, latent_dim)
+        text_tokens, _ = vae.encode_text_tokens(text_embs)  # (1, K, latent_dim)
+        text_latent = text_tokens.flatten(0, 1)
 
-    text_shape = _shape_tensor([text_latent.shape[0]], device)
+    text_shape = _shape_tensor([text_tokens.shape[1]], device)
 
     # Optional: prepare router input
     router_tokens = None
@@ -395,6 +427,7 @@ def generate_timeseries(
         router=router,
         text_tokens_for_router=router_tokens,
         text_raw=text_embs,
+        temporal_guidance_scale=temporal_guidance_scale,
     )
 
     # Step 3: Decode latent -> time series
@@ -428,6 +461,8 @@ def _load_models(args, device):
     # VAE
     vae_ckpt = torch.load(args.vae_checkpoint, map_location=device, weights_only=False)
     vae_config = MMLDMVAEConfig(**vae_ckpt["config"])
+    if getattr(args, "text_num_tokens", None) is not None:
+        vae_config.text_num_tokens = args.text_num_tokens
     vae = MMLDMVAEModel(vae_config).to(device)
     missing, unexpected = vae.load_state_dict(vae_ckpt["model_state_dict"], strict=False)
     if missing:
@@ -441,13 +476,15 @@ def _load_models(args, device):
     dit_ckpt = torch.load(args.dit_checkpoint, map_location=device, weights_only=False)
     dit_config = MMLDMDiTConfig(**dit_ckpt["config"])
     dit = MMLDMDiTModel(dit_config).to(device)
-    missing, unexpected = dit.load_state_dict(dit_ckpt["dit_state_dict"], strict=False)
+    dit_state = dit_ckpt.get("ema_state_dict") or dit_ckpt["dit_state_dict"]
+    missing, unexpected = dit.load_state_dict(dit_state, strict=False)
     if missing:
         print(f"  WARNING: DiT missing keys: {missing}")
     dit.eval()
     for p in dit.parameters():
         p.requires_grad = False
-    print(f"Loaded DiT from {args.dit_checkpoint}")
+    loaded_kind = "EMA DiT" if dit_ckpt.get("ema_state_dict") is not None else "DiT"
+    print(f"Loaded {loaded_kind} from {args.dit_checkpoint}")
 
     # Load Stage2-trained VAE weights (text encoder or full VAE for joint training)
     if "vae_state_dict" in dit_ckpt:
@@ -495,10 +532,9 @@ def _encode_text_sbert(text_str: str, text_dim: int, device: torch.device) -> to
         inputs = tokenizer(text_str, return_tensors="pt", padding=True, truncation=True).to(device)
         with torch.no_grad():
             emb = sbert(**inputs).last_hidden_state.mean(dim=1)  # (1, 384)
-        # Deterministic projection: use first `text_dim` dims (preserves more
-        # semantics than a random Linear; SBERT dims are roughly equally informative)
         if emb.shape[-1] > text_dim:
-            emb = emb[:, :text_dim]
+            usable = (emb.shape[-1] // text_dim) * text_dim
+            emb = emb[:, :usable].reshape(emb.shape[0], text_dim, -1).mean(dim=-1)
         elif emb.shape[-1] < text_dim:
             emb = F.pad(emb, (0, text_dim - emb.shape[-1]))
         del sbert, tokenizer
@@ -533,6 +569,10 @@ def main():
     parser.add_argument("--T", type=float, default=1.0)
     parser.add_argument("--timestep_num", type=int, default=20)
     parser.add_argument("--guidance_scale", type=float, default=7.0)
+    parser.add_argument("--temporal_guidance_scale", type=float, default=0.0,
+                        help="Decoupled CFG: separate temporal guidance scale (0=standard CFG)")
+    parser.add_argument("--text_num_tokens", type=int, default=None,
+                        help="Override VAE text token count when loading older VAE checkpoints")
     parser.add_argument("--use_adaptive_routing", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     # Single-sample mode
@@ -631,6 +671,7 @@ def main():
                     guidance_scale=args.guidance_scale,
                     use_adaptive_routing=args.use_adaptive_routing,
                     router=router,
+                    temporal_guidance_scale=args.temporal_guidance_scale,
                 )
                 gen_np = ts_out.squeeze(0).cpu().numpy()  # (L, C) normalized
                 # Trim to min length in case of mismatch
@@ -723,6 +764,7 @@ def main():
         use_adaptive_routing=args.use_adaptive_routing,
         router=router,
         text_str=args.text,
+        temporal_guidance_scale=args.temporal_guidance_scale,
     )
 
     print(f"Generated shape: {ts_output.shape}")

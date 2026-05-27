@@ -59,15 +59,29 @@ def get_kl_beta(epoch: int, kl_anneal_epochs: int, kl_anneal_start: float, kl_an
     return kl_anneal_start + (kl_anneal_end - kl_anneal_start) * progress
 
 
-def compute_kl_loss(latent_dists: tuple[list, list]) -> torch.Tensor:
-    """KL for dual distributions (trend + residual)."""
-    trend_dists, residual_dists = latent_dists
+def compute_kl_loss(latent_dists: tuple) -> torch.Tensor:
+    """KL for dual or tri-band distributions."""
     kl = 0.0
-    for d in trend_dists:
-        kl = kl + d.kl()
-    for d in residual_dists:
-        kl = kl + d.kl()
-    return kl / (len(trend_dists) + len(residual_dists))
+    n = 0
+    for dist_list in latent_dists:
+        for d in dist_list:
+            kl = kl + d.kl()
+        n += len(dist_list)
+    return kl / n
+
+
+def _sample_latents_from_dists(latent_dists: tuple, poe_fusion=None) -> list[torch.Tensor]:
+    """Return deterministic clean latents from dual-band concat or tri-band PoE."""
+    if len(latent_dists) == 3:
+        if poe_fusion is None:
+            raise ValueError("Tri-band latents require a ProductOfExperts fusion module")
+        z_list = []
+        for sample_dists in zip(*latent_dists):
+            fused_params = poe_fusion(list(sample_dists))
+            z_list.append(torch.chunk(fused_params, 2, dim=-1)[0])
+        return z_list
+    return [torch.cat([d.mean for d in sample_dists], dim=-1)
+            for sample_dists in zip(*latent_dists)]
 
 
 def train_step(
@@ -76,6 +90,7 @@ def train_step(
     beta: float = 1e-6,
     gamma_spectral: float = 0.1,
     gamma_tclr: float = 0.1,
+    gamma_mrfft: float = 0.05,
     device: torch.device = torch.device("cpu"),
 ) -> dict:
     ot = batch["ot"].to(device)
@@ -91,10 +106,11 @@ def train_step(
     l_kl = compute_kl_loss(output["latent_dists"])
     l_spectral = output.get("spectral_loss", torch.tensor(0.0, device=device))
     l_tclr = output.get("tclr_loss", torch.tensor(0.0, device=device))
+    l_mrfft = output.get("multi_res_fft_loss", torch.tensor(0.0, device=device))
 
-    total = l_recon + beta * l_kl + gamma_spectral * l_spectral + gamma_tclr * l_tclr
+    total = l_recon + beta * l_kl + gamma_spectral * l_spectral + gamma_tclr * l_tclr + gamma_mrfft * l_mrfft
 
-    return {"total": total, "recon": l_recon, "kl": l_kl, "spectral": l_spectral, "tclr": l_tclr}
+    return {"total": total, "recon": l_recon, "kl": l_kl, "spectral": l_spectral, "tclr": l_tclr, "mrfft": l_mrfft}
 
 
 def main():
@@ -118,7 +134,11 @@ def main():
     parser.add_argument("--kl_anneal_end", type=float, default=1e-5)
     parser.add_argument("--gamma_spectral", type=float, default=0.1, help="Spectral loss weight")
     parser.add_argument("--gamma_tclr", type=float, default=0.1, help="TCLR loss weight")
+    parser.add_argument("--gamma_mrfft", type=float, default=0.05, help="Multi-resolution FFT loss weight")
     parser.add_argument("--fft_cutoff_ratio", type=float, default=0.3, help="FFT cutoff ratio for trend/residual split")
+    parser.add_argument("--use_tri_band", action="store_true", help="Use tri-band FFT decomposition with PoE fusion")
+    parser.add_argument("--text_num_tokens", type=int, default=8,
+                        help="Number of semantic text tokens produced for Stage 2 conditioning")
     parser.add_argument("--dim", type=int, default=256)
     parser.add_argument("--latent_dim", type=int, default=64)
     parser.add_argument("--num_heads", type=int, default=4)
@@ -147,6 +167,8 @@ def main():
         block_size=args.block_size, kl_anneal_start=args.kl_anneal_start,
         kl_anneal_end=args.kl_anneal_end, kl_anneal_epochs=args.kl_anneal_epochs,
         fft_cutoff_ratio=args.fft_cutoff_ratio,
+        use_tri_band=args.use_tri_band,
+        text_num_tokens=args.text_num_tokens,
     )
 
     if args.dataset_type == "weather_npy":
@@ -183,7 +205,11 @@ def main():
     if args.resume_checkpoint:
         ckpt = torch.load(args.resume_checkpoint, map_location=device, weights_only=False)
         model = MMLDMVAEModel(config).to(device)
-        model.load_state_dict(ckpt["model_state_dict"])
+        missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if missing:
+            print(f"  WARNING: missing keys when resuming VAE: {missing}")
+        if unexpected:
+            print(f"  WARNING: unexpected keys when resuming VAE: {unexpected}")
         print(f"Resumed from {args.resume_checkpoint} (epoch {ckpt.get('epoch', '?')})")
     else:
         model = MMLDMVAEModel(config).to(device)
@@ -214,14 +240,14 @@ def main():
 
     for epoch in range(args.epochs):
         model.train()
-        epoch_losses = {"total": 0.0, "recon": 0.0, "kl": 0.0, "spectral": 0.0, "tclr": 0.0}
+        epoch_losses = {"total": 0.0, "recon": 0.0, "kl": 0.0, "spectral": 0.0, "tclr": 0.0, "mrfft": 0.0}
         t0 = time.time()
         beta = get_kl_beta(epoch, args.kl_anneal_epochs, args.kl_anneal_start, args.kl_anneal_end)
         optimizer.zero_grad()
 
         for step, batch in enumerate(train_loader):
             losses = train_step(model, batch, beta=beta, gamma_spectral=args.gamma_spectral,
-                                gamma_tclr=args.gamma_tclr, device=device)
+                                gamma_tclr=args.gamma_tclr, gamma_mrfft=args.gamma_mrfft, device=device)
             (losses["total"] / args.grad_accum_steps).backward()
 
             if (step + 1) % args.grad_accum_steps == 0:
@@ -245,14 +271,14 @@ def main():
         avg = {k: v / len(train_loader) for k, v in epoch_losses.items()}
         print(f"Epoch {epoch+1}/{args.epochs} ({elapsed:.1f}s): "
               f"loss={avg['total']:.4f} recon={avg['recon']:.4f} "
-              f"kl={avg['kl']:.4f} spectral={avg['spectral']:.4f} tclr={avg['tclr']:.4f}")
+              f"kl={avg['kl']:.4f} spectral={avg['spectral']:.4f} tclr={avg['tclr']:.4f} mrfft={avg['mrfft']:.4f}")
 
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
             for batch in val_loader:
                 losses = train_step(model, batch, beta=beta, gamma_spectral=args.gamma_spectral,
-                                    gamma_tclr=args.gamma_tclr, device=device)
+                                    gamma_tclr=args.gamma_tclr, gamma_mrfft=args.gamma_mrfft, device=device)
                 val_loss += losses["total"].item()
         val_loss /= max(len(val_loader), 1)
         print(f"  Val loss: {val_loss:.4f}")
@@ -267,9 +293,11 @@ def main():
                     ot_lengths = batch["ot_lengths"]
                     ot_list = [ot[i, :ot_lengths[i]] for i in range(ot.shape[0])]
                     enc_output = model.encode(ot_list)
-                    trend_dists, residual_dists = enc_output.latent_dists
-                    for td, rd in zip(trend_dists, residual_dists):
-                        all_latents.append(torch.cat([td.mean, rd.mean], dim=-1))
+                    for z_i in _sample_latents_from_dists(
+                        enc_output.latent_dists,
+                        model.poe_fusion if model.use_tri_band else None,
+                    ):
+                        all_latents.append(z_i)
                 model.compute_latent_stats(all_latents)
             print("  Latent stats computed for standardization.")
 

@@ -170,20 +170,20 @@ class SpectralSignatureLearner(nn.Module):
 
     def forward(
         self, mechanism_states: list[torch.Tensor], ts_shape: torch.LongTensor,
-    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             mechanism_states: K x (L_total, latent_dim)
             ts_shape: (B, 1) per-sample lengths.
 
         Returns:
-            spectral_signatures: K x (n_freq_bins,)
-            causal_graph: (K, K) soft adjacency in [0, 1].
+            spectral_signatures: (B, K, n_freq_bins) per-sample signatures.
+            causal_graph: (B, K, K) per-sample soft adjacency in [0, 1].
         """
         lengths = ts_shape.flatten().tolist()
         B = len(lengths)
 
-        spectral_signatures = []
+        per_mech_sigs = []
         for k in range(self.n_mechanisms):
             z_k = mechanism_states[k]  # (L_total, latent_dim)
 
@@ -214,46 +214,50 @@ class SpectralSignatureLearner(nn.Module):
             # Learnable pooling across latent dim -> (B, n_freq_bins)
             mag_pooled = self.freq_pool[k](mag).squeeze(-1)  # (B, n_freq_bins)
 
-            # Average across batch: (n_freq_bins,)
-            phi_k = mag_pooled.mean(dim=0)
+            # L2-normalise per sample (not across batch!)
+            phi_k = F.normalize(mag_pooled, dim=-1)  # (B, n_freq_bins)
+            per_mech_sigs.append(phi_k)
 
-            # L2-normalise for cosine similarity
-            phi_k = F.normalize(phi_k, dim=0)
-            spectral_signatures.append(phi_k)
+        # Stack: (B, K, n_freq_bins)
+        spectral_signatures = torch.stack(per_mech_sigs, dim=1)
 
-        # Build causal graph from spectral compatibility
+        # Build per-sample causal graph
         causal_graph = self._build_graph(spectral_signatures)
 
         return spectral_signatures, causal_graph
 
-    def _build_graph(self, signatures: list[torch.Tensor]) -> torch.Tensor:
-        """Compute soft causal graph from spectral signatures.
+    def _build_graph(self, signatures: torch.Tensor) -> torch.Tensor:
+        """Compute per-sample soft causal graph from spectral signatures.
 
-        W_jk = sigma(cos(phi_j, phi_k) * tau_jk / temp)
+        Args:
+            signatures: (B, K, n_freq_bins) per-sample spectral signatures.
+
+        Returns:
+            causal_graph: (B, K, K) per-sample soft adjacency in [0, 1].
         """
-        K = self.n_mechanisms
-        device = signatures[0].device
+        B, K, _ = signatures.shape
+        device = signatures.device
 
-        # Stack signatures: (K, n_freq_bins)
-        Phi = torch.stack(signatures, dim=0)
-
-        # Pairwise cosine similarity: (K, K)
+        # Pairwise cosine similarity: (B, K, K)
         cos_sim = F.cosine_similarity(
-            Phi.unsqueeze(1), Phi.unsqueeze(0), dim=-1,
-        )
+            signatures.unsqueeze(2),  # (B, K, 1, n_freq_bins)
+            signatures.unsqueeze(1),  # (B, 1, K, n_freq_bins)
+            dim=-1,
+        )  # (B, K, K)
 
         # Temperature scaling
         temp = self.graph_log_tau.exp().clamp(min=0.1, max=5.0)
 
         # Apply learnable direction: asymmetric via tau_jk
         tau = torch.sigmoid(self.direction_logits)  # (K, K)
-        raw_graph = cos_sim * tau / temp
+        raw_graph = cos_sim * tau.unsqueeze(0) / temp  # (B, K, K)
 
         # Sigmoid to [0, 1]
         causal_graph = torch.sigmoid(raw_graph)
 
         # Zero diagonal (no self-loops)
-        causal_graph = causal_graph * (1 - torch.eye(K, device=device))
+        eye = torch.eye(K, device=device).unsqueeze(0)  # (1, K, K)
+        causal_graph = causal_graph * (1 - eye)
 
         return causal_graph
 
@@ -350,7 +354,7 @@ class CausalMechanismTransition(nn.Module):
         """
         Args:
             mechanism_states: K x (L_total, latent_dim)
-            causal_graph: (K, K) soft adjacency
+            causal_graph: (B, K, K) per-sample soft adjacency
             regime: (regime_dim,) or (B, regime_dim) regime encoding
             ts_shape: (B, 1) per-sample lengths.
 
@@ -364,17 +368,24 @@ class CausalMechanismTransition(nn.Module):
         # Expand regime to per-token: (L_total, regime_dim)
         regime_expanded = self._expand_regime(regime, ts_shape)
 
+        lengths = ts_shape.flatten().tolist()
+        B = len(lengths)
+
         updated = []
         for k in range(self.n_mechanisms):
-            # Weighted aggregation of parent states
+            # Weighted aggregation of parent states (per-sample graph weights)
             parent_input = mechanism_states[k].new_zeros(
                 mechanism_states[k].shape,
             )
             for j in range(self.n_mechanisms):
                 if j == k:
                     continue
-                w_jk = causal_graph[j, k]
-                parent_input = parent_input + w_jk * mechanism_states[j]
+                # Expand per-sample weight to per-token: w_jk[b] -> repeat L_b times
+                w_jk = causal_graph[:, j, k]  # (B,)
+                w_expanded = torch.cat([
+                    w_jk[b].expand(int(lengths[b])) for b in range(B)
+                ])  # (L_total,)
+                parent_input = parent_input + w_expanded.unsqueeze(-1) * mechanism_states[j]
 
             # Mechanism MLP
             h = self.mechanism_mlps[k](parent_input)  # (L, latent_dim)
@@ -473,13 +484,19 @@ def compute_notears_acyclicity(graph: torch.Tensor) -> torch.Tensor:
     """NOTEARS acyclicity constraint: tr(exp(W .* W)) - K = 0 iff DAG.
 
     Args:
-        graph: (K, K) soft adjacency matrix.
+        graph: (B, K, K) or (K, K) soft adjacency matrix.
     Returns:
         Scalar loss, >= 0, = 0 iff graph is acyclic.
     """
-    K = graph.shape[0]
+    if graph.ndim == 2:
+        graph = graph.unsqueeze(0)
+    B, K, _ = graph.shape
     W_sq = graph * graph
-    return torch.trace(torch.matrix_exp(W_sq)) - K
+    # trace(matrix_exp(W_sq)) per sample, then average
+    traces = torch.stack([
+        torch.trace(torch.matrix_exp(W_sq[b])) for b in range(B)
+    ])
+    return (traces - K).mean()
 
 
 def compute_graph_sparsity(graph: torch.Tensor) -> torch.Tensor:
@@ -579,11 +596,12 @@ class SCMON(nn.Module):
         sparsity_loss = compute_graph_sparsity(causal_graph)
 
         # Spectral consistency: updated signatures should resemble original
+        # Both are (B, K, n_freq_bins)
         spectral_loss = z0.new_tensor(0.0)
         updated_sigs, _ = self.spectral_learner(updated_states, ts_shape)
         for k in range(self.n_mechanisms):
             spectral_loss = spectral_loss + F.mse_loss(
-                updated_sigs[k], signatures[k].detach(),
+                updated_sigs[:, k, :], signatures[:, k, :].detach(),
             )
 
         losses = {

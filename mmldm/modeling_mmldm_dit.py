@@ -744,6 +744,75 @@ class TPCIModule(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# TPCI-v2: YaRN-style Timestep-Position Coupled Encoding
+# ---------------------------------------------------------------------------
+
+
+class TPCIv2(nn.Module):
+    """YaRN-style per-dimension timestep-position coupled encoding.
+
+    Improvements over TPCIModule:
+    1. Per-dimension learnable frequencies (not per-band)
+    2. Per-dimension timestep coupling (a_s, b_s)
+    3. YaRN temperature correction to prevent attention entropy collapse
+
+    Reference: YaRN (2023), LongRoPE (ICML 2024)
+    """
+
+    def __init__(self, head_dim: int, rope_theta: float = 10000.0):
+        super().__init__()
+        self.head_dim = head_dim
+        half_dim = head_dim // 2
+
+        # Per-dimension learnable log-frequencies
+        self.log_omega = nn.Parameter(
+            torch.log(torch.tensor(1.0 / (rope_theta ** (
+                torch.arange(0, half_dim).float() / half_dim
+            ))))
+        )
+
+        # Per-dimension timestep coupling: λ_d(t) = σ(a_d · logit(t) + b_d)
+        self.a_s = nn.Parameter(torch.linspace(2.0, -2.0, half_dim))
+        self.b_s = nn.Parameter(torch.zeros(half_dim))
+        self.gamma = nn.Parameter(torch.tensor(0.0))
+
+        # YaRN temperature correction
+        self.attn_temperature = nn.Parameter(torch.tensor(1.0))
+
+    def forward(
+        self, seq_len: int, device: torch.device, dtype: torch.dtype,
+        timestep: float | torch.Tensor, pos_offset: int = 0,
+    ) -> torch.Tensor:
+        indices = torch.arange(pos_offset, pos_offset + seq_len, device=device, dtype=torch.float32)
+        theta_base = torch.exp(self.log_omega)  # (half_dim,)
+
+        # Timestep coupling
+        if torch.is_tensor(timestep):
+            t_scalar = timestep.detach().float().mean().to(device)
+        else:
+            t_scalar = torch.tensor(float(timestep), device=device, dtype=torch.float32)
+        t_clamped = t_scalar.clamp(1e-6, 1 - 1e-6)
+        logit_t = torch.log(t_clamped / (1 - t_clamped))
+        lambda_s = torch.sigmoid(self.a_s * logit_t + self.b_s)  # (half_dim,)
+
+        # Coupled frequencies
+        theta_coupled = theta_base * (1 + self.gamma * lambda_s)
+
+        # Position encoding with YaRN temperature
+        angles = indices.unsqueeze(-1) * theta_coupled.unsqueeze(0)  # (L, half_dim)
+        cos_emb = torch.cos(angles) * self.attn_temperature
+        sin_emb = torch.sin(angles) * self.attn_temperature
+
+        return torch.cat([cos_emb, sin_emb], dim=-1).to(dtype)
+
+    def diversity_loss(self) -> torch.Tensor:
+        """Encourage distinct per-dimension frequencies."""
+        log_w = self.log_omega
+        diff = log_w.unsqueeze(0) - log_w.unsqueeze(1)
+        return -torch.mean(torch.abs(diff))
+
+
+# ---------------------------------------------------------------------------
 # Multimodal Joint Attention (for DiT)
 # ---------------------------------------------------------------------------
 
@@ -1079,14 +1148,281 @@ class MultimodalDiTBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Dual-Stream DiT Block (Innovation I4: DiTS-style)
+# ---------------------------------------------------------------------------
+
+
+class DualStreamDiTBlock(nn.Module):
+    """Dual-stream DiT block separating time and variate attention.
+
+    Instead of joint attention over [TS; Text], this block uses three
+    distinct attention pathways:
+    1. Time Attention: causal, intra-variate (along sequence dimension)
+    2. Variate Attention: cross-variate (across variables/channels)
+    3. Text Cross-Attention: TS queries text for conditioning
+
+    This is more parameter-efficient for multivariate time series since
+    the attention matrix decomposes from (VT x VT) to (T x T + V x V).
+
+    Reference: DiTS (arXiv 2602.06597, Feb 2026)
+    """
+
+    def __init__(
+        self,
+        ts_dim: int,
+        text_dim: int,
+        emb_dim: int,
+        heads: int,
+        head_dim: int,
+        expand_ratio: int = 4,
+        norm_eps: float = 1e-5,
+        qk_bias: bool = False,
+        rope_dim: int = 32,
+        text_latent_dim: int = 0,
+        latent_dim_for_causal: int = 0,
+        use_tpci: bool = False,
+        tpci_n_bands: int = 4,
+        tpci_gamma_init: float = 0.0,
+        tpci_use_period_bias: bool = False,
+        tpci_period: float = 24.0,
+    ):
+        super().__init__()
+        inner_dim = heads * head_dim
+
+        # 1. Time Attention (intra-variate, along sequence)
+        self.time_attn_norm = AdaptiveLayerNorm(ts_dim, dim_cond=emb_dim)
+        self.time_qkv = nn.Linear(ts_dim, inner_dim * 3, bias=qk_bias)
+        self.time_out = nn.Linear(inner_dim, ts_dim, bias=qk_bias)
+        self.time_q_norm = nn.LayerNorm(head_dim, eps=norm_eps)
+        self.time_k_norm = nn.LayerNorm(head_dim, eps=norm_eps)
+        self.time_post_gamma = nn.Sequential(nn.SiLU(), nn.Linear(emb_dim, ts_dim))
+        nn.init.zeros_(self.time_post_gamma[-1].weight)
+        nn.init.zeros_(self.time_post_gamma[-1].bias)
+
+        # 2. Variate Attention (cross-variate, across channels)
+        self.var_attn_norm = AdaptiveLayerNorm(ts_dim, dim_cond=emb_dim)
+        self.var_qkv = nn.Linear(ts_dim, inner_dim * 3, bias=qk_bias)
+        self.var_out = nn.Linear(inner_dim, ts_dim, bias=qk_bias)
+        self.var_q_norm = nn.LayerNorm(head_dim, eps=norm_eps)
+        self.var_k_norm = nn.LayerNorm(head_dim, eps=norm_eps)
+        self.var_post_gamma = nn.Sequential(nn.SiLU(), nn.Linear(emb_dim, ts_dim))
+        nn.init.zeros_(self.var_post_gamma[-1].weight)
+        nn.init.zeros_(self.var_post_gamma[-1].bias)
+
+        # 3. Text Cross-Attention
+        self.text_cross_norm = AdaptiveLayerNorm(ts_dim, dim_cond=emb_dim)
+        self.text_q = nn.Linear(ts_dim, inner_dim, bias=qk_bias)
+        self.text_kv = nn.Linear(text_dim, inner_dim * 2, bias=qk_bias)
+        self.text_out = nn.Linear(inner_dim, ts_dim, bias=qk_bias)
+        self.text_q_norm = nn.LayerNorm(head_dim, eps=norm_eps)
+        self.text_k_norm = nn.LayerNorm(head_dim, eps=norm_eps)
+        self.text_post_gamma = nn.Sequential(nn.SiLU(), nn.Linear(emb_dim, ts_dim))
+        nn.init.zeros_(self.text_post_gamma[-1].weight)
+        nn.init.zeros_(self.text_post_gamma[-1].bias)
+
+        # 4. FFN
+        self.ffn_norm = AdaptiveLayerNorm(ts_dim, dim_cond=emb_dim)
+        self.ffn = MLP(ts_dim, expand_ratio)
+        self.ffn_post_gamma = nn.Sequential(nn.SiLU(), nn.Linear(emb_dim, ts_dim))
+        nn.init.zeros_(self.ffn_post_gamma[-1].weight)
+        nn.init.zeros_(self.ffn_post_gamma[-1].bias)
+
+        # SCMON causal feature injection
+        self.use_causal = latent_dim_for_causal > 0
+        if self.use_causal:
+            self.causal_proj = nn.Linear(latent_dim_for_causal, ts_dim)
+            self.causal_gate = nn.Parameter(torch.zeros(1))
+            nn.init.xavier_uniform_(self.causal_proj.weight)
+            nn.init.zeros_(self.causal_proj.bias)
+
+        self.heads = heads
+        self.head_dim = head_dim
+        self.rope_dim = rope_dim
+
+        # RoPE / TPCI for time attention
+        if use_tpci:
+            self.tpci = TPCIModule(
+                rope_dim=rope_dim, n_bands=tpci_n_bands,
+                gamma_init=tpci_gamma_init,
+                use_period_bias=tpci_use_period_bias, period=tpci_period,
+            )
+        else:
+            self.tpci = None
+
+        # Text-Guided Feature Modulation (TGFM)
+        self.use_tgfm = text_latent_dim > 0
+        if self.use_tgfm:
+            self.text_modulator = TextModulator(ts_dim, text_latent_dim)
+            self.text_mod_gate = nn.Parameter(torch.full((1,), 0.1))
+
+    def _get_rope_freqs(self, seq_len, device, dtype, pos_offset=0, timestep=0.0):
+        if self.tpci is not None:
+            return self.tpci(seq_len, device, dtype, timestep, pos_offset)
+        half_dim = self.rope_dim // 2
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, half_dim, device=device).float() / half_dim))
+        t = torch.arange(pos_offset, pos_offset + seq_len, device=device, dtype=inv_freq.dtype)
+        return torch.outer(t, inv_freq)
+
+    def _apply_rope(self, x, freqs):
+        d = self.rope_dim
+        x_rope = x[..., :d].float()
+        x_pass = x[..., d:]
+        half = d // 2
+        x1, x2 = x_rope[..., :half], x_rope[..., half:]
+        freqs_half = freqs[..., :half]
+        cos = freqs_half.cos().unsqueeze(0).unsqueeze(0)
+        sin = freqs_half.sin().unsqueeze(0).unsqueeze(0)
+        out1 = x1 * cos - x2 * sin
+        out2 = x2 * cos + x1 * sin
+        return torch.cat([torch.cat([out1, out2], dim=-1).to(x.dtype), x_pass], dim=-1)
+
+    def forward(
+        self,
+        ts_tokens: torch.Tensor,       # (1, L_ts, dim)
+        text_tokens: torch.Tensor,     # (1, L_text, dim)
+        ts_emb: torch.Tensor,          # (1, L_ts, emb_dim)
+        text_emb: torch.Tensor,        # (1, 1, emb_dim)
+        attn_mask: Optional[torch.Tensor] = None,
+        prefix_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        pos_offset: int = 0,
+        return_kv: bool = False,
+        text_latent: Optional[torch.Tensor] = None,
+        causal_features: Optional[torch.Tensor] = None,
+        timestep: float | torch.Tensor = 0.0,
+        n_vars: int = 1,               # number of variables for reshape
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, tuple]:
+        B, L, D = ts_tokens.shape
+        H, d = self.heads, self.head_dim
+
+        # --- 1. Time Attention (intra-variate, causal along sequence) ---
+        h = self.time_attn_norm(ts_tokens, cond=ts_emb)
+        qkv = self.time_qkv(h).reshape(B, L, 3, H, d)
+        q, k, v = qkv.unbind(2)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        q, k = self.time_q_norm(q), self.time_k_norm(k)
+
+        # Apply RoPE
+        freqs = self._get_rope_freqs(L, q.device, q.dtype, pos_offset, timestep)
+        q, k = self._apply_rope(q, freqs), self._apply_rope(k, freqs)
+
+        # Prefix KV cache
+        if prefix_kv is not None:
+            pre_k, pre_v = prefix_kv
+            k = torch.cat([pre_k, k], dim=2)
+            v = torch.cat([pre_v, v], dim=2)
+
+        # Causal attention (block-causal mask applied via attn_mask)
+        d_head = q.shape[-1]
+        time_attn = q.mul(1.0 / (d_head ** 0.5)) @ k.transpose(-2, -1)
+        if attn_mask is not None:
+            time_attn = time_attn + attn_mask.to(time_attn.dtype)
+        time_out = (time_attn.softmax(dim=-1) @ v).transpose(1, 2).reshape(B, L, -1)
+        time_out = self.time_out(time_out)
+        ts_tokens = ts_tokens + self.time_post_gamma(ts_emb) * time_out
+
+        # --- 2. Variate Attention (cross-variate) ---
+        h = self.var_attn_norm(ts_tokens, cond=ts_emb)
+        # Reshape: (B, n_vars, T_per_var, D) -> attend across vars at each timestep
+        if n_vars > 1:
+            T_per = L // n_vars
+            h_var = h.reshape(B * n_vars, T_per, D)
+            qkv_var = self.var_qkv(h_var).reshape(B * n_vars, T_per, 3, H, d)
+            q_v, k_v, v_v = qkv_var.unbind(2)
+            q_v, k_v, v_v = q_v.transpose(1, 2), k_v.transpose(1, 2), v_v.transpose(1, 2)
+            q_v, k_v = self.var_q_norm(q_v), self.var_k_norm(k_v)
+            # Attend across vars at each timestep: (B, H, T, n_vars, d)
+            q_v = q_v.reshape(B, H, n_vars, T_per, d).permute(0, 1, 3, 2, 4)
+            k_v = k_v.reshape(B, H, n_vars, T_per, d).permute(0, 1, 3, 2, 4)
+            v_v = v_v.reshape(B, H, n_vars, T_per, d).permute(0, 1, 3, 2, 4)
+            q_v = q_v.reshape(B * H * T_per, n_vars, d)
+            k_v = k_v.reshape(B * H * T_per, n_vars, d)
+            v_v = v_v.reshape(B * H * T_per, n_vars, d)
+            var_attn = q_v.mul(1.0 / (d ** 0.5)) @ k_v.transpose(-2, -1)
+            var_out = (var_attn.softmax(dim=-1) @ v_v)
+            var_out = var_out.reshape(B, H, T_per, n_vars, d).permute(0, 1, 3, 2, 4)
+            var_out = var_out.reshape(B, H, L, d).transpose(1, 2).reshape(B, L, -1)
+        else:
+            var_out = h
+        var_out = self.var_out(var_out)
+        ts_tokens = ts_tokens + self.var_post_gamma(ts_emb) * var_out
+
+        # --- 3. Text Cross-Attention ---
+        h = self.text_cross_norm(ts_tokens, cond=ts_emb)
+        q_t = self.text_q(h).reshape(B, L, H, d).transpose(1, 2)
+        kv_t = self.text_kv(text_tokens).reshape(B, -1, 2, H, d)
+        k_t, v_t = kv_t.unbind(2)
+        k_t, v_t = k_t.transpose(1, 2), v_t.transpose(1, 2)
+        q_t, k_t = self.text_q_norm(q_t), self.text_k_norm(k_t)
+        text_cross_attn = q_t.mul(1.0 / (d ** 0.5)) @ k_t.transpose(-2, -1)
+        text_cross_out = (text_cross_attn.softmax(dim=-1) @ v_t).transpose(1, 2).reshape(B, L, -1)
+        text_cross_out = self.text_out(text_cross_out)
+        ts_tokens = ts_tokens + self.text_post_gamma(ts_emb) * text_cross_out
+
+        # --- 4. FFN ---
+        h = self.ffn_norm(ts_tokens, cond=ts_emb)
+        ts_tokens = ts_tokens + self.ffn_post_gamma(ts_emb) * self.ffn(h)
+
+        # --- 5. SCMON causal feature injection ---
+        if self.use_causal and causal_features is not None:
+            ts_tokens = ts_tokens + self.causal_gate * self.causal_proj(causal_features)
+
+        # --- 6. TGFM ---
+        if self.use_tgfm and text_latent is not None:
+            ts_tokens = ts_tokens + self.text_mod_gate * self.text_modulator(ts_tokens, text_latent)
+
+        # Return KV for caching (time attention only)
+        current_kv = None
+        if return_kv:
+            current_kv = (k[:, :, -L:], v[:, :, -L:])
+            return ts_tokens, text_tokens, current_kv
+        return ts_tokens, text_tokens
+
+
+# ---------------------------------------------------------------------------
 # Output dataclass
 # ---------------------------------------------------------------------------
+# Representation Alignment Regularization (P3-1)
+# ---------------------------------------------------------------------------
+
+
+class REPALoss(nn.Module):
+    """Representation Alignment Regularization (JanusFlow, arXiv 2411.07975).
+
+    Aligns intermediate DiT hidden states with text features via cosine
+    similarity at each block. Encourages the TS representation to be
+    semantically aligned with the text conditioning throughout the network.
+    """
+
+    def __init__(self, text_dim: int, ts_dim: int, n_blocks: int, weight: float = 0.01):
+        super().__init__()
+        self.projectors = nn.ModuleList([nn.Linear(ts_dim, text_dim) for _ in range(n_blocks)])
+        self.weight = weight
+
+    def forward(self, ts_hidden_states: list[torch.Tensor], text_features: torch.Tensor) -> torch.Tensor:
+        """Compute REPA loss.
+
+        Args:
+            ts_hidden_states: list of (B, L, ts_dim) from each DiT block.
+            text_features: (B, text_dim) pooled text features.
+
+        Returns:
+            Scalar weighted loss.
+        """
+        total_loss = torch.tensor(0.0, device=text_features.device, dtype=text_features.dtype)
+        for i, h in enumerate(ts_hidden_states):
+            h_proj = self.projectors[i](h.mean(dim=1))  # (B, text_dim)
+            h_proj = F.normalize(h_proj, dim=-1)
+            text_norm = F.normalize(text_features, dim=-1)
+            sim = (h_proj * text_norm).sum(dim=-1)  # (B,)
+            total_loss = total_loss - sim.mean()
+        return self.weight * total_loss / len(ts_hidden_states)
 
 
 @dataclass
 class MMLDMDiTOutput:
     ts_sample: torch.Tensor
     text_sample: torch.Tensor
+    repa_loss: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -1122,6 +1458,8 @@ class MMLDMDiTModel(PreTrainedModel):
         self.use_scmon = getattr(config, 'use_scmon', False)
         self.use_semantic_axes = getattr(config, 'use_semantic_axes', False)
         self.use_tpci = getattr(config, 'use_tpci', False)
+        self.use_dual_stream = getattr(config, 'use_dual_stream', False)
+        self.n_vars = getattr(config, 'n_vars', 1)
 
         # Text Pooler: SemanticAxisTextPooler (Grassmannian) or MultiViewTextPooler (baseline)
         if self.text_latent_dim > 0 and self.n_text_views > 1:
@@ -1176,8 +1514,9 @@ class MMLDMDiTModel(PreTrainedModel):
         )
 
         # DiT blocks
+        block_cls = DualStreamDiTBlock if self.use_dual_stream else MultimodalDiTBlock
         self.blocks = nn.ModuleList([
-            MultimodalDiTBlock(
+            block_cls(
                 ts_dim=config.txt_dim,
                 text_dim=config.txt_dim,
                 emb_dim=config.emb_dim,
@@ -1213,6 +1552,16 @@ class MMLDMDiTModel(PreTrainedModel):
             dim=config.txt_dim,
         )
 
+        # REPA loss (P3-1) — align intermediate TS hidden states with text
+        self.use_repa = getattr(config, "use_repa", False)
+        if self.use_repa:
+            self.repa_loss = REPALoss(
+                text_dim=self.text_latent_dim if self.text_latent_dim > 0 else config.txt_dim,
+                ts_dim=config.txt_dim,
+                n_blocks=config.num_layers,
+                weight=getattr(config, "repa_weight", 0.01),
+            )
+
         self.post_init()
         self._reset_conditioning_init()
 
@@ -1233,14 +1582,20 @@ class MMLDMDiTModel(PreTrainedModel):
                 nn.init.zeros_(cond_linear.bias[dim:])
 
         for block in self.blocks:
-            for gate in (
-                block.ts_post_attn_gamma[-1],
-                block.text_post_attn_gamma[-1],
-                block.ts_post_ff_gamma[-1],
-                block.text_post_ff_gamma[-1],
-            ):
-                nn.init.zeros_(gate.weight)
-                nn.init.zeros_(gate.bias)
+            # MultimodalDiTBlock and DualStreamDiTBlock use different gate names.
+            # Both already zero-init in __init__, but HF post_init may overwrite.
+            gate_names = [
+                "ts_post_attn_gamma", "text_post_attn_gamma",
+                "ts_post_ff_gamma", "text_post_ff_gamma",
+                # DualStreamDiTBlock names
+                "time_post_gamma", "var_post_gamma",
+                "text_post_gamma", "ffn_post_gamma",
+            ]
+            for name in gate_names:
+                gate = getattr(block, name, None)
+                if gate is not None:
+                    nn.init.zeros_(gate[-1].weight)
+                    nn.init.zeros_(gate[-1].bias)
 
         nn.init.zeros_(self.ts_out.proj.weight)
         nn.init.zeros_(self.ts_out.proj.bias)
@@ -1352,22 +1707,34 @@ class MMLDMDiTModel(PreTrainedModel):
         if self.text_pooler is not None and text_latent is not None:
             text_views = self.text_pooler(text_latent)  # K × (B, text_dim)
 
+        repa_hidden_states = [] if self.use_repa else None
         for i, block in enumerate(self.blocks):
             layer_prefix_kv = prefix_kv.layers[i] if prefix_kv is not None and i < len(prefix_kv.layers) else None
             # Cycle through views if available, else use original text_latent
             block_text_latent = text_views[i % len(text_views)] if text_views is not None else text_latent
             block_text_latent = self._expand_text_latent_to_ts(block_text_latent, ts_shape_patched)
-            ts, text = block(
-                ts, text,
-                ts_emb=ts_emb,
-                text_emb=text_emb,
-                attn_mask=attn_mask,
-                prefix_kv=layer_prefix_kv,
-                pos_offset=pos_offset,
-                text_latent=block_text_latent,
-                causal_features=causal_features,
+            # Pass n_vars for dual-stream variate attention
+            block_kwargs = dict(
+                ts_emb=ts_emb, text_emb=text_emb, attn_mask=attn_mask,
+                prefix_kv=layer_prefix_kv, pos_offset=pos_offset,
+                text_latent=block_text_latent, causal_features=causal_features,
                 timestep=timestep,
             )
+            if self.use_dual_stream:
+                block_kwargs["n_vars"] = self.n_vars
+            ts, text = block(ts, text, **block_kwargs)
+            if repa_hidden_states is not None:
+                repa_hidden_states.append(ts)
+
+        # REPA loss (P3-1)
+        repa_loss = None
+        if self.use_repa and repa_hidden_states:
+            # Use text_latent as the text feature target
+            if text_latent is not None:
+                text_feats = text_latent if text_latent.dim() == 2 else text_latent.mean(dim=1)
+            else:
+                text_feats = text.squeeze(0).mean(dim=0, keepdim=True)  # (1, d)
+            repa_loss = self.repa_loss(repa_hidden_states, text_feats)
 
         # Output norm + unpatch
         ts = self.ts_out_norm(ts.squeeze(0), cond=ts_emb.squeeze(0))
@@ -1376,7 +1743,7 @@ class MMLDMDiTModel(PreTrainedModel):
         ts, _ = self.ts_out(ts, ts_shape_patched, ts_shape_before)
         text, _ = self.text_out(text, text_shape_patched, text_shape_before)
 
-        return MMLDMDiTOutput(ts_sample=ts, text_sample=text)
+        return MMLDMDiTOutput(ts_sample=ts, text_sample=text, repa_loss=repa_loss)
 
     @torch.no_grad()
     def compute_prefix_kv(
@@ -1443,15 +1810,13 @@ class MMLDMDiTModel(PreTrainedModel):
         for i, block in enumerate(self.blocks):
             block_text_latent = text_views[i % len(text_views)] if text_views is not None else text_latent
             block_text_latent = self._expand_text_latent_to_ts(block_text_latent, ts_shape_patched)
-            ts, text, kv = block(
-                ts, text,
-                ts_emb=ts_emb,
-                text_emb=text_emb,
-                attn_mask=attn_mask,
-                return_kv=True,
-                text_latent=block_text_latent,
-                timestep=timestep,
+            block_kwargs = dict(
+                ts_emb=ts_emb, text_emb=text_emb, attn_mask=attn_mask,
+                return_kv=True, text_latent=block_text_latent, timestep=timestep,
             )
+            if self.use_dual_stream:
+                block_kwargs["n_vars"] = self.n_vars
+            ts, text, kv = block(ts, text, **block_kwargs)
             cache.layers.append(kv)
 
         cache.n_prefix_ts = int(ts_shape_patched.sum().item())
@@ -1505,15 +1870,13 @@ class MMLDMDiTModel(PreTrainedModel):
         for i, block in enumerate(self.blocks):
             block_text_latent = text_views[i % len(text_views)] if text_views is not None else text_latent
             block_text_latent = self._expand_text_latent_to_ts(block_text_latent, ts_shape_patched)
-            ts, text, kv = block(
-                ts, text,
-                ts_emb=ts_emb,
-                text_emb=text_emb,
-                pos_offset=pos_offset,
-                return_kv=True,
-                text_latent=block_text_latent,
-                timestep=timestep,
+            block_kwargs = dict(
+                ts_emb=ts_emb, text_emb=text_emb, pos_offset=pos_offset,
+                return_kv=True, text_latent=block_text_latent, timestep=timestep,
             )
+            if self.use_dual_stream:
+                block_kwargs["n_vars"] = self.n_vars
+            ts, text, kv = block(ts, text, **block_kwargs)
             # Append to existing layer KV
             old_ts_k, old_ts_v = existing_cache.layers[i]
             new_ts_k, new_ts_v = kv

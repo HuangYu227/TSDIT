@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import random
 import time
 from pathlib import Path
@@ -45,6 +46,46 @@ from .modeling_mmldm_dit import MMLDMDiTModel
 from .modeling_mmldm_vae import MMLDMVAEModel
 from .attention_utils import create_dit_readonly_text_mask
 from .semantic_router import SemanticRouter
+
+
+def _sample_latents_from_dists(latent_dists: tuple, poe_fusion: Optional[nn.Module] = None) -> list[torch.Tensor]:
+    """Return deterministic clean latents from dual-band concat or tri-band PoE."""
+    if len(latent_dists) == 3:
+        if poe_fusion is None:
+            raise ValueError("Tri-band latents require a ProductOfExperts fusion module")
+        z_list = []
+        for sample_dists in zip(*latent_dists):
+            fused_params = poe_fusion(list(sample_dists))
+            z_list.append(torch.chunk(fused_params, 2, dim=-1)[0])
+        return z_list
+    return [torch.cat([d.mean for d in sample_dists], dim=-1)
+            for sample_dists in zip(*latent_dists)]
+
+
+def _apply_text_film(
+    vae: MMLDMVAEModel,
+    z0: torch.Tensor,
+    film_params: list[tuple[torch.Tensor, torch.Tensor]],
+) -> torch.Tensor:
+    """Apply text FiLM to clean latents without breaking tri-band PoE shape."""
+    if vae.use_tri_band:
+        gamma = torch.stack([g for g, _ in film_params], dim=0).mean(dim=0)
+        beta = torch.stack([b for _, b in film_params], dim=0).mean(dim=0)
+        return gamma * z0 + beta
+
+    band_dims = [vae.trend_dim, vae.residual_dim]
+    z0_bands = z0.split(band_dims, dim=-1)
+    return torch.cat(
+        [gamma * band_z + beta for band_z, (gamma, beta) in zip(z0_bands, film_params)],
+        dim=-1,
+    )
+
+
+def _get_block_tpci(block):
+    """Get TPCI module from any block type (MultimodalDiTBlock or DualStreamDiTBlock)."""
+    if hasattr(block, "joint_attn"):
+        return block.joint_attn.tpci  # MultimodalDiTBlock
+    return getattr(block, "tpci", None)  # DualStreamDiTBlock
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +122,24 @@ class EMA:
             if p.requires_grad and name in self.backup:
                 p.data.copy_(self.backup[name])
         self.backup = {}
+
+    def state_dict(self) -> dict:
+        return {"decay": self.decay, "shadow": self.shadow}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.decay = state.get("decay", self.decay)
+        self.shadow = {name: value.clone() for name, value in state.get("shadow", {}).items()}
+
+
+def build_ema_model_state_dict(model: nn.Module, ema: Optional[EMA]) -> Optional[dict]:
+    """Return a full model state dict with EMA parameters substituted."""
+    if ema is None:
+        return None
+    state = {name: value.detach().clone() for name, value in model.state_dict().items()}
+    for name, value in ema.shadow.items():
+        if name in state:
+            state[name] = value.detach().clone()
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -128,18 +187,23 @@ def compute_align_loss(
     ts_features: torch.Tensor,
     temperature: float = 0.07,
     ts_projector: Optional[nn.Module] = None,
+    hard_neg_weight: float = 2.0,
+    cs_weight: float = 0.1,
 ) -> torch.Tensor:
-    """Contrastive alignment loss between text semantic axis views and TS features.
+    """Hard-negative contrastive alignment loss with Cauchy-Schwarz divergence.
 
-    Each text view should be most similar to its own sample's TS features
-    (InfoNCE-style).
+    Replaces standard InfoNCE with:
+    1. Hard negative mining: upweights samples with high cosine similarity
+       that are NOT positive pairs (they are confusing negatives)
+    2. Cauchy-Schwarz divergence: tighter distributional alignment
 
     Args:
-        text_views: K x (B, text_dim) semantic axis outputs from SemanticAxisTextPooler.
-        ts_features: (B, D) TS representation (e.g., z0 mean-pooled per sample).
-        temperature: softmax temperature (lower = sharper).
-        ts_projector: optional Linear(D, text_dim) to project TS features to
-            text embedding space before computing cosine similarity.
+        text_views: K x (B, text_dim) semantic axis outputs.
+        ts_features: (B, D) TS representation (z0 mean-pooled per sample).
+        temperature: softmax temperature.
+        ts_projector: optional Linear(D, text_dim) projection.
+        hard_neg_weight: scaling factor for hard negative loss term.
+        cs_weight: weight for Cauchy-Schwarz divergence term.
 
     Returns:
         Scalar alignment loss.
@@ -152,21 +216,40 @@ def compute_align_loss(
     if B < 2:
         return torch.tensor(0.0, device=ts_features.device)
 
-    # Project TS features to text space if dimensions differ
+    # Project TS features to text space
     if ts_projector is not None:
-        ts_proj = ts_projector(ts_features)  # (B, text_dim)
+        ts_proj = ts_projector(ts_features)
     else:
         ts_proj = ts_features
-    ts_norm = F.normalize(ts_proj, dim=-1)  # (B, text_dim)
+    ts_norm = F.normalize(ts_proj, dim=-1)
 
-    loss = torch.tensor(0.0, device=ts_features.device)
+    total_loss = torch.tensor(0.0, device=ts_features.device)
     for k in range(K):
-        txt_k = F.normalize(text_views[k], dim=-1)  # (B, text_dim)
+        txt_k = F.normalize(text_views[k], dim=-1)
         logits = torch.mm(txt_k, ts_norm.t()) / temperature  # (B, B)
-        labels = torch.arange(B, device=logits.device)
-        loss = loss + F.cross_entropy(logits, labels)
 
-    return loss / K
+        # Standard InfoNCE
+        labels = torch.arange(B, device=logits.device)
+        infonce_loss = F.cross_entropy(logits, labels)
+
+        # Hard negative mining: weight off-diagonal entries by their softmax prob
+        mask = ~torch.eye(B, dtype=torch.bool, device=logits.device)
+        off_diag = logits.masked_fill(~mask, -1e9)
+        hard_neg_weights = torch.softmax(off_diag, dim=-1) * mask.float()
+        hard_neg_loss = (hard_neg_weights * logits).sum(dim=-1).mean()
+
+        # Cauchy-Schwarz divergence
+        k_tt = torch.mm(txt_k, txt_k.t())
+        k_ss = torch.mm(ts_norm, ts_norm.t())
+        k_ts = torch.mm(txt_k, ts_norm.t())
+        log_joint = torch.logsumexp(k_ts.flatten(), 0) - math.log(k_ts.numel())
+        log_text = torch.logsumexp(k_tt.flatten(), 0) - math.log(k_tt.numel())
+        log_ts = torch.logsumexp(k_ss.flatten(), 0) - math.log(k_ss.numel())
+        cs_loss = log_joint - 0.5 * log_text - 0.5 * log_ts
+
+        total_loss = total_loss + infonce_loss + hard_neg_weight * hard_neg_loss + cs_weight * cs_loss
+
+    return total_loss / K
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +493,8 @@ def compute_flow_matching_loss(
         loss = 0.5 * frequency_weighted_flow_loss(ts_pred, u_t, ts_shape, gamma_freq, gamma_weighted)
     else:
         loss = 0.5 * F.mse_loss(ts_pred, u_t)
+    if output.repa_loss is not None:
+        loss = loss + output.repa_loss
     return loss
 
 
@@ -586,6 +671,8 @@ def main():
     parser.add_argument("--ts_channels", type=int, default=None,
                         help="Compatibility argument; Stage 2 infers channels from the VAE checkpoint")
     parser.add_argument("--vae_checkpoint", type=str, required=True, help="Stage 1 VAE checkpoint")
+    parser.add_argument("--text_num_tokens", type=int, default=8,
+                        help="Override VAE text token count for Stage 2 conditioning")
     parser.add_argument("--datasets", type=str, nargs="+", default=["ETTh1"])
     parser.add_argument("--time_intervals", type=int, nargs="+", default=[24])
     parser.add_argument("--epochs", type=int, default=20)
@@ -640,8 +727,16 @@ def main():
     parser.add_argument("--tpci_use_period_bias", action="store_true")
     parser.add_argument("--tpci_period", type=float, default=24.0)
     parser.add_argument("--gamma_tpci_div", type=float, default=0.01, help="TPCI frequency diversity loss weight")
+    # Dual-Stream DiT (DiTS-style)
+    parser.add_argument("--use_dual_stream", action="store_true", help="Use DualStreamDiTBlock (time+variate+text)")
+    parser.add_argument("--n_vars", type=int, default=1, help="Number of variables for dual-stream reshape")
+    # REPA (P3-1)
+    parser.add_argument("--use_repa", action="store_true", help="Use REPA loss for intermediate feature alignment")
+    parser.add_argument("--repa_weight", type=float, default=0.01, help="REPA loss weight")
     # Engineering: EMA
     parser.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay rate (0=disabled)")
+    parser.add_argument("--early_stop_patience", type=int, default=0,
+                        help="Stop after this many non-improving epochs (0=disabled)")
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--split_file", type=str, default=None, help="Path to splits.json for train/val split")
     parser.add_argument("--seed", type=int, default=42)
@@ -656,8 +751,13 @@ def main():
     # Load VAE
     vae_ckpt = torch.load(args.vae_checkpoint, map_location=device, weights_only=False)
     vae_config = MMLDMVAEConfig(**vae_ckpt["config"])
+    vae_config.text_num_tokens = args.text_num_tokens
     vae = MMLDMVAEModel(vae_config).to(device)
-    vae.load_state_dict(vae_ckpt["model_state_dict"])
+    missing, unexpected = vae.load_state_dict(vae_ckpt["model_state_dict"], strict=False)
+    if missing:
+        print(f"  WARNING: VAE missing keys: {missing}")
+    if unexpected:
+        print(f"  WARNING: VAE unexpected keys: {unexpected}")
     if args.unfreeze_ts:
         # Joint training: TS encoder + text encoder tuned by FM loss.
         # Decoder is not in the forward path but stays in train mode for consistency.
@@ -673,14 +773,7 @@ def main():
         for p in vae.parameters():
             p.requires_grad = False
         # Unfreeze text encoder — trained by FM loss for cross-modal alignment
-        for p in vae.text_proj.parameters():
-            p.requires_grad = True
-        for block in vae.text_encoder_blocks:
-            for p in block.parameters():
-                p.requires_grad = True
-        for p in vae.text_final_norm.parameters():
-            p.requires_grad = True
-        for p in vae.text_final_layer.parameters():
+        for p in vae.text_encoder.parameters():
             p.requires_grad = True
         text_enc_params = sum(p.numel() for p in vae.parameters() if p.requires_grad)
         print(f"Loaded VAE from {args.vae_checkpoint}")
@@ -717,6 +810,10 @@ def main():
         tpci_gamma_init=args.tpci_gamma_init,
         tpci_use_period_bias=args.tpci_use_period_bias,
         tpci_period=args.tpci_period,
+        use_dual_stream=args.use_dual_stream,
+        n_vars=args.n_vars,
+        use_repa=args.use_repa,
+        repa_weight=args.repa_weight,
     )
     dit = MMLDMDiTModel(dit_config).to(device)
     dit_param_count = sum(p.numel() for p in dit.parameters())
@@ -791,9 +888,7 @@ def main():
                 _ot_lengths = _batch["ot_lengths"]
                 _ot_list = [_ot[i, :_ot_lengths[i]] for i in range(_ot.shape[0])]
                 _enc = vae.encode(_ot_list)
-                _trend_d, _res_d = _enc.latent_dists
-                _z = [torch.cat([td.mean, rd.mean], dim=-1)
-                      for td, rd in zip(_trend_d, _res_d)]
+                _z = _sample_latents_from_dists(_enc.latent_dists, vae.poe_fusion if vae.use_tri_band else None)
                 _all_latents.extend(_z)
         vae.compute_latent_stats(_all_latents)
         print(f"  Latent stats: mean={vae.latent_mean.mean():.4f}, std={vae.latent_std.mean():.4f}")
@@ -836,18 +931,20 @@ def main():
     )
 
     # TPCI data-adaptive frequency initialization from a sample batch
-    if args.use_tpci and dit.blocks[0].joint_attn.tpci is not None:
+    if args.use_tpci and _get_block_tpci(dit.blocks[0]) is not None:
         _sample_batch = next(iter(train_loader))
         _sample_ot = _sample_batch["ot"].to(device)
         with torch.no_grad():
             _enc = vae.encode([_sample_ot[i] for i in range(_sample_ot.shape[0])])
-            _trend_dists, _res_dists = _enc.latent_dists
-            _sample_z = torch.cat([torch.cat([td.mean, rd.mean], dim=-1)
-                                   for td, rd in zip(_trend_dists, _res_dists)], dim=0)
+            _sample_z = torch.cat(
+                _sample_latents_from_dists(_enc.latent_dists, vae.poe_fusion if vae.use_tri_band else None),
+                dim=0,
+            )
             _sample_z = vae.standardize_latent(_sample_z)
         for _blk in dit.blocks:
-            if _blk.joint_attn.tpci is not None:
-                _blk.joint_attn.tpci.init_from_data(_sample_z)
+            _tpci = _get_block_tpci(_blk)
+            if _tpci is not None:
+                _tpci.init_from_data(_sample_z)
         print(f"TPCI: initialized log_omega from FFT peaks of sample batch")
 
     # Optimizer with param groups (no weight decay for norms/biases)
@@ -893,6 +990,7 @@ def main():
 
     global_step = 0
     best_val_loss = float("inf")
+    epochs_without_improvement = 0
     ts_align_projector = None  # lazy init for L_align TS->text projection
 
     for epoch in range(args.epochs):
@@ -929,9 +1027,7 @@ def main():
             else:
                 with torch.no_grad():
                     enc_output = vae.encode(ot_list)
-            trend_dists, residual_dists = enc_output.latent_dists
-            z_list = [torch.cat([td.mean, rd.mean], dim=-1)
-                      for td, rd in zip(trend_dists, residual_dists)]
+            z_list = _sample_latents_from_dists(enc_output.latent_dists, vae.poe_fusion if vae.use_tri_band else None)
 
             z0 = torch.cat(z_list, dim=0)  # (L_total, latent_dim)
             # Standardize latent using dataset-level stats
@@ -941,7 +1037,12 @@ def main():
             )
 
             # Text latent: use clean text-only encoder (no TS leakage through joint blocks)
-            text_latent = vae.encode_text_condition(text_emb)  # (B, latent_dim)
+            text_tokens, film_params = vae.encode_text_tokens(text_emb)
+            text_num_tokens = text_tokens.shape[1]
+
+            # FiLM modulation: apply per-band (γ, β) to z0
+            # Split z0 into frequency bands, modulate, recombine
+            z0 = _apply_text_film(vae, z0, film_params)
 
             # CFG training: randomly drop text condition per sample
             # Must drop BOTH text_latent AND text_emb (text_raw) to ensure
@@ -949,17 +1050,17 @@ def main():
             if args.cfg_drop_prob > 0:
                 drop_mask = (
                     torch.rand(B, 1, device=device) > args.cfg_drop_prob
-                ).to(text_latent.dtype)
-                text_latent = text_latent * drop_mask
+                ).to(text_tokens.dtype)
+                text_tokens = text_tokens * drop_mask.unsqueeze(-1)
                 text_emb = text_emb * drop_mask
 
-            # Per-sample text: each sample gets 1 text token
-            text_shape = torch.tensor([[1]] * B, dtype=torch.long, device=device)
+            text_latent = text_tokens.flatten(0, 1)
+            text_shape = torch.tensor([[text_num_tokens]] * B, dtype=torch.long, device=device)
 
             # Innovation E: Text-Adaptive SNR — bias timesteps by text complexity
             t_per_sample = torch.rand(B, device=device)
             if args.snr_alpha > 0:
-                t_per_sample = text_adaptive_timestep(text_latent.detach(), t_per_sample, args.snr_alpha)
+                t_per_sample = text_adaptive_timestep(text_emb.detach(), t_per_sample, args.snr_alpha)
             t_per_token = expand_timesteps_per_token(t_per_sample, ts_shape)
 
             noise = torch.randn_like(z0)
@@ -970,13 +1071,14 @@ def main():
             # individual tokens, corrupting per-sample groupings.
             if args.batch_mul > 1:
                 z0 = z0.repeat(args.batch_mul, 1)
-                text_latent = text_latent.repeat(args.batch_mul, 1)
+                text_tokens = text_tokens.repeat(args.batch_mul, 1, 1)
+                text_latent = text_tokens.flatten(0, 1)
                 ts_shape = ts_shape.repeat(args.batch_mul, 1)
                 text_shape = text_shape.repeat(args.batch_mul, 1)
                 text_emb = text_emb.repeat(args.batch_mul, 1)
                 t_per_sample = torch.rand(B * args.batch_mul, device=device)
                 if args.snr_alpha > 0:
-                    t_per_sample = text_adaptive_timestep(text_latent.detach(), t_per_sample, args.snr_alpha)
+                    t_per_sample = text_adaptive_timestep(text_emb.detach(), t_per_sample, args.snr_alpha)
                 t_per_token = expand_timesteps_per_token(t_per_sample, ts_shape)
                 noise = torch.randn_like(z0)
 
@@ -1012,8 +1114,9 @@ def main():
             l_dcd_mix = torch.tensor(0.0, device=device)
             l_dcd_aux = torch.tensor(0.0, device=device)
 
-            if args.gamma1 > 0 and B >= 2:
-                half = B // 2
+            B_eff = int(ts_shape.shape[0])
+            if args.gamma1 > 0 and B_eff >= 2:
+                half = B_eff // 2
                 # Symmetric split: both halves have exactly `half` samples.
                 # When B is odd, the last sample is silently dropped.
                 cut_a = ts_shape[:half].sum().item()
@@ -1050,8 +1153,10 @@ def main():
                 l_dcd_mix, l_dcd_aux = compute_dcd_losses(
                     model=dit,
                     z0_a=z0_a, z0_b=z0_b,
-                    text_a=text_latent[:half],
-                    text_b=text_latent[half:half * 2],
+                    text_a=text_latent[:int(text_shape[:half].sum().item())],
+                    text_b=text_latent[
+                        int(text_shape[:half].sum().item()):int(text_shape[:half * 2].sum().item())
+                    ],
                     ts_shape_a=ts_shape_a, ts_shape_b=ts_shape_b,
                     text_shape_a=text_shape[:half],
                     text_shape_b=text_shape[half:half * 2],
@@ -1087,6 +1192,8 @@ def main():
                     ts_align_projector = nn.Linear(
                         ts_feats_for_align.shape[-1], text_views_for_align[0].shape[-1],
                     ).to(device)
+                    # Add to optimizer so projection weights get trained
+                    optimizer.add_param_group({"params": ts_align_projector.parameters(), "weight_decay": 0.0})
                 l_align = compute_align_loss(
                     text_views_for_align, ts_feats_for_align,
                     temperature=args.align_temperature,
@@ -1095,8 +1202,8 @@ def main():
 
             # TPCI frequency diversity loss
             l_tpci_div = torch.tensor(0.0, device=device)
-            if args.gamma_tpci_div > 0 and dit.use_tpci and dit.blocks[0].joint_attn.tpci is not None:
-                l_tpci_div = dit.blocks[0].joint_attn.tpci.diversity_loss()
+            if args.gamma_tpci_div > 0 and dit.use_tpci and _get_block_tpci(dit.blocks[0]) is not None:
+                l_tpci_div = _get_block_tpci(dit.blocks[0]).diversity_loss()
 
             total = (l_fm + args.gamma1 * l_dcd_mix + args.gamma2 * l_dcd_aux
                      + args.gamma_cons * l_cons + l_scmon
@@ -1162,20 +1269,22 @@ def main():
                 ot_list = [ot[i, :ot_lengths[i]] for i in range(B_v)]
 
                 enc_output_v = vae.encode(ot_list)
-                trend_dists_v, residual_dists_v = enc_output_v.latent_dists
-                z_list = [torch.cat([td.mean, rd.mean], dim=-1)
-                          for td, rd in zip(trend_dists_v, residual_dists_v)]
+                z_list = _sample_latents_from_dists(
+                    enc_output_v.latent_dists, vae.poe_fusion if vae.use_tri_band else None,
+                )
                 z0_v = torch.cat(z_list, dim=0)
                 # Standardize latent using dataset-level stats
                 z0_v = vae.standardize_latent(z0_v)
                 ts_shape_v = torch.tensor(
                     [[z.shape[0]] for z in z_list], dtype=torch.long, device=device,
                 )
-                text_latent_v = vae.encode_text_condition(text_emb)
-                text_shape_v = torch.tensor([[1]] * B_v, dtype=torch.long, device=device)
+                text_tokens_v, film_params_v = vae.encode_text_tokens(text_emb)
+                text_latent_v = text_tokens_v.flatten(0, 1)
+                z0_v = _apply_text_film(vae, z0_v, film_params_v)
+                text_shape_v = torch.tensor([[text_tokens_v.shape[1]]] * B_v, dtype=torch.long, device=device)
                 t_v = torch.rand(B_v, device=device)
                 if args.snr_alpha > 0:
-                    t_v = text_adaptive_timestep(text_latent_v, t_v, args.snr_alpha)
+                    t_v = text_adaptive_timestep(text_emb, t_v, args.snr_alpha)
                 t_pt_v = expand_timesteps_per_token(t_v, ts_shape_v)
                 noise_v = torch.randn_like(z0_v)
 
@@ -1201,21 +1310,20 @@ def main():
             vae_save_key = "vae_state_dict"
         else:
             vae_save_state = {k: v for k, v in vae.state_dict().items()
-                              if k.startswith(("text_proj", "text_encoder_blocks",
-                                               "text_final_norm", "text_final_layer"))}
+                              if k.startswith("text_encoder.")}
             vae_save_key = "vae_text_encoder_state_dict"
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_without_improvement = 0
             best_ckpt_path = save_dir / "best.pt"
-            # Save EMA weights for best checkpoint (better inference quality)
-            if ema:
-                ema.apply(dit)
             torch.save(
                 {
                     "epoch": epoch + 1,
                     "global_step": global_step,
                     "dit_state_dict": dit.state_dict(),
+                    "ema_state_dict": build_ema_model_state_dict(dit, ema),
+                    "ema_shadow_state_dict": ema.state_dict() if ema else None,
                     vae_save_key: vae_save_state,
                     "config": dit_config.to_dict(),
                     "val_loss": val_loss,
@@ -1223,8 +1331,8 @@ def main():
                 best_ckpt_path,
             )
             print(f"  New best model saved: {best_ckpt_path}")
-            if ema:
-                ema.restore(dit)
+        else:
+            epochs_without_improvement += 1
 
         # Save checkpoint
         ckpt_path = save_dir / f"epoch_{epoch+1}.pt"
@@ -1233,6 +1341,8 @@ def main():
                 "epoch": epoch + 1,
                 "global_step": global_step,
                 "dit_state_dict": dit.state_dict(),
+                "ema_state_dict": build_ema_model_state_dict(dit, ema),
+                "ema_shadow_state_dict": ema.state_dict() if ema else None,
                 vae_save_key: vae_save_state,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
@@ -1243,6 +1353,12 @@ def main():
             ckpt_path,
         )
         print(f"  Saved checkpoint: {ckpt_path}")
+        if args.early_stop_patience > 0 and epochs_without_improvement >= args.early_stop_patience:
+            print(
+                f"Early stopping: no val improvement for "
+                f"{epochs_without_improvement} epochs."
+            )
+            break
 
     print("Stage 2 training complete.")
 
