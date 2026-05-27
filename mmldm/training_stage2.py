@@ -773,6 +773,7 @@ def main():
         val_size = min(len(dataset) // 10, 1000)
         from torch.utils.data import random_split
         train_ds, val_ds = random_split(dataset, [len(dataset) - val_size, val_size])
+        collate = CollateFn()
         print(f"Loaded {len(dataset)} samples (random split, no split_file)")
 
     # Compute dataset-level latent statistics for standardization
@@ -988,6 +989,17 @@ def main():
                         args.block_size, device=device, dtype=z0.dtype,
                     )
 
+            # SCMON: compute causal features from z0 (detached) BEFORE FM loss
+            causal_features = None
+            l_scmon = torch.tensor(0.0, device=device)
+            if dit.scmon is not None:
+                scmon_out = dit.scmon(
+                    z0.detach(), ts_shape, regime=text_emb if text_emb is not None else None,
+                )
+                causal_features = scmon_out.causal_features
+                scmon_weight = args.gamma_scmon * min(1.0, (epoch + 1) / max(args.scmon_warmup_epochs, 1))
+                l_scmon = scmon_weight * scmon_out.losses["scmon_graph_total"]
+
             # Flow Matching loss
             l_fm = compute_flow_matching_loss(
                 dit, z0, text_latent, ts_shape, text_shape, t_per_token, noise,
@@ -1057,17 +1069,6 @@ def main():
                     attn_mask=attn_mask, delta=args.cons_delta,
                     text_raw=text_emb,
                 )
-
-            # SCMON: compute causal features from z0 (detached)
-            causal_features = None
-            l_scmon = torch.tensor(0.0, device=device)
-            if dit.scmon is not None:
-                scmon_out = dit.scmon(
-                    z0.detach(), ts_shape, regime=text_emb if text_emb is not None else None,
-                )
-                causal_features = scmon_out.causal_features
-                scmon_weight = args.gamma_scmon * min(1.0, (epoch + 1) / max(args.scmon_warmup_epochs, 1))
-                l_scmon = scmon_weight * scmon_out.losses["scmon_graph_total"]
 
             # L_align: contrastive alignment between text views and TS features
             l_align = torch.tensor(0.0, device=device)

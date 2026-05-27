@@ -513,6 +513,7 @@ class SCMON(nn.Module):
         super().__init__()
         self.latent_dim = latent_dim
         self.n_mechanisms = n_mechanisms
+        self.regime_dim = regime_dim
 
         # Stage A
         self.decomposer = MechanismSubspaceDecomposer(
@@ -555,7 +556,7 @@ class SCMON(nn.Module):
 
         # Default regime: zeros (no modulation)
         if regime is None:
-            regime = z0.new_zeros(self.latent_dim)
+            regime = z0.new_zeros(self.regime_dim)
 
         # Stage A: Decompose into mechanism subspaces
         mechanism_states, orth_loss = self.decomposer(z0, ts_shape)

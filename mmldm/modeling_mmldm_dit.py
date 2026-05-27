@@ -617,7 +617,7 @@ class TPCIModule(nn.Module):
             if training_data.ndim == 1:
                 training_data = training_data.unsqueeze(0)
             fft_mag = torch.fft.rfft(training_data, dim=-1).abs().mean(dim=0)  # (F,)
-            freqs = torch.fft.rfft_fftfreq(training_data.shape[-1], d=1.0)  # (F,)
+            freqs = torch.fft.rfftfreq(training_data.shape[-1], d=1.0)  # (F,)
 
             half_dim = rope_dim // 2
             band_size = half_dim // n_bands
@@ -652,7 +652,7 @@ class TPCIModule(nn.Module):
         if training_data.ndim == 1:
             training_data = training_data.unsqueeze(0)
         fft_mag = torch.fft.rfft(training_data, dim=-1).abs().mean(dim=0)
-        freqs = torch.fft.rfft_fftfreq(training_data.shape[-1], d=1.0)
+        freqs = torch.fft.rfftfreq(training_data.shape[-1], d=1.0)
 
         half_dim = self.half_dim
         band_size = half_dim // self.n_bands
