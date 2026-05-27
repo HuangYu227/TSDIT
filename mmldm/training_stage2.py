@@ -858,15 +858,15 @@ def main():
     )
 
     # TPCI data-adaptive frequency initialization from a sample batch
-    if args.use_tpci and dit.blocks[0].tpci is not None:
+    if args.use_tpci and dit.blocks[0].joint_attn.tpci is not None:
         _sample_batch = next(iter(train_loader))
         _sample_ot = _sample_batch["ot"].to(device)
         with torch.no_grad():
             _sample_z, _ = vae.encode(_sample_ot)
             _sample_z = vae.standardize_latent(_sample_z)
         for _blk in dit.blocks:
-            if _blk.tpci is not None:
-                _blk.tpci.init_from_data(_sample_z)
+            if _blk.joint_attn.tpci is not None:
+                _blk.joint_attn.tpci.init_from_data(_sample_z)
         print(f"TPCI: initialized log_omega from FFT peaks of sample batch")
 
     # Optimizer with param groups (no weight decay for norms/biases)
@@ -1136,8 +1136,8 @@ def main():
 
             # TPCI frequency diversity loss
             l_tpci_div = torch.tensor(0.0, device=device)
-            if args.gamma_tpci_div > 0 and dit.use_tpci and dit.blocks[0].tpci is not None:
-                l_tpci_div = dit.blocks[0].tpci.diversity_loss()
+            if args.gamma_tpci_div > 0 and dit.use_tpci and dit.blocks[0].joint_attn.tpci is not None:
+                l_tpci_div = dit.blocks[0].joint_attn.tpci.diversity_loss()
 
             total = (l_fm + args.gamma1 * l_dcd_mix + args.gamma2 * l_dcd_aux
                      + args.gamma_cons * l_cons + l_scmon
@@ -1150,7 +1150,8 @@ def main():
                 trainable_params = [p for group in optimizer.param_groups for p in group["params"]]
                 last_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
-                scheduler.step()
+                if global_step < total_steps:
+                    scheduler.step()
                 optimizer.zero_grad()
                 # Engineering: EMA update
                 if ema:
