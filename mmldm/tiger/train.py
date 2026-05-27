@@ -282,15 +282,13 @@ class TIGERTrainer:
             loss_dict = self.model(batch, is_train=True)
             loss_dict["all"].backward()
 
-            # Gradient clipping
-            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
+            grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
             self.scheduler.step()
             self.global_step += 1
 
             total_loss += loss_dict["all"].item()
-            pbar.set_postfix(loss=f"{loss_dict['all'].item():.4f}", lr=f"{self.scheduler.get_lr():.2e}")
+            pbar.set_postfix(loss=f"{loss_dict['all'].item():.4f}", grad=f"{grad_norm:.2f}", lr=f"{self.scheduler.get_lr():.2e}")
 
             # Log per-step
             for k, v in loss_dict.items():
