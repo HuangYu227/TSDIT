@@ -21,6 +21,7 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -275,7 +276,8 @@ class TIGERTrainer:
         total_loss = 0.0
         t0 = time.time()
 
-        for batch in self.train_loader:
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}", leave=False)
+        for batch in pbar:
             self.optimizer.zero_grad()
             loss_dict = self.model(batch, is_train=True)
             loss_dict["all"].backward()
@@ -288,6 +290,7 @@ class TIGERTrainer:
             self.global_step += 1
 
             total_loss += loss_dict["all"].item()
+            pbar.set_postfix(loss=f"{loss_dict['all'].item():.4f}", lr=f"{self.scheduler.get_lr():.2e}")
 
             # Log per-step
             for k, v in loss_dict.items():
@@ -308,7 +311,7 @@ class TIGERTrainer:
         self.model.eval()
         total_loss = 0.0
 
-        for batch in self.val_loader:
+        for batch in tqdm(self.val_loader, desc="Validating", leave=False):
             loss_dict = self.model(batch, is_train=False)
             total_loss += loss_dict["all"].item()
 
