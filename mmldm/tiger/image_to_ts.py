@@ -161,10 +161,11 @@ def stft_image_to_ts(
     # this is acceptable (the decoder's denormalisation handles the rest).
 
     # Resize back to (F, frames) expected by Griffin-Lim.
-    # We use F = n_fft//2 + 1; frames is approximate.
+    # torch.stft with center=True pads signal by n_fft//2 on both sides,
+    # so output frames = 1 + floor((ts_length + n_fft) / hop_length).
     F_bins = n_fft // 2 + 1
-    # Estimate number of frames for the target ts_length.
-    frames = max(1, math.ceil(ts_length / (hop_length or (n_fft // 4))))
+    hp = hop_length or (n_fft // 4)
+    frames = max(1, 1 + (ts_length + n_fft) // hp)
 
     # Interpolate to the required spectrogram shape.
     # bicubic requires (N, C, H, W) — add channel dim if needed.
@@ -333,13 +334,14 @@ class ImageToTSDecoder(nn.Module):
         min_val = norm_params.min_val
         max_val = norm_params.max_val
 
-        if min_val.dim() == 1:
-            # Univariate: (B,) -> (B, 1)
+        if min_val.dim() == 2:
+            # Multivariate: (B, C) → flatten to (B*C, 1) to match x_norm (B*C, T)
+            min_val = min_val.reshape(-1, 1)
+            max_val = max_val.reshape(-1, 1)
+        elif min_val.dim() == 1:
+            # Univariate: (B,) → (B, 1)
             min_val = min_val.unsqueeze(-1)
             max_val = max_val.unsqueeze(-1)
 
-        # If multivariate, norm_params has shape (B, C) but x_norm is (B*C, T).
-        # The caller is responsible for reshaping before and after if needed.
-        # For the common univariate case this just broadcasts correctly.
         x = x_norm * (max_val - min_val) + min_val
         return x

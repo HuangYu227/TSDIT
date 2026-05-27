@@ -118,10 +118,17 @@ class TIGERGenerator(nn.Module):
 
         if cond_mode == "text+image":
             image_emb = self.encode_image(images)
-            text_emb = self.encode_text(texts)
+            # For CFG: texts=None → encode empty string as null-text embedding
+            if texts is not None:
+                text_emb = self.encode_text(texts)
+            else:
+                text_emb = self.encode_text([""] * images.shape[0])
             attr_emb = self.cond_projector(text_emb, image_emb, diffusion_step)
         elif cond_mode == "text_only":
-            text_emb = self.encode_text(texts)
+            if texts is not None:
+                text_emb = self.encode_text(texts)
+            else:
+                text_emb = self.encode_text([""] * (images.shape[0] if images is not None else 1))
             attr_emb = self.cond_projector(text_emb, diffusion_step)
         elif cond_mode == "image_only":
             image_emb = self.encode_image(images)
@@ -148,6 +155,13 @@ class TIGERGenerator(nn.Module):
 
         if is_train:
             t = torch.randint(0, self.num_steps, [B], device=self.device)
+
+            # CFG: randomly drop text conditioning during training
+            cfg_dropout = self.config["condition"].get("cfg_dropout", 0.0)
+            if cfg_dropout > 0 and texts is not None:
+                if torch.rand(1).item() < cfg_dropout:
+                    texts = None
+
             attr_emb = self.compute_condition(images, texts, t)
             loss = self._noise_estimation_loss(images, attr_emb, t)
             return {"noise_loss": loss, "all": loss}
@@ -157,16 +171,23 @@ class TIGERGenerator(nn.Module):
             t = torch.full((B,), step, device=self.device, dtype=torch.long)
             attr_emb = self.compute_condition(images, texts, t)
             loss_total += self._noise_estimation_loss(images, attr_emb, t)
-        
+
         avg_loss = loss_total / self.num_steps
         return {"noise_loss": avg_loss, "all": avg_loss}
 
     @torch.no_grad()
-    def generate(self, images, texts, n_samples=1, sampler="ddim"):
-        """Generate images conditioned on text + reference image."""
+    def generate(self, images, texts, n_samples=1, sampler="ddim",
+                 guidance_scale: float = 1.0):
+        """Generate images conditioned on text + reference image.
+
+        Args:
+            guidance_scale: CFG guidance weight. 1.0 = no guidance,
+                >1.0 applies classifier-free guidance.
+        """
         B = images.shape[0]
         sample_shape = images.shape
         samples = []
+        use_cfg = guidance_scale > 1.0 and texts is not None
 
         for i in range(n_samples):
             x = torch.randn(sample_shape, device=self.device)
@@ -175,6 +196,12 @@ class TIGERGenerator(nn.Module):
                 t = torch.full((B,), step, device=self.device, dtype=torch.long)
                 attr_emb = self.compute_condition(images, texts, t)
                 pred_noise = self.dit(x, t, attr_emb)
+
+                # CFG: blend conditional and unconditional predictions
+                if use_cfg:
+                    attr_uncond = self.compute_condition(images, None, t)
+                    pred_uncond = self.dit(x, t, attr_uncond)
+                    pred_noise = pred_uncond + guidance_scale * (pred_noise - pred_uncond)
 
                 if sampler == "ddpm":
                     x = self.ddpm.reverse(x, pred_noise, t, noise)

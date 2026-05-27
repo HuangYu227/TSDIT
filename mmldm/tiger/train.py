@@ -80,6 +80,7 @@ def get_default_config() -> dict:
             "cond_mode": "text+image",   # "text+image" | "text_only" | "image_only"
             "image_encoder_type": "cnn",
             "num_stages": 4,
+            "cfg_dropout": 0.3,          # 30% prob to drop text for CFG training
             "text": {
                 "pretrain_model_path": "openai/clip-vit-base-patch32",
                 "pretrain_model_dim": 512,
@@ -233,8 +234,9 @@ class TIGERTrainer:
     # ---- optimizer ----------------------------------------------------------
 
     def _init_opt(self):
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = Adam(
-            self.model.parameters(),
+            trainable_params,
             lr=self.config["lr"],
             weight_decay=self.config["weight_decay"],
         )

@@ -613,16 +613,16 @@ class TIGERDiT(nn.Module):
                 B, self.channels, total_tokens, device=device,
             )
         else:
-            # Resize attr_emb to each scale's grid, flatten, concatenate
+            # Pool semantic dims (n_var, n_scale) → global vector per sample.
+            # attr_emb: (B, attr_dim, n_var, n_scale) → (B, attr_dim, 1, 1)
+            attr_pooled = F.adaptive_avg_pool2d(attr_emb.float(), output_size=1)
+            attr_pooled = attr_pooled.to(attr_emb.dtype)
+
+            # Broadcast to each scale's grid, flatten, concatenate
             attr_parts: list[torch.Tensor] = []
             for i in range(self.multipatch_num):
                 n_h_i, n_w_i = grids[i]
-                attr_i = F.interpolate(
-                    attr_emb.float(),
-                    size=(n_h_i, n_w_i),
-                    mode="bilinear",
-                    align_corners=False,
-                ).to(attr_emb.dtype)
+                attr_i = attr_pooled.expand(-1, -1, n_h_i, n_w_i)
                 attr_parts.append(attr_i.reshape(B, attr_i.shape[1], -1))
             attr_cat = torch.cat(attr_parts, dim=-1)    # (B, attr_dim, total_tokens)
 
