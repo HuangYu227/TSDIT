@@ -276,7 +276,7 @@ class TIGERTrainer:
         total_loss = 0.0
         t0 = time.time()
 
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}", leave=False)
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}")
         for batch in pbar:
             self.optimizer.zero_grad()
             loss_dict = self.model(batch, is_train=True)
@@ -299,9 +299,7 @@ class TIGERTrainer:
 
         avg_loss = total_loss / max(1, len(self.train_loader))
         dt = time.time() - t0
-
-        if (epoch + 1) % self.display_interval == 0:
-            print(f"Epoch {epoch+1:>4d} | train_loss={avg_loss:.6f} | lr={self.scheduler.get_lr():.2e} | {dt:.1f}s")
+        print(f"Epoch {epoch+1:>4d} | train_loss={avg_loss:.6f} | lr={self.scheduler.get_lr():.2e} | {dt:.1f}s")
 
         self.writer.add_scalar("train_epoch/loss", avg_loss, epoch)
         return avg_loss
@@ -311,7 +309,7 @@ class TIGERTrainer:
         self.model.eval()
         total_loss = 0.0
 
-        for batch in tqdm(self.val_loader, desc="Validating", leave=False):
+        for batch in tqdm(self.val_loader, desc="Validating"):
             loss_dict = self.model(batch, is_train=False)
             total_loss += loss_dict["all"].item()
 
