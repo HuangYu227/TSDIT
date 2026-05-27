@@ -18,7 +18,8 @@ class TIGERDataset(Dataset):
 
     def __init__(self, data_dir, split="train", dataset_type="weather_npy",
                  datasets=None, time_interval=24, max_samples=None,
-                 image_size=64, n_fft=64, hop_length=8, epsilon_quantile=0.1):
+                 image_size=64, n_fft=64, hop_length=8, epsilon_quantile=0.1,
+                 seed=123):
         super().__init__()
         self.data_dir = data_dir
         self.split = split
@@ -60,12 +61,21 @@ class TIGERDataset(Dataset):
         self.time_points = np.arange(self.n_steps)
 
     def _load_csv(self, datasets, time_interval):
-        """Load TSFragment-600K in T2S CSV format."""
+        """Load T2S-style CSV dataset.
+
+        Expected file: ``embedding_cleaned_{dataset}_{time_interval}.csv``
+        Columns: SampleID, SampleNumID, TimeInterval, Text, TextEmbedding, OT
+
+        Args:
+            datasets: list of dataset names (e.g. ["ETTh1"]).
+            time_interval: series length (24, 48, or 96).
+        """
         import pandas as pd
-        
+        from sklearn.preprocessing import MinMaxScaler
+
         if datasets is None:
             datasets = ["ETTh1"]
-        
+
         all_dfs = []
         for ds in datasets:
             fname = f"embedding_cleaned_{ds}_{time_interval}.csv"
@@ -73,26 +83,46 @@ class TIGERDataset(Dataset):
             if os.path.exists(fpath):
                 df = pd.read_csv(fpath)
                 all_dfs.append(df)
-        
+
         if not all_dfs:
-            raise FileNotFoundError(f"No CSV files found in {self.data_dir}")
-        
+            raise FileNotFoundError(
+                f"No CSV files matching 'embedding_cleaned_*_{time_interval}.csv' "
+                f"found in {self.data_dir}"
+            )
+
         df = pd.concat(all_dfs, ignore_index=True)
-        
-        # Parse time series and text
-        self.ts_data = []
-        self.caps = []
-        for _, row in df.iterrows():
-            ts = np.array(ast.literal_eval(row["OT"]), dtype=np.float32)
-            self.ts_data.append(ts)
-            self.caps.append([row["Text"]])  # Wrap in list for consistency
-        
-        self.ts_data = np.array(self.ts_data)
-        self.caps = np.array(self.caps, dtype=object)
+
+        # Parse time series from 'OT' column (Python list string)
+        parsed = [
+            ast.literal_eval(item) if isinstance(item, str) else item
+            for item in df["OT"]
+        ]
+        ts_data = np.array(parsed, dtype=np.float32)  # (N, T)
+
+        # Global MinMaxScaler normalization (same as T2S)
+        scaler = MinMaxScaler().fit(ts_data)
+        ts_data = scaler.transform(ts_data).astype(np.float32)
+
+        # Text captions
+        caps = [[t] for t in df["Text"].tolist()]  # wrap in list for consistency
+
+        # Train/test split: 99% train, 1% test (same as T2S)
+        n = len(ts_data)
+        rng = np.random.RandomState(123)
+        perm = rng.permutation(n)
+        n_train = int(np.ceil(n * 0.99))
+
+        if self.split == "train":
+            idx = perm[:n_train]
+        else:  # valid/test
+            idx = perm[n_train:]
+
+        self.ts_data = ts_data[idx]
+        self.caps = np.array([caps[i] for i in idx], dtype=object)
         self.attrs = None
-        
+
         self.n_samples = len(self.ts_data)
-        self.n_steps = self.ts_data.shape[1] if self.ts_data.ndim == 2 else self.ts_data.shape[-1]
+        self.n_steps = self.ts_data.shape[1]
         self.time_points = np.arange(self.n_steps)
 
     def _precompute_images(self):

@@ -185,24 +185,19 @@ class TIGERTrainer:
 
     def _init_data(self):
         dc = self.config["data"]
-        train_ds = TIGERDataset(
+        common = dict(
             data_dir=self.config["data_dir"],
-            split="train",
             dataset_type=dc["dataset_type"],
             image_size=dc["image_size"],
             n_fft=dc["n_fft"],
             hop_length=dc["hop_length"],
             epsilon_quantile=dc["epsilon_quantile"],
+            datasets=dc.get("datasets"),
+            time_interval=dc.get("time_interval", 24),
         )
-        val_ds = TIGERDataset(
-            data_dir=self.config["data_dir"],
-            split="valid",
-            dataset_type=dc["dataset_type"],
-            image_size=dc["image_size"],
-            n_fft=dc["n_fft"],
-            hop_length=dc["hop_length"],
-            epsilon_quantile=dc["epsilon_quantile"],
-        )
+        train_ds = TIGERDataset(split="train", **common)
+        val_ds = TIGERDataset(split="valid" if dc["dataset_type"] == "weather_npy" else "test",
+                              **common)
 
         collate = TIGERCollateFn()
         self.train_loader = DataLoader(
@@ -354,6 +349,10 @@ def parse_args():
     # Data
     p.add_argument("--dataset_type", type=str, default="weather_npy",
                     choices=["weather_npy", "csv"])
+    p.add_argument("--datasets", type=str, nargs="+", default=None,
+                    help="T2S dataset names, e.g. --datasets ETTh1 traffic")
+    p.add_argument("--time_interval", type=int, default=24,
+                    choices=[24, 48, 96], help="T2S series length")
     p.add_argument("--image_size", type=int, default=64)
     p.add_argument("--n_fft", type=int, default=64)
     p.add_argument("--hop_length", type=int, default=8)
@@ -412,6 +411,8 @@ def main():
         "image_size": args.image_size,
         "n_fft": args.n_fft,
         "hop_length": args.hop_length,
+        "datasets": args.datasets,
+        "time_interval": args.time_interval,
     })
     config["diffusion"].update({
         "num_steps": args.num_steps,
