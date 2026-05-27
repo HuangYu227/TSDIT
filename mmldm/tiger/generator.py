@@ -108,7 +108,8 @@ class TIGERGenerator(nn.Module):
         """
         if self.text_model is None:
             return None
-        inputs = self.text_tokenizer(texts, padding=True, truncation=True, max_length=77, return_tensors="pt")
+        max_len = self.text_model.config.max_position_embeddings
+        inputs = self.text_tokenizer(texts, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         # last_hidden_state: (B, seq_len, hidden_dim) — all token embeddings
         text_hidden = self.text_model(**inputs).last_hidden_state
