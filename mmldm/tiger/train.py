@@ -171,6 +171,11 @@ def calc_mape(real: np.ndarray, gen: np.ndarray, eps: float = 1e-8) -> float:
     return float(np.mean(np.abs(real - gen) / (np.abs(real) + eps)))
 
 
+def calc_wape(real: np.ndarray, gen: np.ndarray) -> float:
+    """WAPE: sum(|real - gen|) / sum(|real|). T2S style."""
+    return float(np.sum(np.abs(real - gen)) / (np.sum(np.abs(real)) + 1e-8))
+
+
 def calc_mrr(real: np.ndarray, gen_samples: np.ndarray, k: int = 10) -> float:
     """MRR@k: Mean Reciprocal Rank by cosine similarity.
     real: (B, T), gen_samples: (n_samples, B, T).
@@ -204,8 +209,8 @@ class TIGERTrainer:
         self.val_interval = config["val_interval"]
         self.display_interval = config["display_interval"]
         self.save_interval = config["save_interval"]
-        self.eval_gen_interval = config.get("eval_gen_interval", 10)
-        self.eval_mrr_interval = config.get("eval_mrr_interval", 30)
+        self.eval_gen_interval = config.get("eval_gen_interval", 5)
+        self.eval_mrr_interval = config.get("eval_mrr_interval", 10)
 
         os.makedirs(config["save_dir"], exist_ok=True)
         os.makedirs(config["log_dir"], exist_ok=True)
@@ -396,10 +401,12 @@ class TIGERTrainer:
 
         mse = calc_mse(real_np, gen_np)
         mape = calc_mape(real_np, gen_np)
+        wape = calc_wape(real_np, gen_np)
         self.writer.add_scalar("val/MSE", mse, epoch)
         self.writer.add_scalar("val/MAPE", mape, epoch)
+        self.writer.add_scalar("val/WAPE", wape, epoch)
 
-        msg = f"         | MSE={mse:.6f} | MAPE={mape:.4f}"
+        msg = f"         | MSE={mse:.6f} | MAPE={mape:.4f} | WAPE={wape:.4f}"
 
         if do_mrr:
             all_gen10 = []
