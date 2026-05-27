@@ -205,6 +205,7 @@ class TIGERTrainer:
         self.display_interval = config["display_interval"]
         self.save_interval = config["save_interval"]
         self.eval_gen_interval = config.get("eval_gen_interval", 10)
+        self.eval_mrr_interval = config.get("eval_mrr_interval", 30)
 
         os.makedirs(config["save_dir"], exist_ok=True)
         os.makedirs(config["log_dir"], exist_ok=True)
@@ -355,9 +356,9 @@ class TIGERTrainer:
         self.writer.add_scalar("val/loss", avg_loss, epoch)
         print(f"         | val_loss  ={avg_loss:.6f}")
 
-        # Generation metrics every eval_gen_interval epochs
+        # MSE/MAPE every eval_gen_interval, MRR@10 every eval_mrr_interval
         if (epoch + 1) % self.eval_gen_interval == 0:
-            self._compute_gen_metrics(epoch)
+            self._compute_gen_metrics(epoch, do_mrr=(epoch + 1) % self.eval_mrr_interval == 0)
 
         if avg_loss < self.best_val_loss:
             self.best_val_loss = avg_loss
@@ -367,8 +368,8 @@ class TIGERTrainer:
         return avg_loss
 
     @torch.no_grad()
-    def _compute_gen_metrics(self, epoch: int):
-        """Generate samples and compute MSE, MAPE, MRR@10."""
+    def _compute_gen_metrics(self, epoch: int, do_mrr: bool = False):
+        """Generate samples and compute MSE, MAPE, and optionally MRR@10."""
         self.model.eval()
         dc = self.config["data"]
         ts_len = dc.get("time_interval", 24)
@@ -381,15 +382,10 @@ class TIGERTrainer:
             ts_min = batch["ts_min"].to(self.device).float()
             ts_max = batch["ts_max"].to(self.device).float()
 
-            # Generate 1 image sample (for MSE/MAPE)
             gen_imgs = self.model.generate(images, texts, n_samples=1)
-            gen_img = gen_imgs[0]  # (B, 3, H, W)
-
-            # Decode to time series
+            gen_img = gen_imgs[0]
             norm_params = NormParams(min_val=ts_min, max_val=ts_max, n_vars=1, original_length=ts_len)
-            gen_ts = self.decoder.decode(gen_img, ts_len, norm_params)  # (B, T)
-
-            # Real TS in original scale
+            gen_ts = self.decoder.decode(gen_img, ts_len, norm_params)
             real_ts = ts_real * (ts_max.unsqueeze(-1) - ts_min.unsqueeze(-1)) + ts_min.unsqueeze(-1)
 
             all_real.append(real_ts.cpu().numpy())
@@ -400,28 +396,31 @@ class TIGERTrainer:
 
         mse = calc_mse(real_np, gen_np)
         mape = calc_mape(real_np, gen_np)
-
-        # MRR@10: generate 10 samples
-        all_gen10 = []
-        for s in range(10):
-            gen_list = []
-            for batch in self.val_loader:
-                images = batch["image"].to(self.device).float()
-                texts = batch.get("cap", None)
-                ts_min = batch["ts_min"].to(self.device).float()
-                ts_max = batch["ts_max"].to(self.device).float()
-                gen_imgs = self.model.generate(images, texts, n_samples=1)
-                norm_params = NormParams(min_val=ts_min, max_val=ts_max, n_vars=1, original_length=ts_len)
-                gen_ts = self.decoder.decode(gen_imgs[0], ts_len, norm_params)
-                gen_list.append(gen_ts.cpu().numpy())
-            all_gen10.append(np.concatenate(gen_list, axis=0))
-        gen10_np = np.stack(all_gen10, axis=0)  # (10, B, T)
-        mrr = calc_mrr(real_np, gen10_np, k=10)
-
         self.writer.add_scalar("val/MSE", mse, epoch)
         self.writer.add_scalar("val/MAPE", mape, epoch)
-        self.writer.add_scalar("val/MRR@10", mrr, epoch)
-        print(f"         | MSE={mse:.6f} | MAPE={mape:.4f} | MRR@10={mrr:.4f}")
+
+        msg = f"         | MSE={mse:.6f} | MAPE={mape:.4f}"
+
+        if do_mrr:
+            all_gen10 = []
+            for s in range(10):
+                gen_list = []
+                for batch in self.val_loader:
+                    images = batch["image"].to(self.device).float()
+                    texts = batch.get("cap", None)
+                    ts_min = batch["ts_min"].to(self.device).float()
+                    ts_max = batch["ts_max"].to(self.device).float()
+                    gen_imgs = self.model.generate(images, texts, n_samples=1)
+                    norm_params = NormParams(min_val=ts_min, max_val=ts_max, n_vars=1, original_length=ts_len)
+                    gen_ts = self.decoder.decode(gen_imgs[0], ts_len, norm_params)
+                    gen_list.append(gen_ts.cpu().numpy())
+                all_gen10.append(np.concatenate(gen_list, axis=0))
+            gen10_np = np.stack(all_gen10, axis=0)
+            mrr = calc_mrr(real_np, gen10_np, k=10)
+            self.writer.add_scalar("val/MRR@10", mrr, epoch)
+            msg += f" | MRR@10={mrr:.4f}"
+
+        print(msg)
 
     def _save_checkpoint(self, epoch: int, val_loss: float = None, tag: str = None):
         if tag is None:
