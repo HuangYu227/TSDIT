@@ -281,7 +281,10 @@ class MultiResolutionFFTLoss(nn.Module):
             Scalar loss.
         """
         losses = []
+        L = recon.shape[-1]
         for n_fft in self.fft_sizes:
+            if n_fft > L:
+                continue  # skip windows larger than the signal
             hop = max(1, int(n_fft * self.hop_ratio))
             win = torch.hann_window(n_fft, device=recon.device, dtype=recon.dtype)
             # Average over channels
