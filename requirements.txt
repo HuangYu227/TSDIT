@@ -1,7 +1,0 @@
-torch
-numpy
-scipy
-pyyaml
-tqdm
-einops
-transformers
