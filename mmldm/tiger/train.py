@@ -376,8 +376,8 @@ def parse_args():
     # Condition
     p.add_argument("--use_text", action="store_true", default=True)
     p.add_argument("--no_text", dest="use_text", action="store_false")
-    p.add_argument("--image_encoder_type", type=str, default="cnn",
-                    choices=["cnn", "clip"])
+    p.add_argument("--image_encoder_type", type=str, default="vit",
+                    choices=["cnn", "clip", "vit"])
 
     # Logging
     p.add_argument("--val_interval", type=int, default=10)

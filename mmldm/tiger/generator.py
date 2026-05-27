@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from .dit_model import TIGERDiT
-from .image_encoder import ImageEncoder, CNNEncoder
+from .image_encoder import ImageEncoder, ViTEncoder, CNNEncoder
 from .cond_projector import ImageTextProjector, ImageOnlyProjector, TextOnlyProjector
 from .samplers import DDPMSampler, DDIMSampler
 
@@ -40,6 +40,8 @@ class TIGERGenerator(nn.Module):
         encoder_type = cond_config.get("image_encoder_type", "cnn")
         if encoder_type == "clip":
             self.image_encoder = ImageEncoder(cond_config["image"]).to(self.device)
+        elif encoder_type == "vit":
+            self.image_encoder = ViTEncoder(cond_config["image"]).to(self.device)
         else:
             self.image_encoder = CNNEncoder(cond_config["image"]).to(self.device)
 

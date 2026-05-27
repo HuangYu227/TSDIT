@@ -5,4 +5,4 @@ from .ts_to_image import TSToImageEncoder
 from .image_to_ts import ImageToTSDecoder
 from .dit_model import TIGERDiT
 from .cond_projector import ImageTextProjector, TextOnlyProjector
-from .image_encoder import ImageEncoder
+from .image_encoder import ImageEncoder, ViTEncoder

@@ -1,8 +1,9 @@
 """Image Encoder for TIGER — encode 3-channel images (GAF+STFT+RP) into embeddings.
 
-Provides two encoder variants:
-  - ImageEncoder: CLIP ViT (frozen) + learned projection MLP (recommended)
-  - CNNEncoder:    Lightweight 4-layer CNN (fallback when CLIP is unavailable)
+Provides three encoder variants:
+  - ImageEncoder:  CLIP ViT (frozen) + learned projection MLP
+  - ViTEncoder:    Lightweight Vision Transformer (trainable, recommended)
+  - CNNEncoder:    Lightweight 4-layer CNN (fallback)
 """
 
 import torch
@@ -111,6 +112,130 @@ class ImageEncoder(nn.Module):
         image_emb = self.image_enc(hidden_states)  # (B, N, image_emb)
 
         return image_emb
+
+
+class PatchEmbed(nn.Module):
+    """Split image into patches and project to embedding dimension."""
+
+    def __init__(self, img_size=64, patch_size=8, in_chans=3, embed_dim=192):
+        super().__init__()
+        self.num_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size,
+                              stride=patch_size)
+
+    def forward(self, x):
+        # (B, 3, H, W) -> (B, embed_dim, H/P, W/P) -> (B, num_patches, embed_dim)
+        return self.proj(x).flatten(2).transpose(1, 2)
+
+
+class TransformerBlock(nn.Module):
+    """Standard pre-norm Transformer block with GELU activation."""
+
+    def __init__(self, dim, num_heads, mlp_ratio=4.0, drop=0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=drop,
+                                           batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, int(dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(int(dim * mlp_ratio), dim),
+            nn.Dropout(drop),
+        )
+
+    def forward(self, x):
+        h = self.norm1(x)
+        h, _ = self.attn(h, h, h)
+        x = x + h
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class ViTEncoder(nn.Module):
+    """Lightweight Vision Transformer for 3-channel images.
+
+    Designed for 64×64 spectrogram images. Splits into 8×8 patches
+    (64 tokens), applies Transformer self-attention, and outputs a
+    token sequence compatible with ``_AnchorProjector``.
+
+    Parameters
+    ----------
+    configs : dict
+        Required keys:
+            image_emb : int
+                Output embedding dimension per token.
+        Optional keys:
+            img_size  : int, default 64
+            patch_size: int, default 8
+            embed_dim : int, default 192
+            depth     : int, default 4  (number of Transformer layers)
+            num_heads : int, default 6
+            mlp_ratio : float, default 4.0
+            drop      : float, default 0.1
+    """
+
+    def __init__(self, configs: dict):
+        super().__init__()
+        img_size = configs.get("img_size", 64)
+        patch_size = configs.get("patch_size", 8)
+        embed_dim = configs.get("embed_dim", 192)
+        depth = configs.get("depth", 4)
+        num_heads = configs.get("num_heads", 6)
+        mlp_ratio = configs.get("mlp_ratio", 4.0)
+        drop = configs.get("drop", 0.1)
+        out_dim = configs["image_emb"]
+
+        self.patch_embed = PatchEmbed(img_size, patch_size, 3, embed_dim)
+        num_patches = self.patch_embed.num_patches
+
+        # CLS token + positional embedding
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, 1 + num_patches, embed_dim))
+        self.pos_drop = nn.Dropout(drop)
+
+        # Transformer blocks
+        self.blocks = nn.Sequential(*[
+            TransformerBlock(embed_dim, num_heads, mlp_ratio, drop)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+
+        # Projection to output dim
+        self.proj = nn.Linear(embed_dim, out_dim)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode images into a token embedding sequence.
+
+        Parameters
+        ----------
+        images : torch.Tensor
+            Float tensor of shape ``(B, 3, H, W)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(B, 1 + num_patches, image_emb)`` — CLS + patch tokens.
+        """
+        B = images.shape[0]
+        x = self.patch_embed(images)  # (B, num_patches, embed_dim)
+
+        # Prepend CLS token
+        cls = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1)  # (B, 1+num_patches, embed_dim)
+
+        x = self.pos_drop(x + self.pos_embed)
+        x = self.blocks(x)
+        x = self.norm(x)
+
+        return self.proj(x)  # (B, 1+num_patches, image_emb)
 
 
 class CNNEncoder(nn.Module):

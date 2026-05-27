@@ -1,0 +1,50 @@
+{
+  "epochs": 500,
+  "batch_size": 512,
+  "lr": 3e-4,
+  "warmup_steps": 500,
+  "val_interval": 10,
+  "display_interval": 10,
+  "save_interval": 50,
+  "save_dir": "./checkpoints/exp1_text_image",
+  "log_dir": "./runs/exp1_text_image",
+
+  "condition": {
+    "cond_mode": "text+image",
+    "image_encoder_type": "vit",
+    "num_stages": 4,
+    "cfg_dropout": 0.3,
+    "image": {
+      "image_emb": 128,
+      "img_size": 64,
+      "patch_size": 8,
+      "embed_dim": 192,
+      "depth": 4,
+      "num_heads": 6,
+      "mlp_ratio": 4.0,
+      "drop": 0.1
+    }
+  },
+
+  "diffusion": {
+    "num_steps": 50,
+    "channels": 64,
+    "nheads": 8,
+    "layers": 8,
+    "n_var": 16,
+    "multipatch_num": 1,
+    "base_patch": 4,
+    "patch_scale": 2,
+    "diffusion_embedding_dim": 64,
+    "in_channels": 3,
+    "condition_type": "adaLN",
+    "attention_mask_type": "parallel"
+  },
+
+  "data": {
+    "dataset_type": "weather_npy",
+    "image_size": 64,
+    "n_fft": 64,
+    "hop_length": 8
+  }
+}
