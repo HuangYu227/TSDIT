@@ -4,7 +4,7 @@
   "lr": 3e-4,
   "warmup_steps": 500,
   "val_interval": 10,
-  "display_interval": 10,
+  "display_interval": 1,
   "save_interval": 50,
   "save_dir": "./checkpoints/t2s_exp3_image_only",
   "log_dir": "./runs/t2s_exp3_image_only",
