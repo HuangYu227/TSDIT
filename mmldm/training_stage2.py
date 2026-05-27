@@ -43,7 +43,6 @@ from .data.tsfragment_dataset import CollateFn, TSFragmentDataset
 from .data.weather_dataset import WeatherCollateFn, WeatherDataset
 from .modeling_mmldm_dit import MMLDMDiTModel
 from .modeling_mmldm_vae import MMLDMVAEModel
-from .causal_discovery import SCMON
 from .attention_utils import create_dit_readonly_text_mask
 from .semantic_router import SemanticRouter
 
@@ -393,7 +392,6 @@ def compute_flow_matching_loss(
         text_raw: ``(B, text_raw_dim)`` raw text embedding for TGFM.
         gamma_freq: frequency-domain L1 loss weight.
         gamma_weighted: frequency-weighted loss weight.
-        causal_features: ``(L_total, latent_dim)`` SCMON causal features.
     """
     z_t = q_sample_flow(z0, t_per_token, noise)
     u_t = noise - z0  # target velocity
@@ -620,49 +618,28 @@ def main():
     parser.add_argument("--unfreeze_ts", action="store_true",
                         help="Unfreeze VAE TS encoder/decoder in Stage 2 (jointly trained by FM loss)")
     # SCMON (Spectral Causal Mechanism Operator Network)
-    parser.add_argument("--use_scmon", action="store_true",
-                        help="Enable SCMON causal discovery module")
-    parser.add_argument("--scmon_n_mechanisms", type=int, default=8,
-                        help="Number of causal mechanisms (K)")
-    parser.add_argument("--scmon_mechanism_dim", type=int, default=8,
-                        help="Dimension per mechanism subspace")
-    parser.add_argument("--scmon_hidden_dim", type=int, default=128,
-                        help="Hidden dim of mechanism transition MLPs")
-    parser.add_argument("--scmon_n_freq_bins", type=int, default=32,
-                        help="Number of frequency bins for spectral signatures")
-    parser.add_argument("--gamma_scmon", type=float, default=0.01,
-                        help="SCMON loss weight (after warmup)")
-    parser.add_argument("--scmon_warmup_epochs", type=int, default=50,
-                        help="Epochs to warmup SCMON loss from 0 to gamma_scmon")
-    # SemanticAxisTextPooler (Grassmannian semantic decomposition)
-    parser.add_argument("--use_semantic_axes", action="store_true",
-                        help="Use SemanticAxisTextPooler instead of MultiViewTextPooler")
-    parser.add_argument("--n_semantic_axes", type=int, default=4,
-                        help="Number of semantic axes K")
-    parser.add_argument("--axis_dim", type=int, default=16,
-                        help="Dimension per semantic axis d_k")
-    parser.add_argument("--axis_hidden_dim", type=int, default=64,
-                        help="Hidden dim of shared text encoder")
-    parser.add_argument("--hyper_hidden_dim", type=int, default=32,
-                        help="Hidden dim of axis adaptation hypernetwork")
+    parser.add_argument("--use_scmon", action="store_true", help="Enable SCMON causal discovery")
+    parser.add_argument("--scmon_n_mechanisms", type=int, default=8)
+    parser.add_argument("--scmon_mechanism_dim", type=int, default=8)
+    parser.add_argument("--scmon_hidden_dim", type=int, default=128)
+    parser.add_argument("--scmon_n_freq_bins", type=int, default=32)
+    parser.add_argument("--gamma_scmon", type=float, default=0.01, help="SCMON loss weight")
+    parser.add_argument("--scmon_warmup_epochs", type=int, default=10, help="SCMON loss warmup epochs")
+    # SemanticAxisTextPooler
+    parser.add_argument("--use_semantic_axes", action="store_true", help="Use Grassmannian semantic axes")
+    parser.add_argument("--n_semantic_axes", type=int, default=4)
+    parser.add_argument("--axis_dim", type=int, default=16)
+    parser.add_argument("--axis_hidden_dim", type=int, default=64)
+    parser.add_argument("--hyper_hidden_dim", type=int, default=32)
+    parser.add_argument("--gamma_align", type=float, default=0.01, help="L_align contrastive loss weight")
+    parser.add_argument("--align_temperature", type=float, default=0.07, help="InfoNCE temperature")
     # TPCI (Timestep-Position Coupled Interval Encoding)
-    parser.add_argument("--use_tpci", action="store_true",
-                        help="Use TPCI for timestep-conditioned RoPE")
-    parser.add_argument("--tpci_n_bands", type=int, default=4,
-                        help="Number of frequency bands for TPCI")
-    parser.add_argument("--tpci_gamma_init", type=float, default=0.0,
-                        help="Initial coupling strength (0 = no coupling)")
-    parser.add_argument("--tpci_use_period_bias", action="store_true",
-                        help="Enable periodic attention bias in TPCI")
-    parser.add_argument("--tpci_period", type=float, default=24.0,
-                        help="Dominant period for periodic bias (e.g. 24h)")
-    parser.add_argument("--gamma_tpci_div", type=float, default=0.01,
-                        help="Weight for TPCI frequency diversity loss")
-    # L_align contrastive alignment for SemanticAxisTextPooler
-    parser.add_argument("--gamma_align", type=float, default=0.01,
-                        help="Weight for L_align contrastive loss (0=disabled)")
-    parser.add_argument("--align_temperature", type=float, default=0.07,
-                        help="Temperature for contrastive alignment loss")
+    parser.add_argument("--use_tpci", action="store_true", help="Use TPCI for timestep-conditioned RoPE")
+    parser.add_argument("--tpci_n_bands", type=int, default=4)
+    parser.add_argument("--tpci_gamma_init", type=float, default=0.0)
+    parser.add_argument("--tpci_use_period_bias", action="store_true")
+    parser.add_argument("--tpci_period", type=float, default=24.0)
+    parser.add_argument("--gamma_tpci_div", type=float, default=0.01, help="TPCI frequency diversity loss weight")
     # Engineering: EMA
     parser.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay rate (0=disabled)")
     parser.add_argument("--max_samples", type=int, default=None)
@@ -721,7 +698,7 @@ def main():
         head_dim=args.dit_dim // args.dit_heads,
         num_layers=args.dit_layers,
         block_size=args.block_size,
-        text_latent_dim=128,  # TGFM: raw SBERT embedding dim
+        text_latent_dim=128,
         n_text_views=args.n_semantic_axes if args.use_semantic_axes else 4,
         # SCMON
         use_scmon=args.use_scmon,
@@ -862,7 +839,9 @@ def main():
         _sample_batch = next(iter(train_loader))
         _sample_ot = _sample_batch["ot"].to(device)
         with torch.no_grad():
-            _sample_z, _ = vae.encode(_sample_ot)
+            _enc = vae.encode([_sample_ot[i] for i in range(_sample_ot.shape[0])])
+            _trend_d, _res_d = _enc.latent_dists
+            _sample_z = torch.cat([_trend_d.mean, _res_d.mean], dim=-1)
             _sample_z = vae.standardize_latent(_sample_z)
         for _blk in dit.blocks:
             if _blk.joint_attn.tpci is not None:
@@ -872,51 +851,34 @@ def main():
     # Optimizer with param groups (no weight decay for norms/biases)
     # DiT + VAE text encoder jointly trained.
     # TS encoder/decoder frozen; text encoder receives FM gradient for cross-modal alignment.
-    # TPCI params get lower LR to prevent frequency divergence.
     trainable_models = [dit, vae]
 
     decay_params = []
     no_decay_params = []
-    tpci_decay = []
-    tpci_nodecay = []
     for model in trainable_models:
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if "tpci" in name:
-                if "norm" in name or "bias" in name:
-                    tpci_nodecay.append(param)
-                else:
-                    tpci_decay.append(param)
-            elif "norm" in name or "bias" in name:
+            if "norm" in name or "bias" in name:
                 no_decay_params.append(param)
             else:
                 decay_params.append(param)
 
-    param_groups = [
-        {"params": decay_params, "weight_decay": 0.01},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
-    if tpci_decay:
-        param_groups.append({"params": tpci_decay, "weight_decay": 0.01, "lr": args.lr * 0.1})
-    if tpci_nodecay:
-        param_groups.append({"params": tpci_nodecay, "weight_decay": 0.0, "lr": args.lr * 0.1})
-
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": decay_params, "weight_decay": 0.01},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=args.lr,
+    )
 
     # OneCycleLR: single-cycle schedule matching T2S's approach
     # Ramps lr up then decays over the entire training run
     total_steps = len(train_loader) * args.epochs
     pct_start = min(max(args.warmup_steps / total_steps, 1e-6), 0.3) if args.warmup_steps > 0 else 0.05
-    # max_lr must be a list matching param_groups so TPCI's 0.1x LR is preserved
-    max_lr_list = [args.lr, args.lr]  # decay, no_decay
-    if tpci_decay:
-        max_lr_list.append(args.lr * 0.1)
-    if tpci_nodecay:
-        max_lr_list.append(args.lr * 0.1)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=max_lr_list,
+        max_lr=args.lr,
         total_steps=total_steps,
         pct_start=pct_start,
         anneal_strategy="cos",
@@ -1025,45 +987,6 @@ def main():
                         args.block_size, device=device, dtype=z0.dtype,
                     )
 
-            # SCMON: compute causal features from z0 (detached)
-            causal_features = None
-            l_scmon = torch.tensor(0.0, device=device)
-            if dit.scmon is not None:
-                # Pass raw SBERT embedding (128-dim) as regime, not VAE output (64-dim)
-                scmon_out = dit.scmon(
-                    z0.detach(), ts_shape, regime=text_emb if text_emb is not None else None,
-                )
-                causal_features = scmon_out.causal_features
-                # Warmup: linearly increase SCMON loss weight
-                scmon_weight = args.gamma_scmon * min(1.0, (epoch + 1) / max(args.scmon_warmup_epochs, 1))
-                l_scmon = scmon_weight * scmon_out.losses["scmon_graph_total"]
-
-            # L_align: contrastive alignment between text views and TS features
-            l_align = torch.tensor(0.0, device=device)
-            text_views_for_align = None
-            if (args.gamma_align > 0 and dit.text_pooler is not None
-                    and hasattr(dit.text_pooler, 'n_axes')):
-                # Use raw SBERT embedding (128-dim), not VAE output (64-dim)
-                text_views_for_align = dit.text_pooler(text_emb)  # K x (B, text_dim)
-                # TS features: mean-pool z0 per sample
-                _ts_feats = []
-                _cum = 0
-                for _l in ts_shape.flatten().tolist():
-                    _l = int(_l)
-                    _ts_feats.append(z0[_cum:_cum + _l].mean(dim=0))
-                    _cum += _l
-                ts_feats_for_align = torch.stack(_ts_feats, dim=0)  # (B, latent_dim)
-                # Projector: latent_dim -> text_dim (created once, lazily)
-                if ts_align_projector is None:
-                    ts_align_projector = nn.Linear(
-                        ts_feats_for_align.shape[-1], text_views_for_align[0].shape[-1],
-                    ).to(device)
-                l_align = compute_align_loss(
-                    text_views_for_align, ts_feats_for_align,
-                    temperature=args.align_temperature,
-                    ts_projector=ts_align_projector,
-                )
-
             # Flow Matching loss
             l_fm = compute_flow_matching_loss(
                 dit, z0, text_latent, ts_shape, text_shape, t_per_token, noise,
@@ -1134,6 +1057,40 @@ def main():
                     text_raw=text_emb,
                 )
 
+            # SCMON: compute causal features from z0 (detached)
+            causal_features = None
+            l_scmon = torch.tensor(0.0, device=device)
+            if dit.scmon is not None:
+                scmon_out = dit.scmon(
+                    z0.detach(), ts_shape, regime=text_emb if text_emb is not None else None,
+                )
+                causal_features = scmon_out.causal_features
+                scmon_weight = args.gamma_scmon * min(1.0, (epoch + 1) / max(args.scmon_warmup_epochs, 1))
+                l_scmon = scmon_weight * scmon_out.losses["scmon_graph_total"]
+
+            # L_align: contrastive alignment between text views and TS features
+            l_align = torch.tensor(0.0, device=device)
+            text_views_for_align = None
+            if (args.gamma_align > 0 and dit.text_pooler is not None
+                    and hasattr(dit.text_pooler, 'n_axes')):
+                text_views_for_align = dit.text_pooler(text_emb)
+                _ts_feats = []
+                _cum = 0
+                for _l in ts_shape.flatten().tolist():
+                    _l = int(_l)
+                    _ts_feats.append(z0[_cum:_cum + _l].mean(dim=0))
+                    _cum += _l
+                ts_feats_for_align = torch.stack(_ts_feats, dim=0)
+                if ts_align_projector is None:
+                    ts_align_projector = nn.Linear(
+                        ts_feats_for_align.shape[-1], text_views_for_align[0].shape[-1],
+                    ).to(device)
+                l_align = compute_align_loss(
+                    text_views_for_align, ts_feats_for_align,
+                    temperature=args.align_temperature,
+                    ts_projector=ts_align_projector,
+                )
+
             # TPCI frequency diversity loss
             l_tpci_div = torch.tensor(0.0, device=device)
             if args.gamma_tpci_div > 0 and dit.use_tpci and dit.blocks[0].joint_attn.tpci is not None:
@@ -1150,8 +1107,7 @@ def main():
                 trainable_params = [p for group in optimizer.param_groups for p in group["params"]]
                 last_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
-                if global_step < total_steps:
-                    scheduler.step()
+                scheduler.step()
                 optimizer.zero_grad()
                 # Engineering: EMA update
                 if ema:
@@ -1174,8 +1130,7 @@ def main():
                     f"  Epoch {epoch+1} Step {step+1}/{len(train_loader)}: "
                     f"loss={avg['total']:.4f} fm={avg['fm']:.4f} "
                     f"dcd_mix={avg['dcd_mix']:.4f} dcd_aux={avg['dcd_aux']:.4f} "
-                    f"cons={avg.get('cons', 0.0):.4f} scmon={avg.get('scmon', 0.0):.4f} "
-                    f"align={avg.get('align', 0.0):.4f} "
+                    f"cons={avg.get('cons', 0.0):.4f} "
                     f"lr={scheduler.get_last_lr()[0]:.2e} grad_norm={last_grad_norm:.2f}"
                 )
 
@@ -1185,8 +1140,7 @@ def main():
             f"Epoch {epoch+1}/{args.epochs} ({elapsed:.1f}s): "
             f"loss={avg['total']:.4f} fm={avg['fm']:.4f} "
             f"dcd_mix={avg['dcd_mix']:.4f} dcd_aux={avg['dcd_aux']:.4f} "
-            f"cons={avg.get('cons', 0.0):.4f} scmon={avg.get('scmon', 0.0):.4f} "
-            f"align={avg.get('align', 0.0):.4f}"
+            f"cons={avg.get('cons', 0.0):.4f}"
         )
 
         # Validation (use EMA weights if available)
@@ -1223,20 +1177,10 @@ def main():
                 t_pt_v = expand_timesteps_per_token(t_v, ts_shape_v)
                 noise_v = torch.randn_like(z0_v)
 
-                # SCMON causal features for validation
-                causal_features_v = None
-                if dit.scmon is not None:
-                    scmon_v = dit.scmon(
-                        z0_v.detach(), ts_shape_v,
-                        regime=text_latent_v.mean(dim=0) if text_latent_v is not None else None,
-                    )
-                    causal_features_v = scmon_v.causal_features
-
                 l_fm_v = compute_flow_matching_loss(
                     dit, z0_v, text_latent_v, ts_shape_v, text_shape_v,
                     t_pt_v, noise_v, text_raw=text_emb,
                     gamma_freq=args.gamma_freq, gamma_weighted=args.gamma_weighted,
-                    causal_features=causal_features_v,
                 )
                 val_loss += l_fm_v.item()
                 val_fm += l_fm_v.item()
