@@ -134,6 +134,23 @@ class MMLDMDiTConfig(PretrainedConfig):
         block_size: int = 8,
         text_latent_dim: int = 0,
         n_text_views: int = 1,
+        # SCMON (Spectral Causal Mechanism Operator Network)
+        use_scmon: bool = False,
+        scmon_n_mechanisms: int = 8,
+        scmon_mechanism_dim: int = 8,
+        scmon_hidden_dim: int = 128,
+        scmon_n_freq_bins: int = 32,
+        # SemanticAxisTextPooler (Grassmannian semantic decomposition)
+        use_semantic_axes: bool = False,
+        axis_dim: int = 16,
+        axis_hidden_dim: int = 64,
+        hyper_hidden_dim: int = 32,
+        # TPCI (Timestep-Position Coupled Interval Encoding)
+        use_tpci: bool = False,
+        tpci_n_bands: int = 4,
+        tpci_gamma_init: float = 0.0,
+        tpci_use_period_bias: bool = False,
+        tpci_period: float = 24.0,
         **kwargs,
     ):
         self.ts_in_channels = ts_in_channels
@@ -153,4 +170,21 @@ class MMLDMDiTConfig(PretrainedConfig):
         self.block_size = block_size
         self.text_latent_dim = text_latent_dim
         self.n_text_views = n_text_views
+        # SCMON
+        self.use_scmon = use_scmon
+        self.scmon_n_mechanisms = scmon_n_mechanisms
+        self.scmon_mechanism_dim = scmon_mechanism_dim
+        self.scmon_hidden_dim = scmon_hidden_dim
+        self.scmon_n_freq_bins = scmon_n_freq_bins
+        # SemanticAxisTextPooler
+        self.use_semantic_axes = use_semantic_axes
+        self.axis_dim = axis_dim
+        self.axis_hidden_dim = axis_hidden_dim
+        self.hyper_hidden_dim = hyper_hidden_dim
+        # TPCI
+        self.use_tpci = use_tpci
+        self.tpci_n_bands = tpci_n_bands
+        self.tpci_gamma_init = tpci_gamma_init
+        self.tpci_use_period_bias = tpci_use_period_bias
+        self.tpci_period = tpci_period
         super().__init__(**kwargs)

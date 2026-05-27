@@ -1,0 +1,35 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ \"${CLAUDE_TOOL_USE_FILE_PATH##*.}\" = \"py\" ] && command -v ruff >/dev/null 2>&1; then ruff check --fix \"${CLAUDE_TOOL_USE_FILE_PATH}\" 2>/dev/null; ruff format \"${CLAUDE_TOOL_USE_FILE_PATH}\" 2>/dev/null; fi"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "case \"${CLAUDE_TOOL_USE_FILE_PATH}\" in *.pt|*.pth|*.bin) echo \"[HOOK] BLOCKED: ${CLAUDE_TOOL_USE_FILE_PATH} is a weight file — do not edit or overwrite\"; exit 1;; esac; exit 0"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"${CLAUDE_TOOL_USE_COMMAND:-}\" | grep -qE '(rm|mv|>).*\\.(pt|pth)'; then echo \"[HOOK] BLOCKED: command may delete/overwrite .pt weight files\"; exit 1; fi; exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -38,6 +38,7 @@ from torch import nn
 from transformers import AutoConfig, AutoModel, PreTrainedModel
 
 from .attention_utils import create_dit_readonly_text_mask
+from .causal_discovery import SCMON, SCMONOutput
 from .configuration_mmldm import MMLDMDiTConfig
 
 
@@ -377,6 +378,371 @@ class MultiViewTextPooler(nn.Module):
         return [v(text_emb) for v in self.views]
 
 
+class SemanticAxisTextPooler(nn.Module):
+    """Grassmannian semantic decomposition for text embeddings.
+
+    Drop-in replacement for MultiViewTextPooler with three innovations:
+    1. Learnable axis prototypes on the Grassmann manifold Gr(d, d_k)
+    2. Text-conditioned hypernetwork adaptation of axis directions
+    3. Contrastive alignment to time series properties (trend, freq, amp, regime)
+
+    Each semantic axis projects the text embedding onto a distinct, semantically
+    grounded subspace. The orthogonality is maintained via differentiable
+    Gram-Schmidt, and axis semantics are enforced by contrastive alignment.
+
+    Full design doc: 综合创新之SemanticAxisTextPooler.md
+    """
+
+    def __init__(
+        self,
+        text_dim: int = 128,
+        n_axes: int = 4,
+        axis_dim: int = 16,
+        hidden_dim: int = 64,
+        hyper_hidden: int = 32,
+    ):
+        super().__init__()
+        self.text_dim = text_dim
+        self.n_axes = n_axes
+        self.axis_dim = axis_dim
+
+        # Component A: Shared text encoder (extracts generic features for hypernetwork)
+        self.shared_encoder = nn.Sequential(
+            nn.Linear(text_dim, hidden_dim),
+            nn.SiLU(),
+        )
+
+        # Component B: Grassmann axis prototypes V_k ∈ R^{d × d_k}
+        # Initialized as orthonormal columns via QR on random normal
+        prototypes = []
+        for _ in range(n_axes):
+            V = torch.randn(text_dim, axis_dim)
+            Q, _ = torch.linalg.qr(V)
+            prototypes.append(Q)
+        # Stack: (n_axes, d, d_k) — learnable parameters on Gr(d, d_k)
+        self.axis_prototypes = nn.Parameter(torch.stack(prototypes, dim=0))
+
+        # Component C: Hypernetwork for text-conditioned axis adaptation
+        # Shared first layer, per-axis second layer
+        self.hyper_shared = nn.Sequential(
+            nn.Linear(hidden_dim, hyper_hidden),
+            nn.SiLU(),
+        )
+        self.hyper_axes = nn.ModuleList([
+            nn.Linear(hyper_hidden, text_dim * axis_dim)
+            for _ in range(n_axes)
+        ])
+        # Zero-init hyper_axes → δV_k = 0 → initial P_k = A_k
+        for hyper in self.hyper_axes:
+            nn.init.zeros_(hyper.weight)
+            nn.init.zeros_(hyper.bias)
+
+        # Learnable adaptation strength (initialized to 0)
+        self.alpha = nn.Parameter(torch.tensor(0.0))
+
+        # Component D: Output projections (axis_dim → text_dim)
+        self.out_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(axis_dim, text_dim),
+                nn.SiLU(),
+                nn.Linear(text_dim, text_dim),
+            )
+            for _ in range(n_axes)
+        ])
+        # Zero-init last layer of each output projection. The forward path adds
+        # a residual text_emb, so enabling semantic axes starts as identity
+        # conditioning instead of a dead all-zero text view.
+        for proj in self.out_projs:
+            nn.init.zeros_(proj[-1].weight)
+            nn.init.zeros_(proj[-1].bias)
+
+    def _gram_schmidt(self, W: torch.Tensor) -> torch.Tensor:
+        """Differentiable Gram-Schmidt orthogonalization.
+
+        Args:
+            W: (n_axes, d, d_k) or (B, d, d_k) matrix.
+        Returns:
+            Q: same shape, columns form orthonormal basis.
+        """
+        Q, _ = torch.linalg.qr(W)
+        return Q
+
+    def forward(self, text_emb: torch.Tensor) -> list[torch.Tensor]:
+        """
+        Args:
+            text_emb: (B, text_dim) SBERT embedding.
+        Returns:
+            List of K (B, text_dim) semantic axis views.
+        """
+        B = text_emb.shape[0]
+
+        # Component A: Shared encoding
+        h_shared = self.shared_encoder(text_emb)  # (B, hidden_dim)
+        h_hyper = self.hyper_shared(h_shared)      # (B, hyper_hidden)
+
+        # Component B+C: Adapt axes per text
+        # Start from prototypes: (n_axes, d, d_k)
+        V_base = self.axis_prototypes
+
+        # Generate per-text adaptations
+        delta_Vs = []
+        for k in range(self.n_axes):
+            dv = self.hyper_axes[k](h_hyper)  # (B, d*d_k)
+            dv = dv.view(B, self.text_dim, self.axis_dim)  # (B, d, d_k)
+            delta_Vs.append(dv)
+        # Stack: (B, n_axes, d, d_k)
+        delta_V = torch.stack(delta_Vs, dim=1)
+
+        # V_base broadcasts over batch: (n_axes, d, d_k) → (B, n_axes, d, d_k)
+        V_adapted = V_base.unsqueeze(0) + self.alpha * delta_V
+
+        # Orthogonalize each axis via Gram-Schmidt
+        # Reshape to (B*n_axes, d, d_k) for batched QR
+        V_flat = V_adapted.reshape(-1, self.text_dim, self.axis_dim)
+        Q_flat = self._gram_schmidt(V_flat)
+        Q = Q_flat.reshape(B, self.n_axes, self.text_dim, self.axis_dim)
+
+        # Component D: Project text onto each axis
+        views = []
+        for k in range(self.n_axes):
+            W_k = Q[:, k]  # (B, d, d_k)
+            e_k = torch.bmm(
+                text_emb.unsqueeze(1), W_k
+            ).squeeze(1)  # (B, d_k)
+            view_k = text_emb + self.out_projs[k](e_k)  # (B, text_dim)
+            views.append(view_k)
+
+        return views
+
+    def orthogonality_loss(self) -> torch.Tensor:
+        """Encourage axis prototypes to stay distinct on the Grassmann manifold."""
+        V = self._gram_schmidt(self.axis_prototypes)  # (K, d, d_k)
+        loss = V.new_tensor(0.0)
+        count = 0
+        for i in range(self.n_axes):
+            for j in range(i + 1, self.n_axes):
+                cross = V[i].transpose(0, 1) @ V[j]
+                loss = loss + cross.pow(2).mean()
+                count += 1
+        return loss / max(count, 1)
+
+
+# ---------------------------------------------------------------------------
+# TPCI: Timestep-Position Coupled Interval Encoding
+# ---------------------------------------------------------------------------
+
+
+class TPCIModule(nn.Module):
+    """Timestep-Position Coupled Interval Encoding for RoPE.
+
+    Modulates RoPE frequency bands based on diffusion timestep t:
+    - High noise (t→1): emphasize low-frequency bands (coarse global position)
+    - Low noise (t→0): emphasize high-frequency bands (fine local detail)
+
+    Full design doc: 综合创新之TPCI.md
+    """
+
+    def __init__(
+        self,
+        rope_dim: int = 32,
+        n_bands: int = 4,
+        gamma_init: float = 0.0,
+        use_period_bias: bool = False,
+        period: float = 24.0,
+    ):
+        super().__init__()
+        self.rope_dim = rope_dim
+        self.n_bands = n_bands
+        self.half_dim = rope_dim // 2
+        self.use_period_bias = use_period_bias
+
+        # Band boundaries: equal partition of half_dim
+        band_size = self.half_dim // n_bands
+        self.band_sizes = [band_size] * n_bands
+        self.band_sizes[-1] = self.half_dim - band_size * (n_bands - 1)
+
+        # Learnable per-band center frequencies (log-space for positivity)
+        default_base = 10000.0
+        band_starts = [0]
+        for s in range(n_bands - 1):
+            band_starts.append(band_starts[-1] + self.band_sizes[s])
+        init_log_omega = []
+        for s in range(n_bands):
+            i_start, i_end = band_starts[s], band_starts[s] + self.band_sizes[s]
+            center_idx = (i_start + i_end) / 2.0
+            omega = default_base ** (center_idx / self.half_dim)
+            init_log_omega.append(math.log(omega))
+        self.log_omega = nn.Parameter(torch.tensor(init_log_omega, dtype=torch.float32))
+
+        # Timestep coupling: λ_s(t) = σ(a_s · logit(t) + b_s)
+        # a_s controls how strongly band s responds to t:
+        #   Higher a_s → band activates more at high t (noise, coarse structure)
+        #   Lower a_s  → band activates more at low t (clean, fine detail)
+        # Linear spacing: a_0=2 (low-freq → high-t), a_{n-1}=-2 (high-freq → low-t)
+        # For n_bands=1: a_0=0 (no coupling, degenerates to standard RoPE)
+        if n_bands > 1:
+            a_init = torch.linspace(2.0, -2.0, n_bands)
+        else:
+            a_init = torch.zeros(1)
+        self.a_s = nn.Parameter(a_init)
+        self.b_s = nn.Parameter(torch.zeros(n_bands))
+
+        # Global coupling strength (0 → no coupling at start)
+        self.gamma = nn.Parameter(torch.tensor(gamma_init))
+
+        # Optional periodic attention bias
+        if use_period_bias:
+            self.beta = nn.Parameter(torch.tensor(0.0))
+            self.period = period
+
+    @classmethod
+    def from_data_init(
+        cls,
+        rope_dim: int = 32,
+        n_bands: int = 4,
+        gamma_init: float = 0.0,
+        use_period_bias: bool = False,
+        period: float = 24.0,
+        training_data: Optional[torch.Tensor] = None,
+    ) -> 'TPCIModule':
+        """Create TPCIModule with data-adaptive frequency initialization.
+
+        When ``training_data`` is provided, dominant FFT peaks in each
+        frequency band segment are used to initialise ``log_omega``.
+        Falls back to the standard RoPE schedule otherwise.
+        """
+        module = cls(rope_dim, n_bands, gamma_init, use_period_bias, period)
+
+        if training_data is not None and training_data.numel() > 0:
+            if training_data.ndim == 1:
+                training_data = training_data.unsqueeze(0)
+            fft_mag = torch.fft.rfft(training_data, dim=-1).abs().mean(dim=0)  # (F,)
+            freqs = torch.fft.rfft_fftfreq(training_data.shape[-1], d=1.0)  # (F,)
+
+            half_dim = rope_dim // 2
+            band_size = half_dim // n_bands
+            n_freq = fft_mag.shape[0]
+            seg_size = max(n_freq // n_bands, 1)
+            init_log_omega = []
+            for s in range(n_bands):
+                start = s * seg_size
+                end = min((s + 1) * seg_size, n_freq)
+                if start >= end:
+                    center_idx = s * band_size + band_size / 2
+                    omega = 10000.0 ** (center_idx / half_dim)
+                else:
+                    seg_mag = fft_mag[start:end]
+                    peak_idx = seg_mag.argmax()
+                    peak_freq = freqs[start + peak_idx].abs().item()
+                    omega = max(1.0 / max(peak_freq, 1e-8), 2.0)
+                init_log_omega.append(math.log(omega))
+
+            module.log_omega = nn.Parameter(torch.tensor(init_log_omega, dtype=torch.float32))
+
+        return module
+
+    def init_from_data(self, training_data: torch.Tensor) -> None:
+        """Re-initialize log_omega from dominant FFT peaks in training_data.
+
+        Args:
+            training_data: (B, L) or (L,) raw time series or latent tokens.
+        """
+        if training_data.numel() == 0:
+            return
+        if training_data.ndim == 1:
+            training_data = training_data.unsqueeze(0)
+        fft_mag = torch.fft.rfft(training_data, dim=-1).abs().mean(dim=0)
+        freqs = torch.fft.rfft_fftfreq(training_data.shape[-1], d=1.0)
+
+        half_dim = self.half_dim
+        band_size = half_dim // self.n_bands
+        n_freq = fft_mag.shape[0]
+        seg_size = max(n_freq // self.n_bands, 1)
+        init_log_omega = []
+        for s in range(self.n_bands):
+            start = s * seg_size
+            end = min((s + 1) * seg_size, n_freq)
+            if start >= end:
+                center_idx = s * band_size + band_size / 2
+                omega = 10000.0 ** (center_idx / half_dim)
+            else:
+                seg_mag = fft_mag[start:end]
+                peak_idx = seg_mag.argmax()
+                peak_freq = freqs[start + peak_idx].abs().item()
+                omega = max(1.0 / max(peak_freq, 1e-8), 2.0)
+            init_log_omega.append(math.log(omega))
+        self.log_omega = nn.Parameter(torch.tensor(init_log_omega, dtype=torch.float32,
+                                                    device=self.log_omega.device))
+
+    def diversity_loss(self) -> torch.Tensor:
+        """Encourage frequency bands to have distinct center frequencies.
+
+        L_freq_div = -Σ_{s≠s'} |log(ω_s) - log(ω_s')|
+        """
+        log_w = self.log_omega  # (n_bands,)
+        diff = log_w.unsqueeze(0) - log_w.unsqueeze(1)  # (n_bands, n_bands)
+        mask = torch.triu(
+            torch.ones(self.n_bands, self.n_bands, device=log_w.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        return -diff[mask].abs().mean()
+
+    def forward(
+        self, seq_len: int, device: torch.device, dtype: torch.dtype,
+        timestep: float | torch.Tensor, pos_offset: int = 0,
+    ) -> torch.Tensor:
+        half_dim = self.half_dim
+
+        # Per-band frequencies
+        omega = self.log_omega.exp()
+        all_theta = []
+        idx = 0
+        for s in range(self.n_bands):
+            d_s = self.band_sizes[s]
+            indices = torch.arange(0, d_s, device=device, dtype=torch.float32)
+            theta_s = omega[s] ** (-2.0 * indices / d_s)
+            all_theta.append(theta_s)
+        theta_base = torch.cat(all_theta, dim=0)
+
+        # Timestep coupling. Training passes per-token timesteps; RoPE needs one
+        # sequence-level frequency schedule, so use the batch/token mean.
+        if torch.is_tensor(timestep):
+            t_scalar = timestep.detach().float().mean().to(device)
+        else:
+            t_scalar = torch.tensor(float(timestep), device=device, dtype=torch.float32)
+        t_clamped = t_scalar.clamp(1e-6, 1 - 1e-6)
+        logit_t = torch.log(t_clamped / (1 - t_clamped))
+        lambda_s = torch.sigmoid(self.a_s * logit_t + self.b_s)
+
+        # Expand lambda to per-dimension
+        lambda_full = torch.zeros(half_dim, device=device, dtype=torch.float32)
+        idx = 0
+        for s in range(self.n_bands):
+            d_s = self.band_sizes[s]
+            lambda_full[idx:idx + d_s] = lambda_s[s]
+            idx += d_s
+
+        # Coupled frequencies
+        theta_coupled = theta_base * (1.0 + self.gamma * lambda_full)
+
+        # Apply positions
+        positions = torch.arange(pos_offset, pos_offset + seq_len, device=device, dtype=torch.float32)
+        freqs = torch.outer(positions, theta_coupled)
+        return freqs.to(dtype)
+
+    def get_period_bias(
+        self, q_len: int, k_len: int, device: torch.device, dtype: torch.dtype,
+        query_offset: int = 0, key_offset: int = 0,
+    ) -> Optional[torch.Tensor]:
+        if not self.use_period_bias:
+            return None
+        q_pos = torch.arange(query_offset, query_offset + q_len, device=device, dtype=torch.float32)
+        k_pos = torch.arange(key_offset, key_offset + k_len, device=device, dtype=torch.float32)
+        dist = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)).abs()
+        bias = -self.beta.abs() * torch.abs(torch.sin(math.pi * dist / self.period))
+        return bias.to(dtype)
+
+
 # ---------------------------------------------------------------------------
 # Multimodal Joint Attention (for DiT)
 # ---------------------------------------------------------------------------
@@ -394,12 +760,18 @@ class MultimodalJointAttention(nn.Module):
         qk_bias: bool = False,
         qk_norm_eps: float = 1e-5,
         rope_dim: int = 32,
+        use_tpci: bool = False,
+        tpci_n_bands: int = 4,
+        tpci_gamma_init: float = 0.0,
+        tpci_use_period_bias: bool = False,
+        tpci_period: float = 24.0,
     ):
         super().__init__()
         inner_dim = heads * head_dim
         self.heads = heads
         self.head_dim = head_dim
         self.rope_dim = rope_dim
+        self.use_tpci = use_tpci
 
         # Per-modality QKV
         self.ts_to_qkv = nn.Linear(ts_dim, inner_dim * 3, bias=qk_bias)
@@ -418,7 +790,24 @@ class MultimodalJointAttention(nn.Module):
         # RoPE (simplified sinusoidal)
         self._rope_cache: Optional[torch.Tensor] = None
 
-    def _get_rope_freqs(self, seq_len: int, device: torch.device, dtype: torch.dtype, pos_offset: int = 0):
+        # TPCI module
+        if use_tpci:
+            self.tpci = TPCIModule(
+                rope_dim=rope_dim,
+                n_bands=tpci_n_bands,
+                gamma_init=tpci_gamma_init,
+                use_period_bias=tpci_use_period_bias,
+                period=tpci_period,
+            )
+        else:
+            self.tpci = None
+
+    def _get_rope_freqs(
+        self, seq_len: int, device: torch.device, dtype: torch.dtype,
+        pos_offset: int = 0, timestep: float | torch.Tensor = 0.0,
+    ):
+        if self.tpci is not None:
+            return self.tpci(seq_len, device, dtype, timestep, pos_offset)
         half_dim = self.rope_dim // 2
         inv_freq = 1.0 / (10000 ** (torch.arange(0, half_dim, device=device).float() / half_dim))
         t = torch.arange(pos_offset, pos_offset + seq_len, device=device, dtype=inv_freq.dtype)
@@ -447,6 +836,7 @@ class MultimodalJointAttention(nn.Module):
         prefix_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         pos_offset: int = 0,
         return_kv: bool = False,
+        timestep: float | torch.Tensor = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         B = ts_tokens.shape[0]
         L_ts = ts_tokens.shape[1]
@@ -480,7 +870,7 @@ class MultimodalJointAttention(nn.Module):
         text_k = self.text_k_norm(text_k)
 
         # Apply RoPE to TS only
-        ts_freqs = self._get_rope_freqs(L_ts, ts_q.device, ts_q.dtype, pos_offset=pos_offset)
+        ts_freqs = self._get_rope_freqs(L_ts, ts_q.device, ts_q.dtype, pos_offset=pos_offset, timestep=timestep)
         ts_q = self._apply_rope(ts_q, ts_freqs)
         ts_k = self._apply_rope(ts_k, ts_freqs)
 
@@ -502,6 +892,14 @@ class MultimodalJointAttention(nn.Module):
         d_head = all_q.shape[-1]
         scale = 1.0 / (d_head ** 0.5)
         attn = all_q.mul(scale) @ all_k.transpose(-2, -1)
+        if self.tpci is not None and self.tpci.use_period_bias:
+            ts_k_len = ts_k.shape[2]
+            period_bias = self.tpci.get_period_bias(
+                L_ts, ts_k_len, attn.device, attn.dtype,
+                query_offset=pos_offset, key_offset=0,
+            )
+            if period_bias is not None:
+                attn[:, :, :L_ts, :ts_k_len] = attn[:, :, :L_ts, :ts_k_len] + period_bias
         if attn_mask is not None:
             attn = attn + attn_mask.to(attn.dtype)
         attn_weight = attn.softmax(dim=-1)
@@ -550,6 +948,12 @@ class MultimodalDiTBlock(nn.Module):
         qk_bias: bool = False,
         rope_dim: int = 32,
         text_latent_dim: int = 0,
+        latent_dim_for_causal: int = 0,
+        use_tpci: bool = False,
+        tpci_n_bands: int = 4,
+        tpci_gamma_init: float = 0.0,
+        tpci_use_period_bias: bool = False,
+        tpci_period: float = 24.0,
     ):
         super().__init__()
         # Attention norms (adaptive)
@@ -565,6 +969,11 @@ class MultimodalDiTBlock(nn.Module):
             qk_bias=qk_bias,
             qk_norm_eps=norm_eps,
             rope_dim=rope_dim,
+            use_tpci=use_tpci,
+            tpci_n_bands=tpci_n_bands,
+            tpci_gamma_init=tpci_gamma_init,
+            tpci_use_period_bias=tpci_use_period_bias,
+            tpci_period=tpci_period,
         )
 
         # Post-attn gamma (from conditioning)
@@ -598,6 +1007,14 @@ class MultimodalDiTBlock(nn.Module):
             # Init to 0.1 (not 0) — zero gate + zero-modulator = double dead gradient
             self.text_mod_gate = nn.Parameter(torch.full((1,), 0.1))
 
+        # SCMON causal feature injection
+        self.use_causal = latent_dim_for_causal > 0
+        if self.use_causal:
+            self.causal_proj = nn.Linear(latent_dim_for_causal, ts_dim)
+            self.causal_gate = nn.Parameter(torch.zeros(1))
+            nn.init.xavier_uniform_(self.causal_proj.weight)
+            nn.init.zeros_(self.causal_proj.bias)
+
     def forward(
         self,
         ts_tokens: torch.Tensor,
@@ -609,6 +1026,8 @@ class MultimodalDiTBlock(nn.Module):
         pos_offset: int = 0,
         return_kv: bool = False,
         text_latent: Optional[torch.Tensor] = None,
+        causal_features: Optional[torch.Tensor] = None,
+        timestep: float | torch.Tensor = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, tuple]:
 
         # Attention branch
@@ -619,11 +1038,13 @@ class MultimodalDiTBlock(nn.Module):
             ts_attn_out, text_attn_out, kv = self.joint_attn(
                 ts_normed, text_normed, attn_mask=attn_mask,
                 prefix_kv=prefix_kv, pos_offset=pos_offset, return_kv=True,
+                timestep=timestep,
             )
         else:
             ts_attn_out, text_attn_out = self.joint_attn(
                 ts_normed, text_normed, attn_mask=attn_mask,
                 prefix_kv=prefix_kv, pos_offset=pos_offset,
+                timestep=timestep,
             )
 
         # Post-attn gamma + residual
@@ -647,6 +1068,10 @@ class MultimodalDiTBlock(nn.Module):
         # Text-Guided Feature Modulation (TGFM) — after FFN, before return
         if self.use_tgfm and text_latent is not None:
             ts_tokens = ts_tokens + self.text_mod_gate * self.text_modulator(ts_tokens, text_latent)
+
+        # SCMON causal feature injection — after TGFM
+        if self.use_causal and causal_features is not None:
+            ts_tokens = ts_tokens + self.causal_gate * self.causal_proj(causal_features)
 
         if return_kv:
             return ts_tokens, text_tokens, kv
@@ -694,15 +1119,42 @@ class MMLDMDiTModel(PreTrainedModel):
         self.heads = config.heads
         self.text_latent_dim = getattr(config, 'text_latent_dim', 0)
         self.n_text_views = getattr(config, 'n_text_views', 1)
+        self.use_scmon = getattr(config, 'use_scmon', False)
+        self.use_semantic_axes = getattr(config, 'use_semantic_axes', False)
+        self.use_tpci = getattr(config, 'use_tpci', False)
 
-        # Multi-View Text Pooler (MVTC)
+        # Text Pooler: SemanticAxisTextPooler (Grassmannian) or MultiViewTextPooler (baseline)
         if self.text_latent_dim > 0 and self.n_text_views > 1:
-            self.text_pooler = MultiViewTextPooler(
-                text_dim=self.text_latent_dim,
-                n_views=self.n_text_views,
-            )
+            if self.use_semantic_axes:
+                self.text_pooler = SemanticAxisTextPooler(
+                    text_dim=self.text_latent_dim,
+                    n_axes=self.n_text_views,
+                    axis_dim=getattr(config, 'axis_dim', 16),
+                    hidden_dim=getattr(config, 'axis_hidden_dim', 64),
+                    hyper_hidden=getattr(config, 'hyper_hidden_dim', 32),
+                )
+            else:
+                self.text_pooler = MultiViewTextPooler(
+                    text_dim=self.text_latent_dim,
+                    n_views=self.n_text_views,
+                )
         else:
             self.text_pooler = None
+
+        # SCMON (Spectral Causal Mechanism Operator Network)
+        if self.use_scmon:
+            self.scmon = SCMON(
+                latent_dim=config.ts_in_channels,
+                n_mechanisms=getattr(config, 'scmon_n_mechanisms', 8),
+                mechanism_dim=getattr(config, 'scmon_mechanism_dim', 8),
+                hidden_dim=getattr(config, 'scmon_hidden_dim', 128),
+                regime_dim=self.text_latent_dim,
+                n_freq_bins=getattr(config, 'scmon_n_freq_bins', 32),
+            )
+            scmon_latent_dim = config.ts_in_channels
+        else:
+            self.scmon = None
+            scmon_latent_dim = 0
 
         # Patch embedding
         self.ts_in = PatchIn1D(
@@ -736,6 +1188,12 @@ class MMLDMDiTModel(PreTrainedModel):
                 qk_bias=config.qk_bias,
                 rope_dim=config.rope_dim,
                 text_latent_dim=self.text_latent_dim,
+                latent_dim_for_causal=scmon_latent_dim,
+                use_tpci=self.use_tpci,
+                tpci_n_bands=getattr(config, 'tpci_n_bands', 4),
+                tpci_gamma_init=getattr(config, 'tpci_gamma_init', 0.0),
+                tpci_use_period_bias=getattr(config, 'tpci_use_period_bias', False),
+                tpci_period=getattr(config, 'tpci_period', 24.0),
             )
             for _ in range(config.num_layers)
         ])
@@ -821,6 +1279,7 @@ class MMLDMDiTModel(PreTrainedModel):
         pos_offset: int = 0,
         text_timestep: Optional[Union[int, float, torch.IntTensor, torch.FloatTensor]] = None,
         text_latent: Optional[torch.FloatTensor] = None,
+        causal_features: Optional[torch.FloatTensor] = None,
     ) -> MMLDMDiTOutput:
         """NA-form forward pass.
 
@@ -906,6 +1365,8 @@ class MMLDMDiTModel(PreTrainedModel):
                 prefix_kv=layer_prefix_kv,
                 pos_offset=pos_offset,
                 text_latent=block_text_latent,
+                causal_features=causal_features,
+                timestep=timestep,
             )
 
         # Output norm + unpatch
@@ -989,6 +1450,7 @@ class MMLDMDiTModel(PreTrainedModel):
                 attn_mask=attn_mask,
                 return_kv=True,
                 text_latent=block_text_latent,
+                timestep=timestep,
             )
             cache.layers.append(kv)
 
@@ -1050,6 +1512,7 @@ class MMLDMDiTModel(PreTrainedModel):
                 pos_offset=pos_offset,
                 return_kv=True,
                 text_latent=block_text_latent,
+                timestep=timestep,
             )
             # Append to existing layer KV
             old_ts_k, old_ts_v = existing_cache.layers[i]

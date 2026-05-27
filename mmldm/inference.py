@@ -86,6 +86,7 @@ def euler_ode_step(
     prefix_kv_uncond: Optional[PrefixKVCache] = None,
     pos_offset: int = 0,
     text_raw: Optional[torch.Tensor] = None,
+    causal_features: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Single Euler ODE step with optional CFG and KV cache."""
     device = z_t.device
@@ -101,6 +102,7 @@ def euler_ode_step(
         timestep=t_batch, attn_mask=attn_mask,
         prefix_kv=prefix_kv, pos_offset=pos_offset,
         text_latent=text_raw,
+        causal_features=causal_features,
     )
     v_cond = output_cond.ts_sample
 
@@ -114,6 +116,7 @@ def euler_ode_step(
             timestep=t_batch, attn_mask=attn_mask,
             prefix_kv=prefix_kv_uncond, pos_offset=pos_offset,
             text_latent=None,
+            causal_features=causal_features,
         )
         v_uncond = output_uncond.ts_sample
         v = guidance_scale * (v_cond - v_uncond) + v_uncond
@@ -193,6 +196,7 @@ def generate_latent_blocks(
     prefix_kv_cond: Optional[PrefixKVCache] = None
     prefix_kv_uncond: Optional[PrefixKVCache] = None
     L_text = int(text_shape.sum().item())
+    causal_features = None  # SCMON causal features from previous blocks
 
     for b, curr_block_len in enumerate(block_sizes):
         eps = torch.randn(curr_block_len, latent_dim, device=device, dtype=dtype)
@@ -238,6 +242,7 @@ def generate_latent_blocks(
                     prefix_kv_uncond=prefix_kv_uncond,
                     pos_offset=prefix_len,
                     text_raw=text_raw,
+                    causal_features=causal_features,
                 )
             z_clean = z_block
         else:
@@ -255,10 +260,19 @@ def generate_latent_blocks(
                     attn_mask=attn_mask,
                     guidance_scale=guidance_scale,
                     text_raw=text_raw,
+                    causal_features=causal_features,
                 )
             z_clean = z_block
 
         generated_blocks.append(z_clean)
+
+        # Compute SCMON causal features from accumulated generated blocks
+        if dit.scmon is not None:
+            accumulated = torch.cat(generated_blocks, dim=0)
+            acc_shape = _shape_tensor([accumulated.shape[0]], device)
+            scmon_out = dit.scmon(accumulated, acc_shape, regime=text_raw)
+            # Slice causal features for the current block only (next block will use full)
+            causal_features = scmon_out.causal_features
 
         # Incrementally extend prefix KV cache (only process current block)
         curr_ts_shape = _shape_tensor([curr_block_len], device)
