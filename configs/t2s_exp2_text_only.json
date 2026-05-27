@@ -14,6 +14,12 @@
     "image_encoder_type": "vit",
     "num_stages": 4,
     "cfg_dropout": 0.3,
+    "text": {
+      "pretrain_model_path": "/home/newuser001/huangyu/Research/VerbalTS-multimodal/save/LongCLIP-GmP-ViT-L-14",
+      "pretrain_model_dim": 768,
+      "textemb_hidden_dim": 256,
+      "text_emb": 128
+    },
     "image": {
       "image_emb": 128,
       "img_size": 64,

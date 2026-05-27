@@ -47,10 +47,15 @@ class TIGERGenerator(nn.Module):
 
     def _init_text_encoder(self, cond_config):
         if cond_config.get("use_text", True):
-            from transformers import AutoTokenizer, CLIPTextModelWithProjection
+            from transformers import AutoTokenizer, CLIPTextModelWithProjection, CLIPTextConfig
             model_path = cond_config["text"].get("pretrain_model_path", "openai/clip-vit-base-patch32")
             self.text_tokenizer = AutoTokenizer.from_pretrained(model_path)
-            self.text_model = CLIPTextModelWithProjection.from_pretrained(model_path).to(self.device)
+            if "Long" in model_path or "longclip" in model_path.lower():
+                clip_config = CLIPTextConfig.from_pretrained(model_path)
+                clip_config.max_position_embeddings = 248
+                self.text_model = CLIPTextModelWithProjection.from_pretrained(model_path, config=clip_config).to(self.device)
+            else:
+                self.text_model = CLIPTextModelWithProjection.from_pretrained(model_path).to(self.device)
             for param in self.text_model.parameters():
                 param.requires_grad = False
             self.text_proj = nn.Sequential(
