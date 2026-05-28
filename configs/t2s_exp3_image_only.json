@@ -1,7 +1,7 @@
 {
   "epochs": 500,
   "batch_size": 512,
-  "lr": 3e-4,
+  "lr": 1e-4,
   "warmup_steps": 500,
   "val_interval": 10,
   "display_interval": 1,

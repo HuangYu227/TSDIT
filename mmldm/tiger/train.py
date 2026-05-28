@@ -326,7 +326,12 @@ class TIGERTrainer:
         for batch in pbar:
             self.optimizer.zero_grad()
             loss_dict = self.model(batch, is_train=True)
-            loss_dict["all"].backward()
+            loss = loss_dict["all"]
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"WARNING: NaN/INF loss at step {self.global_step}, skipping batch")
+                self.optimizer.zero_grad()
+                continue
+            loss.backward()
 
             grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
