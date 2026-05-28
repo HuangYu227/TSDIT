@@ -1,6 +1,6 @@
 """TIGER Training Pipeline.
 
-Trains the Text+Image Guided diffusion model for time-series generation.
+Trains the text-conditioned diffusion model for time-series generation.
 
 Usage:
     python -m mmldm.tiger.train --data_dir <path> --config <yaml_or_json>
@@ -80,8 +80,7 @@ def get_default_config() -> dict:
         },
 
         "condition": {
-            "cond_mode": "text+image",   # "text+image" | "text_only" | "image_only"
-            "image_encoder_type": "cnn",
+            "cond_mode": "text_only",
             "num_stages": 4,
             "cfg_dropout": 0.3,          # 30% prob to drop text for CFG training
             "text": {
@@ -89,13 +88,6 @@ def get_default_config() -> dict:
                 "pretrain_model_dim": 512,
                 "textemb_hidden_dim": 256,
                 "text_emb": 128,
-            },
-            "image": {
-                "pretrain_model_path": "openai/clip-vit-base-patch32",
-                "pretrain_model_dim": 768,
-                "imageemb_hidden_dim": 256,
-                "image_emb": 128,
-                "device": "cuda:0",
             },
         },
 
@@ -173,8 +165,6 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
         "n_var": args.n_var,
         "multipatch_num": args.multipatch_num,
     })
-    _set_if_not_none(config["condition"], "use_text", args.use_text)
-    _set_if_not_none(config["condition"], "image_encoder_type", args.image_encoder_type)
     return config
 
 
@@ -252,23 +242,39 @@ def calc_wape(real: np.ndarray, gen: np.ndarray) -> float:
     return float(np.sum(np.abs(real - gen)) / (np.sum(np.abs(real)) + 1e-8))
 
 
-def calc_mrr(real: np.ndarray, gen_samples: np.ndarray, k: int = 10) -> float:
-    """MRR@k: Mean Reciprocal Rank by cosine similarity.
-    real: (B, T), gen_samples: (n_samples, B, T).
+def calc_mrr(
+    real: np.ndarray,
+    gen_samples: np.ndarray,
+    k: int = 10,
+    threshold: float = 0.5,
+) -> float:
+    """T2S-compatible MRR@k by cosine similarity.
+
+    real: (B, T), gen_samples: (n_samples, B, T). For each sample,
+    generated candidates are ranked by cosine similarity. The reciprocal
+    rank is taken for the first candidate whose similarity exceeds
+    ``threshold``; samples with no relevant candidate contribute 0.
     """
-    from numpy.linalg import norm
     n_samples = min(k, gen_samples.shape[0])
     B = real.shape[0]
-    mrr = 0.0
-    for i in range(B):
+    mrr_scores = np.zeros(B, dtype=np.float64)
+    for b in range(B):
+        target = real[b].reshape(-1)
         sims = []
         for s in range(n_samples):
-            a, b = real[i], gen_samples[s, i]
-            sim = np.dot(a, b) / (norm(a) * norm(b) + 1e-8)
+            candidate = gen_samples[s, b].reshape(-1)
+            denom = np.linalg.norm(target) * np.linalg.norm(candidate)
+            sim = 0.0 if denom == 0 else float(np.dot(target, candidate) / denom)
             sims.append(sim)
-        rank = int(np.argmax(sims)) + 1  # best match rank (1-indexed for argmax)
-        mrr += 1.0 / rank
-    return mrr / B
+
+        sorted_idx = np.argsort(sims)[::-1]
+        rank = None
+        for position, idx in enumerate(sorted_idx):
+            if sims[idx] > threshold:
+                rank = position + 1
+                break
+        mrr_scores[b] = 1.0 / rank if rank is not None else 0.0
+    return float(np.mean(mrr_scores))
 
 
 # ---------------------------------------------------------------------------
@@ -513,16 +519,17 @@ class TIGERTrainer:
         self.model.eval()
         dc = self.config["data"]
         ts_len = dc.get("time_interval", 24)
+        image_size = dc["image_size"]
+        image_shape = (3, image_size, image_size)
 
         all_real, all_gen = [], []
         for batch in self.val_loader:
-            images = batch["image"].to(self.device).float()
             texts = batch.get("cap", None)
             ts_real = batch["ts"].to(self.device).float()
             ts_min = _squeeze_trailing_singletons(batch["ts_min"].to(self.device).float())
             ts_max = _squeeze_trailing_singletons(batch["ts_max"].to(self.device).float())
 
-            gen_imgs = self.model.generate(images, texts, n_samples=1)
+            gen_imgs = self.model.generate(image_shape, texts, n_samples=1)
             gen_img = gen_imgs[0]
             norm_params = NormParams(min_val=ts_min, max_val=ts_max, n_vars=1, original_length=ts_len)
             gen_ts = self.decoder.decode(gen_img, ts_len, norm_params)
@@ -553,11 +560,10 @@ class TIGERTrainer:
             for s in range(10):
                 gen_list = []
                 for batch in self.val_loader:
-                    images = batch["image"].to(self.device).float()
                     texts = batch.get("cap", None)
                     ts_min = _squeeze_trailing_singletons(batch["ts_min"].to(self.device).float())
                     ts_max = _squeeze_trailing_singletons(batch["ts_max"].to(self.device).float())
-                    gen_imgs = self.model.generate(images, texts, n_samples=1)
+                    gen_imgs = self.model.generate(image_shape, texts, n_samples=1)
                     norm_params = NormParams(min_val=ts_min, max_val=ts_max, n_vars=1, original_length=ts_len)
                     gen_ts = self.decoder.decode(gen_imgs[0], ts_len, norm_params)
                     gen_list.append(gen_ts.cpu().numpy())
@@ -618,13 +624,6 @@ def parse_args():
     p.add_argument("--n_var", type=int, default=None)
     p.add_argument("--multipatch_num", type=int, default=None)
 
-    # Condition
-    text_group = p.add_mutually_exclusive_group()
-    text_group.add_argument("--use_text", dest="use_text", action="store_true", default=None)
-    text_group.add_argument("--no_text", dest="use_text", action="store_false")
-    p.add_argument("--image_encoder_type", type=str, default=None,
-                    choices=["cnn", "clip", "vit"])
-
     # Logging
     p.add_argument("--val_interval", type=int, default=None)
     p.add_argument("--display_interval", type=int, default=None)
@@ -650,7 +649,6 @@ def main():
         config["device"] = "cuda:0"
     else:
         config["device"] = "cpu"
-    config["condition"].setdefault("image", {})["device"] = config["device"]
     set_seed(config["seed"])
 
     # Save effective config. Eval-only writes to log_dir so it cannot overwrite

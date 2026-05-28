@@ -1,9 +1,7 @@
 """TIGER Evaluator.
 
-Runs end-to-end evaluation: generate images from test set, convert back to TS,
-compute metrics (MSE, WAPE, MAE, MRE, PSNR, SSIM).
-
-Optionally computes CTTP/FID/JFTSD if a CTTP model checkpoint is provided.
+Runs end-to-end evaluation: generate images from text descriptions,
+convert back to TS, compute metrics (MSE, WAPE, MAE, MRE, PSNR, SSIM).
 """
 
 import os
@@ -107,6 +105,10 @@ class TIGEREvaluator:
         all_gen_images = []
         all_real_images = []
 
+        dc = self.config["data"]
+        image_size = dc.get("image_size", 64)
+        image_shape = (3, image_size, image_size)
+
         for batch_idx, batch in enumerate(self.loader):
             images = batch["image"].to(self.device).float()
             texts = batch.get("cap", None)
@@ -115,9 +117,9 @@ class TIGEREvaluator:
             ts_min = batch["ts_min"]
             ts_max = batch["ts_max"]
 
-            # Generate n_samples images per input
+            # Generate n_samples images per input (text-only conditioning)
             gen_images = self.model.generate(
-                images, texts, n_samples=self.n_samples, sampler=self.sampler
+                image_shape, texts, n_samples=self.n_samples, sampler=self.sampler
             )  # (n_samples, B, 3, H, W)
 
             # Take median over samples

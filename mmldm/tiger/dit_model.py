@@ -564,7 +564,7 @@ class TIGERDiT(nn.Module):
         Args:
             image:          ``(B, in_channels, H, W)`` noisy image.
             diffusion_step: ``(B,)`` integer timestep indices.
-            attr_emb:       ``(B, attr_dim, n_h, n_w)`` from ImageTextProjector,
+            attr_emb:       ``(B, attr_dim, n_h, n_w)`` from TextOnlyProjector,
                             or ``None`` for unconditional generation.
 
         Returns:
