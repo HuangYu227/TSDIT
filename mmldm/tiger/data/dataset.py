@@ -179,10 +179,19 @@ class TIGERCollateFn:
     def __call__(self, batch):
         images = torch.stack([b["image"] for b in batch])
         ts = torch.stack([b["ts"] for b in batch])
-        ts_min = torch.tensor([b["ts_min"] for b in batch])
-        ts_max = torch.tensor([b["ts_max"] for b in batch])
+        ts_min = torch.stack([
+            torch.as_tensor(b["ts_min"], dtype=torch.float32).reshape(-1)
+            for b in batch
+        ])
+        ts_max = torch.stack([
+            torch.as_tensor(b["ts_max"], dtype=torch.float32).reshape(-1)
+            for b in batch
+        ])
+        if ts_min.shape[-1] == 1:
+            ts_min = ts_min.squeeze(-1)
+            ts_max = ts_max.squeeze(-1)
         caps = [b["cap"] for b in batch]
-        tp = torch.stack([torch.tensor(b["tp"]) for b in batch])
+        tp = torch.stack([torch.as_tensor(b["tp"]) for b in batch])
         ts_len = batch[0]["ts_len"]
 
         result = {

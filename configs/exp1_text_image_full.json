@@ -28,11 +28,13 @@
 
   "diffusion": {
     "num_steps": 50,
+    "beta_start": 0.0001,
+    "beta_end": 0.02,
     "channels": 64,
     "nheads": 8,
     "layers": 8,
     "n_var": 16,
-    "multipatch_num": 1,
+    "multipatch_num": 4,
     "base_patch": 4,
     "patch_scale": 2,
     "diffusion_embedding_dim": 64,

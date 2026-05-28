@@ -21,8 +21,22 @@ class TIGERGenerator(nn.Module):
         diff_config = config["diffusion"]
         cond_config = config["condition"]
 
-        self._init_image_encoder(cond_config)
-        self._init_text_encoder(cond_config)
+        cond_mode = cond_config.get("cond_mode", "text+image")
+        if cond_mode in {"text+image", "text_only"} and not cond_config.get("use_text", True):
+            raise ValueError(
+                f"cond_mode={cond_mode} requires text conditioning; use cond_mode='image_only' "
+                "instead of disabling use_text."
+            )
+        if cond_mode != "text_only":
+            self._init_image_encoder(cond_config)
+        else:
+            self.image_encoder = None
+        if cond_mode != "image_only":
+            self._init_text_encoder(cond_config)
+        else:
+            self.text_tokenizer = None
+            self.text_model = None
+            self.text_proj = None
         self._init_cond_projector(diff_config, cond_config)
         self._init_dit(diff_config)
 

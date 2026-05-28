@@ -63,13 +63,13 @@ def get_default_config() -> dict:
         "diffusion": {
             "num_steps": 50,
             "beta_start": 0.0001,
-            "beta_end": 0.5,
+            "beta_end": 0.02,
             "schedule": "quad",
             "channels": 64,
             "nheads": 8,
             "layers": 8,
             "n_var": 16,
-            "multipatch_num": 1,
+            "multipatch_num": 4,
             "base_patch": 4,
             "patch_scale": 2,
             "diffusion_embedding_dim": 64,
@@ -127,6 +127,80 @@ def load_config(path: str) -> dict:
     return defaults
 
 
+def _set_if_not_none(config: dict, key: str, value):
+    if value is not None:
+        config[key] = value
+
+
+def _update_if_not_none(config: dict, values: dict):
+    for key, value in values.items():
+        if value is not None:
+            config[key] = value
+
+
+def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
+    """Apply only explicitly supplied CLI values on top of JSON/default config."""
+    config["data_dir"] = args.data_dir
+
+    _update_if_not_none(config, {
+        "save_dir": args.save_dir,
+        "log_dir": args.log_dir,
+        "model_path": args.model_path,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "warmup_steps": args.warmup_steps,
+        "seed": args.seed,
+        "val_interval": args.val_interval,
+        "display_interval": args.display_interval,
+        "save_interval": args.save_interval,
+    })
+    _update_if_not_none(config["data"], {
+        "dataset_type": args.dataset_type,
+        "datasets": args.datasets,
+        "time_interval": args.time_interval,
+        "image_size": args.image_size,
+        "n_fft": args.n_fft,
+        "hop_length": args.hop_length,
+    })
+    _update_if_not_none(config["diffusion"], {
+        "num_steps": args.num_steps,
+        "channels": args.channels,
+        "nheads": args.nheads,
+        "layers": args.layers,
+        "n_var": args.n_var,
+        "multipatch_num": args.multipatch_num,
+    })
+    _set_if_not_none(config["condition"], "use_text", args.use_text)
+    _set_if_not_none(config["condition"], "image_encoder_type", args.image_encoder_type)
+    return config
+
+
+def _squeeze_trailing_singletons(x: torch.Tensor) -> torch.Tensor:
+    """Collapse accidental (..., 1) norm tensors to prevent batch broadcasting."""
+    while x.dim() > 1 and x.shape[-1] == 1:
+        x = x.squeeze(-1)
+    return x
+
+
+def denormalize_ts_batch(
+    ts_norm: torch.Tensor,
+    ts_min: torch.Tensor,
+    ts_max: torch.Tensor,
+) -> torch.Tensor:
+    """Denormalize (B, T) time series with scalar or per-variate min/max."""
+    ts_min = _squeeze_trailing_singletons(ts_min)
+    ts_max = _squeeze_trailing_singletons(ts_max)
+
+    if ts_min.dim() == 1:
+        ts_min = ts_min.unsqueeze(-1)
+        ts_max = ts_max.unsqueeze(-1)
+    elif ts_min.dim() != 2:
+        raise ValueError(f"Expected ts_min/ts_max to be 1D or 2D, got {ts_min.shape}")
+
+    return ts_norm * (ts_max - ts_min) + ts_min
+
+
 # ---------------------------------------------------------------------------
 # Learning rate schedule with linear warmup + cosine decay
 # ---------------------------------------------------------------------------
@@ -166,9 +240,9 @@ def calc_mse(real: np.ndarray, gen: np.ndarray) -> float:
     return float(np.mean((real - gen) ** 2))
 
 
-def calc_mape(real: np.ndarray, gen: np.ndarray, eps: float = 1e-8) -> float:
+def calc_mape(real: np.ndarray, gen: np.ndarray, eps: float = 1e-3) -> float:
     """MAPE between real and generated time series. Both (B, T)."""
-    return float(np.mean(np.abs(real - gen) / (np.abs(real) + eps)))
+    return float(np.mean(np.abs(real - gen) / np.maximum(np.abs(real), eps)))
 
 
 def calc_wape(real: np.ndarray, gen: np.ndarray) -> float:
@@ -320,6 +394,7 @@ class TIGERTrainer:
     def _train_epoch(self, epoch: int) -> float:
         self.model.train()
         total_loss = 0.0
+        num_updates = 0
         t0 = time.time()
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}")
@@ -327,18 +402,24 @@ class TIGERTrainer:
             self.optimizer.zero_grad()
             loss_dict = self.model(batch, is_train=True)
             loss = loss_dict["all"]
-            if torch.isnan(loss) or torch.isinf(loss):
+            if not torch.isfinite(loss):
                 print(f"WARNING: NaN/INF loss at step {self.global_step}, skipping batch")
                 self.optimizer.zero_grad()
                 continue
             loss.backward()
 
             grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            if not torch.isfinite(grad_norm):
+                print(f"WARNING: NaN/INF grad at step {self.global_step}, skipping optimizer step")
+                self.optimizer.zero_grad()
+                continue
+
             self.optimizer.step()
             self.scheduler.step()
             self.global_step += 1
 
             total_loss += loss_dict["all"].item()
+            num_updates += 1
             pbar.set_postfix(loss=f"{loss_dict['all'].item():.4f}", grad=f"{grad_norm:.2f}", lr=f"{self.scheduler.get_lr():.2e}")
 
             # Log per-step
@@ -346,7 +427,7 @@ class TIGERTrainer:
                 self.writer.add_scalar(f"train_step/{k}", v.item(), self.global_step)
             self.writer.add_scalar("train_step/lr", self.scheduler.get_lr(), self.global_step)
 
-        avg_loss = total_loss / max(1, len(self.train_loader))
+        avg_loss = total_loss / max(1, num_updates)
         dt = time.time() - t0
         print(f"Epoch {epoch+1:>4d} | train_loss={avg_loss:.6f} | lr={self.scheduler.get_lr():.2e} | {dt:.1f}s")
 
@@ -357,12 +438,17 @@ class TIGERTrainer:
     def _validate(self, epoch: int) -> float:
         self.model.eval()
         total_loss = 0.0
+        num_batches = 0
 
         for batch in tqdm(self.val_loader, desc="Validating"):
             loss_dict = self.model(batch, is_train=False)
+            if not torch.isfinite(loss_dict["all"]):
+                print("WARNING: NaN/INF validation loss, skipping batch")
+                continue
             total_loss += loss_dict["all"].item()
+            num_batches += 1
 
-        avg_loss = total_loss / max(1, len(self.val_loader))
+        avg_loss = total_loss / num_batches if num_batches else float("inf")
         self.writer.add_scalar("val/loss", avg_loss, epoch)
         print(f"         | val_loss  ={avg_loss:.6f}")
 
@@ -389,14 +475,19 @@ class TIGERTrainer:
             images = batch["image"].to(self.device).float()
             texts = batch.get("cap", None)
             ts_real = batch["ts"].to(self.device).float()
-            ts_min = batch["ts_min"].to(self.device).float()
-            ts_max = batch["ts_max"].to(self.device).float()
+            ts_min = _squeeze_trailing_singletons(batch["ts_min"].to(self.device).float())
+            ts_max = _squeeze_trailing_singletons(batch["ts_max"].to(self.device).float())
 
             gen_imgs = self.model.generate(images, texts, n_samples=1)
             gen_img = gen_imgs[0]
             norm_params = NormParams(min_val=ts_min, max_val=ts_max, n_vars=1, original_length=ts_len)
             gen_ts = self.decoder.decode(gen_img, ts_len, norm_params)
-            real_ts = ts_real * (ts_max.unsqueeze(-1) - ts_min.unsqueeze(-1)) + ts_min.unsqueeze(-1)
+            real_ts = denormalize_ts_batch(ts_real, ts_min, ts_max)
+
+            if real_ts.shape != gen_ts.shape:
+                raise RuntimeError(
+                    f"Metric shape mismatch: real={tuple(real_ts.shape)}, gen={tuple(gen_ts.shape)}"
+                )
 
             all_real.append(real_ts.cpu().numpy())
             all_gen.append(gen_ts.cpu().numpy())
@@ -420,8 +511,8 @@ class TIGERTrainer:
                 for batch in self.val_loader:
                     images = batch["image"].to(self.device).float()
                     texts = batch.get("cap", None)
-                    ts_min = batch["ts_min"].to(self.device).float()
-                    ts_max = batch["ts_max"].to(self.device).float()
+                    ts_min = _squeeze_trailing_singletons(batch["ts_min"].to(self.device).float())
+                    ts_max = _squeeze_trailing_singletons(batch["ts_max"].to(self.device).float())
                     gen_imgs = self.model.generate(images, texts, n_samples=1)
                     norm_params = NormParams(min_val=ts_min, max_val=ts_max, n_vars=1, original_length=ts_len)
                     gen_ts = self.decoder.decode(gen_imgs[0], ts_len, norm_params)
@@ -453,9 +544,9 @@ def parse_args():
     # Paths
     p.add_argument("--data_dir", type=str, required=True, help="Path to dataset directory")
     p.add_argument("--config", type=str, default=None, help="JSON config file (overrides defaults)")
-    p.add_argument("--save_dir", type=str, default="./checkpoints/tiger")
-    p.add_argument("--log_dir", type=str, default="./runs/tiger")
-    p.add_argument("--model_path", type=str, default="", help="Resume from checkpoint")
+    p.add_argument("--save_dir", type=str, default=None)
+    p.add_argument("--log_dir", type=str, default=None)
+    p.add_argument("--model_path", type=str, default=None, help="Resume from checkpoint")
 
     # Data
     p.add_argument("--dataset_type", type=str, default=None,
@@ -464,91 +555,59 @@ def parse_args():
                     help="T2S dataset names, e.g. --datasets ETTh1 traffic")
     p.add_argument("--time_interval", type=int, default=None,
                     choices=[24, 48, 96], help="T2S series length")
-    p.add_argument("--image_size", type=int, default=64)
-    p.add_argument("--n_fft", type=int, default=64)
-    p.add_argument("--hop_length", type=int, default=8)
+    p.add_argument("--image_size", type=int, default=None)
+    p.add_argument("--n_fft", type=int, default=None)
+    p.add_argument("--hop_length", type=int, default=None)
 
     # Training
-    p.add_argument("--epochs", type=int, default=500)
-    p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--warmup_steps", type=int, default=500)
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--batch_size", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--warmup_steps", type=int, default=None)
+    p.add_argument("--seed", type=int, default=None)
 
     # Diffusion
-    p.add_argument("--num_steps", type=int, default=50)
-    p.add_argument("--channels", type=int, default=64)
-    p.add_argument("--nheads", type=int, default=8)
-    p.add_argument("--layers", type=int, default=8)
-    p.add_argument("--n_var", type=int, default=16)
-    p.add_argument("--multipatch_num", type=int, default=1)
+    p.add_argument("--num_steps", type=int, default=None)
+    p.add_argument("--channels", type=int, default=None)
+    p.add_argument("--nheads", type=int, default=None)
+    p.add_argument("--layers", type=int, default=None)
+    p.add_argument("--n_var", type=int, default=None)
+    p.add_argument("--multipatch_num", type=int, default=None)
 
     # Condition
-    p.add_argument("--use_text", action="store_true", default=True)
-    p.add_argument("--no_text", dest="use_text", action="store_false")
-    p.add_argument("--image_encoder_type", type=str, default="vit",
+    text_group = p.add_mutually_exclusive_group()
+    text_group.add_argument("--use_text", dest="use_text", action="store_true", default=None)
+    text_group.add_argument("--no_text", dest="use_text", action="store_false")
+    p.add_argument("--image_encoder_type", type=str, default=None,
                     choices=["cnn", "clip", "vit"])
 
     # Logging
-    p.add_argument("--val_interval", type=int, default=10)
-    p.add_argument("--display_interval", type=int, default=10)
-    p.add_argument("--save_interval", type=int, default=50)
+    p.add_argument("--val_interval", type=int, default=None)
+    p.add_argument("--display_interval", type=int, default=None)
+    p.add_argument("--save_interval", type=int, default=None)
 
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    set_seed(args.seed)
 
     # Build config: start from defaults / JSON, override with CLI
     config = load_config(args.config)
-    config.update({
-        "data_dir": args.data_dir,
-        "save_dir": args.save_dir,
-        "log_dir": args.log_dir,
-        "model_path": args.model_path,
-        "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "lr": args.lr,
-        "warmup_steps": args.warmup_steps,
-        "seed": args.seed,
-        "val_interval": args.val_interval,
-        "display_interval": args.display_interval,
-        "save_interval": args.save_interval,
-    })
-    if args.dataset_type is not None:
-        config["data"]["dataset_type"] = args.dataset_type
-    if args.datasets is not None:
-        config["data"]["datasets"] = args.datasets
-    if args.time_interval is not None:
-        config["data"]["time_interval"] = args.time_interval
-    config["data"].update({
-        "image_size": args.image_size,
-        "n_fft": args.n_fft,
-        "hop_length": args.hop_length,
-    })
-    config["diffusion"].update({
-        "num_steps": args.num_steps,
-        "channels": args.channels,
-        "nheads": args.nheads,
-        "layers": args.layers,
-        "n_var": args.n_var,
-        "multipatch_num": args.multipatch_num,
-    })
-    config["condition"]["use_text"] = args.use_text
-    config["condition"]["image_encoder_type"] = args.image_encoder_type
+    config = apply_cli_overrides(config, args)
 
     # Auto-detect device
     if torch.cuda.is_available():
         config["device"] = "cuda:0"
     else:
         config["device"] = "cpu"
+    config["condition"].setdefault("image", {})["device"] = config["device"]
+    set_seed(config["seed"])
 
     # Save effective config
     os.makedirs(config["save_dir"], exist_ok=True)
     with open(os.path.join(config["save_dir"], "config.json"), "w") as f:
-        json.dump(config, f, indent=2)
+        json.dump(config, f, indent=2, ensure_ascii=False)
 
     trainer = TIGERTrainer(config)
     trainer.train()

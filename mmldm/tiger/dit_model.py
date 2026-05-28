@@ -284,8 +284,10 @@ class ResidualBlock(nn.Module):
                  condition_type: str = "adaLN"):
         super().__init__()
         self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
+        self.norm_mid = nn.GroupNorm(1, channels)      # normalize before mid_projection
         self.side_projection = Conv1d_with_init(side_dim, 2 * channels, 1)
         self.mid_projection = Conv1d_with_init(channels, 2 * channels, 1)
+        self.norm_out = nn.GroupNorm(1, channels)      # normalize before output_projection
         self.output_projection = Conv1d_with_init(channels, 2 * channels, 1)
 
         self.time_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
@@ -301,6 +303,9 @@ class ResidualBlock(nn.Module):
                 nn.SiLU(),
                 nn.Linear(channels, 3 * channels, bias=True),
             )
+            # adaLN-Zero: zero-init so gamma=0, beta=0, alpha=0 at start
+            nn.init.zeros_(self.adaLN_modulation[1].weight)
+            nn.init.zeros_(self.adaLN_modulation[1].bias)
 
     # -- axis attention ----------------------------------------------------------
 
@@ -406,6 +411,7 @@ class ResidualBlock(nn.Module):
 
         # -- 4. side projection + gate / filter ----------------------------------
         y = y.reshape(B, channel, K * L)
+        y = self.norm_mid(y)
         y = self.mid_projection(y)
 
         _, side_dim, _, _ = side_emb.shape
@@ -415,6 +421,7 @@ class ResidualBlock(nn.Module):
 
         gate, filt = torch.chunk(y, 2, dim=1)
         y = torch.sigmoid(gate) * torch.tanh(filt)
+        y = self.norm_out(y)
         y = self.output_projection(y)
 
         # -- 5. residual + skip --------------------------------------------------
@@ -613,16 +620,19 @@ class TIGERDiT(nn.Module):
                 B, self.channels, total_tokens, device=device,
             )
         else:
-            # Pool semantic dims (n_var, n_scale) → global vector per sample.
-            # attr_emb: (B, attr_dim, n_var, n_scale) → (B, attr_dim, 1, 1)
-            attr_pooled = F.adaptive_avg_pool2d(attr_emb.float(), output_size=1)
-            attr_pooled = attr_pooled.to(attr_emb.dtype)
-
-            # Broadcast to each scale's grid, flatten, concatenate
+            # Treat condition anchors as a low-resolution condition map and
+            # resize them to each patch scale. This keeps n_var x n_scale
+            # anchors usable instead of collapsing back to a global vector.
             attr_parts: list[torch.Tensor] = []
+            attr_for_resize = attr_emb.float()
             for i in range(self.multipatch_num):
                 n_h_i, n_w_i = grids[i]
-                attr_i = attr_pooled.expand(-1, -1, n_h_i, n_w_i)
+                attr_i = F.interpolate(
+                    attr_for_resize,
+                    size=(n_h_i, n_w_i),
+                    mode="bilinear",
+                    align_corners=False,
+                ).to(dtype=attr_emb.dtype)
                 attr_parts.append(attr_i.reshape(B, attr_i.shape[1], -1))
             attr_cat = torch.cat(attr_parts, dim=-1)    # (B, attr_dim, total_tokens)
 

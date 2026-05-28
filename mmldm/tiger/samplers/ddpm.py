@@ -27,6 +27,7 @@ class DDPMSampler(BaseSampler):
         alpha_bar_t = self._get_alpha(self.alpha_bar, t, x)
         beta_t = self._get_alpha(self.beta, t, x)
 
-        mean = (1 / torch.sqrt(alpha_t)) * (x - (beta_t / torch.sqrt(1 - alpha_bar_t)) * pred_noise)
+        denom = torch.sqrt(torch.clamp(1 - alpha_bar_t, min=1e-12))
+        mean = (1 / torch.sqrt(alpha_t)) * (x - (beta_t / denom) * pred_noise)
         sigma = torch.sqrt(beta_t)
         return mean + sigma * noise

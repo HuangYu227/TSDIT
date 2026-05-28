@@ -17,7 +17,9 @@ class DDIMSampler(BaseSampler):
         x_0 = (x_t - sqrt(1-alpha_bar_t) * pred_noise) / sqrt(alpha_bar_t)
         """
         alpha_bar_t = self._get_alpha(self.alpha_bar, t, x)
-        return (x - torch.sqrt(1 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t)
+        noise_scale = torch.sqrt(torch.clamp(1 - alpha_bar_t, min=0.0))
+        signal_scale = torch.sqrt(torch.clamp(alpha_bar_t, min=1e-12))
+        return (x - noise_scale * pred_noise) / signal_scale
 
     def reverse(self, x, pred_noise, t, noise, is_determin=True):
         """DDIM reverse step (eta=0 for deterministic).
@@ -33,7 +35,9 @@ class DDIMSampler(BaseSampler):
 
         # Direction pointing to x_t
         sigma = 0.0 if is_determin else torch.sqrt(self._get_alpha(self.beta, t, x))
-        pred_noise_dir = torch.sqrt(1 - alpha_bar_prev - sigma**2) * pred_noise
+        pred_noise_dir = torch.sqrt(
+            torch.clamp(1 - alpha_bar_prev - sigma**2, min=0.0)
+        ) * pred_noise
 
         x_prev = torch.sqrt(alpha_bar_prev) * x0 + pred_noise_dir
         if not is_determin:
