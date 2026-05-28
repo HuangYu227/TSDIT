@@ -59,6 +59,7 @@ def get_default_config() -> dict:
         "log_dir": "./runs/tiger",
         "save_dir": "./checkpoints/tiger",
         "model_path": "",
+        "eval_only": False,
 
         "diffusion": {
             "num_steps": 50,
@@ -154,6 +155,7 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
         "val_interval": args.val_interval,
         "display_interval": args.display_interval,
         "save_interval": args.save_interval,
+        "eval_only": args.eval_only,
     })
     _update_if_not_none(config["data"], {
         "dataset_type": args.dataset_type,
@@ -286,12 +288,17 @@ class TIGERTrainer:
         self.eval_gen_interval = config.get("eval_gen_interval", 5)
         self.eval_mrr_interval = config.get("eval_mrr_interval", 10)
 
-        os.makedirs(config["save_dir"], exist_ok=True)
+        if not config.get("eval_only", False):
+            os.makedirs(config["save_dir"], exist_ok=True)
         os.makedirs(config["log_dir"], exist_ok=True)
 
         self._init_data()
         self._init_model()
-        self._init_opt()
+        if config.get("eval_only", False):
+            self.optimizer = None
+            self.scheduler = None
+        else:
+            self._init_opt()
         self._init_logging()
 
         dc = self.config["data"]
@@ -316,21 +323,25 @@ class TIGERTrainer:
             datasets=dc.get("datasets"),
             time_interval=dc.get("time_interval", 24),
         )
-        train_ds = TIGERDataset(split="train", **common)
         val_ds = TIGERDataset(split="valid" if dc["dataset_type"] == "weather_npy" else "test",
                               **common)
 
         collate = TIGERCollateFn()
-        self.train_loader = DataLoader(
-            train_ds, batch_size=self.config["batch_size"],
-            shuffle=True, collate_fn=collate, num_workers=0,
-            drop_last=True,
-        )
+        if self.config.get("eval_only", False):
+            self.train_loader = None
+            self.train_dataset = None
+        else:
+            train_ds = TIGERDataset(split="train", **common)
+            self.train_loader = DataLoader(
+                train_ds, batch_size=self.config["batch_size"],
+                shuffle=True, collate_fn=collate, num_workers=0,
+                drop_last=True,
+            )
+            self.train_dataset = train_ds
         self.val_loader = DataLoader(
             val_ds, batch_size=self.config["batch_size"],
             shuffle=False, collate_fn=collate, num_workers=0,
         )
-        self.train_dataset = train_ds
 
     # ---- model --------------------------------------------------------------
 
@@ -372,6 +383,9 @@ class TIGERTrainer:
     # ---- train loop ---------------------------------------------------------
 
     def train(self):
+        if self.config.get("eval_only", False):
+            raise RuntimeError("train() called in eval_only mode; use evaluate_only().")
+
         print(f"Starting training for {self.n_epochs} epochs")
         print(f"  Train samples: {len(self.train_loader.dataset)}")
         print(f"  Val samples:   {len(self.val_loader.dataset)}")
@@ -390,6 +404,27 @@ class TIGERTrainer:
 
         self.writer.close()
         print("Training complete.")
+
+    def evaluate_only(self):
+        """Evaluate a checkpoint without training or writing checkpoint files."""
+        if not self.config.get("model_path"):
+            raise ValueError("--eval_only requires --model_path")
+
+        print("Starting eval-only run")
+        print(f"  Eval samples: {len(self.val_loader.dataset)}")
+        print(f"  Batch size:   {self.config['batch_size']}")
+        print(f"  Device:       {self.device}")
+        print(f"  Checkpoint:   {self.config['model_path']}")
+
+        val_loss = self._validate(
+            epoch=0,
+            save_best=False,
+            force_gen_metrics=True,
+            force_mrr=True,
+        )
+        self.writer.close()
+        print(f"Eval complete. val_loss={val_loss:.6f}")
+        return val_loss
 
     def _train_epoch(self, epoch: int) -> float:
         self.model.train()
@@ -435,7 +470,13 @@ class TIGERTrainer:
         return avg_loss
 
     @torch.no_grad()
-    def _validate(self, epoch: int) -> float:
+    def _validate(
+        self,
+        epoch: int,
+        save_best: bool = True,
+        force_gen_metrics: bool = False,
+        force_mrr: bool = False,
+    ) -> float:
         self.model.eval()
         total_loss = 0.0
         num_batches = 0
@@ -452,11 +493,14 @@ class TIGERTrainer:
         self.writer.add_scalar("val/loss", avg_loss, epoch)
         print(f"         | val_loss  ={avg_loss:.6f}")
 
-        # MSE/MAPE every eval_gen_interval, MRR@10 every eval_mrr_interval
-        if (epoch + 1) % self.eval_gen_interval == 0:
-            self._compute_gen_metrics(epoch, do_mrr=(epoch + 1) % self.eval_mrr_interval == 0)
+        # MSE/MAPE every eval_gen_interval, MRR@10 every eval_mrr_interval.
+        # Eval-only forces generation metrics so a checkpoint validation is useful.
+        do_gen_metrics = force_gen_metrics or (epoch + 1) % self.eval_gen_interval == 0
+        do_mrr = force_mrr or (epoch + 1) % self.eval_mrr_interval == 0
+        if do_gen_metrics:
+            self._compute_gen_metrics(epoch, do_mrr=do_mrr)
 
-        if avg_loss < self.best_val_loss:
+        if save_best and avg_loss < self.best_val_loss:
             self.best_val_loss = avg_loss
             self._save_checkpoint(epoch, tag="best")
             print(f"         *** New best val loss: {avg_loss:.6f}")
@@ -585,6 +629,11 @@ def parse_args():
     p.add_argument("--val_interval", type=int, default=None)
     p.add_argument("--display_interval", type=int, default=None)
     p.add_argument("--save_interval", type=int, default=None)
+    p.add_argument(
+        "--eval_only",
+        action="store_true",
+        help="Load --model_path and run validation/test metrics without training or saving checkpoints",
+    )
 
     return p.parse_args()
 
@@ -604,13 +653,22 @@ def main():
     config["condition"].setdefault("image", {})["device"] = config["device"]
     set_seed(config["seed"])
 
-    # Save effective config
-    os.makedirs(config["save_dir"], exist_ok=True)
-    with open(os.path.join(config["save_dir"], "config.json"), "w") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+    # Save effective config. Eval-only writes to log_dir so it cannot overwrite
+    # the original training run's checkpoint config.
+    if config.get("eval_only", False):
+        os.makedirs(config["log_dir"], exist_ok=True)
+        with open(os.path.join(config["log_dir"], "eval_config.json"), "w") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+    else:
+        os.makedirs(config["save_dir"], exist_ok=True)
+        with open(os.path.join(config["save_dir"], "config.json"), "w") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
 
     trainer = TIGERTrainer(config)
-    trainer.train()
+    if config.get("eval_only", False):
+        trainer.evaluate_only()
+    else:
+        trainer.train()
 
 
 if __name__ == "__main__":
