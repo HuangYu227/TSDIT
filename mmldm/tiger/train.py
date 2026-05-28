@@ -250,30 +250,38 @@ def calc_mrr(
 ) -> float:
     """T2S-compatible MRR@k by cosine similarity.
 
-    real: (B, T), gen_samples: (n_samples, B, T). For each sample,
-    generated candidates are ranked by cosine similarity. The reciprocal
-    rank is taken for the first candidate whose similarity exceeds
-    ``threshold``; samples with no relevant candidate contribute 0.
+    Matches T2S evaluation.py exactly:
+      - real: (B, T), gen_samples: (n_samples, B, T)
+      - Per-sample cosine similarity (sklearn), then np.mean
+      - Threshold 0.5 (same as T2S ``therehold = 0.5``)
     """
+    from sklearn.metrics.pairwise import cosine_similarity as _cos_sim
+
     n_samples = min(k, gen_samples.shape[0])
     B = real.shape[0]
     mrr_scores = np.zeros(B, dtype=np.float64)
-    for b in range(B):
-        target = real[b].reshape(-1)
-        sims = []
-        for s in range(n_samples):
-            candidate = gen_samples[s, b].reshape(-1)
-            denom = np.linalg.norm(target) * np.linalg.norm(candidate)
-            sim = 0.0 if denom == 0 else float(np.dot(target, candidate) / denom)
-            sims.append(sim)
 
-        sorted_idx = np.argsort(sims)[::-1]
+    for b in range(B):
+        real_seq = real[b]  # (T,)
+        if real_seq.ndim == 1:
+            real_seq = real_seq.reshape(-1, 1)  # (T, 1) for sklearn
+
+        similarities = []
+        for s in range(n_samples):
+            gen_seq = gen_samples[s, b]  # (T,)
+            if gen_seq.ndim == 1:
+                gen_seq = gen_seq.reshape(-1, 1)
+            sim = _cos_sim(real_seq, gen_seq)
+            similarities.append(float(np.mean(sim)))
+
+        sorted_idx = np.argsort(similarities)[::-1]
         rank = None
         for position, idx in enumerate(sorted_idx):
-            if sims[idx] > threshold:
+            if similarities[idx] > threshold:
                 rank = position + 1
                 break
         mrr_scores[b] = 1.0 / rank if rank is not None else 0.0
+
     return float(np.mean(mrr_scores))
 
 
