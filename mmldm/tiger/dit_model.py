@@ -720,20 +720,19 @@ class TIGERDiT(nn.Module):
         # ------------------------------------------------------------------
         # 6. Residual layers with skip connections
         # ------------------------------------------------------------------
-        _x_in = x_in
         skips: list[torch.Tensor] = []
         moe_aux_losses: list[torch.Tensor] = []
         for layer in self.residual_layers:
             if self._csa_moe_enabled:
                 x_in, skip, aux = layer(
-                    x_in + _x_in, side_in, attr_in, diffusion_emb,
+                    x_in, side_in, attr_in, diffusion_emb,
                     t_emb=diffusion_emb, am=attention_mask,
                 )
                 if aux is not None:
                     moe_aux_losses.append(aux)
             else:
                 x_in, skip = layer(
-                    x_in + _x_in, side_in, attr_in, diffusion_emb,
+                    x_in, side_in, attr_in, diffusion_emb,
                     attention_mask=attention_mask,
                 )
             skips.append(skip)

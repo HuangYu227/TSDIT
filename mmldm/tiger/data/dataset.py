@@ -71,7 +71,6 @@ class TIGERDataset(Dataset):
             time_interval: series length (24, 48, or 96).
         """
         import pandas as pd
-        from sklearn.preprocessing import MinMaxScaler
 
         if datasets is None:
             datasets = ["ETTh1"]
@@ -98,10 +97,6 @@ class TIGERDataset(Dataset):
             for item in df["OT"]
         ]
         ts_data = np.array(parsed, dtype=np.float32)  # (N, T)
-
-        # Global MinMaxScaler normalization (same as T2S)
-        scaler = MinMaxScaler().fit(ts_data)
-        ts_data = scaler.transform(ts_data).astype(np.float32)
 
         # Text captions
         caps = [[t] for t in df["Text"].tolist()]  # wrap in list for consistency
