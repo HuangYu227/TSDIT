@@ -535,16 +535,13 @@ class TIGERTrainer:
             real_global = (real_ts - g_min) / g_range
             gen_global = (gen_ts - g_min) / g_range
 
-            all_real.append(real_global.cpu().numpy())
-            all_gen.append(gen_global.cpu().numpy())
-
             if real_ts.shape != gen_ts.shape:
                 raise RuntimeError(
                     f"Metric shape mismatch: real={tuple(real_ts.shape)}, gen={tuple(gen_ts.shape)}"
                 )
 
-            all_real.append(real_ts.cpu().numpy())
-            all_gen.append(gen_ts.cpu().numpy())
+            all_real.append(real_global.cpu().numpy())
+            all_gen.append(gen_global.cpu().numpy())
             if texts is not None:
                 all_texts.extend(texts if isinstance(texts, list) else [texts])
 
