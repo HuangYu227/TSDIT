@@ -323,6 +323,10 @@ class TIGERTrainer:
         self.best_val_loss = float("inf")
         self.global_step = 0
 
+        # Metrics history (saved to JSON)
+        self.metrics_history: list = []
+        self.metrics_path = os.path.join(config.get("log_dir", "."), "metrics.json")
+
     # ---- data ---------------------------------------------------------------
 
     def _init_data(self):
@@ -409,12 +413,19 @@ class TIGERTrainer:
         for epoch in range(self.n_epochs):
             train_loss = self._train_epoch(epoch)
 
+            epoch_metrics = {"epoch": epoch + 1, "train_loss": train_loss}
+
             if (epoch + 1) % self.val_interval == 0:
                 val_loss = self._validate(epoch)
+                epoch_metrics["val_loss"] = val_loss
                 self._save_checkpoint(epoch, val_loss)
 
             if (epoch + 1) % self.save_interval == 0:
                 self._save_checkpoint(epoch, tag=f"epoch_{epoch+1}")
+
+            self.metrics_history.append(epoch_metrics)
+            with open(self.metrics_path, "w") as f:
+                json.dump(self.metrics_history, f, indent=2)
 
         self.writer.close()
         print("Training complete.")
@@ -451,8 +462,9 @@ class TIGERTrainer:
             self.optimizer.zero_grad()
             loss_dict = self.model(batch, is_train=True)
             loss = loss_dict["all"]
-            if not torch.isfinite(loss):
-                print(f"WARNING: NaN/INF loss at step {self.global_step}, skipping batch")
+            if not torch.isfinite(loss) or loss.item() < 1e-7:
+                reason = "NaN/INF" if not torch.isfinite(loss) else "underflow"
+                print(f"WARNING: {reason} loss={loss.item():.2e} at step {self.global_step}, skipping batch")
                 self.optimizer.zero_grad()
                 continue
             loss.backward()
@@ -511,8 +523,15 @@ class TIGERTrainer:
         # Eval-only forces generation metrics so a checkpoint validation is useful.
         do_gen_metrics = force_gen_metrics or (epoch + 1) % self.eval_gen_interval == 0
         do_mrr = force_mrr or (epoch + 1) % self.eval_mrr_interval == 0
+        gen_metrics = {}
         if do_gen_metrics:
-            self._compute_gen_metrics(epoch, do_mrr=do_mrr)
+            gen_metrics = self._compute_gen_metrics(epoch, do_mrr=do_mrr)
+
+        # Merge gen metrics into the latest metrics_history entry
+        if self.metrics_history and gen_metrics:
+            self.metrics_history[-1].update(gen_metrics)
+            with open(self.metrics_path, "w") as f:
+                json.dump(self.metrics_history, f, indent=2)
 
         if save_best and avg_loss < self.best_val_loss:
             self.best_val_loss = avg_loss
@@ -522,8 +541,10 @@ class TIGERTrainer:
         return avg_loss
 
     @torch.no_grad()
-    def _compute_gen_metrics(self, epoch: int, do_mrr: bool = False):
-        """Generate samples and compute MSE, MAPE, and optionally MRR@10."""
+    def _compute_gen_metrics(self, epoch: int, do_mrr: bool = False) -> dict:
+        """Generate samples and compute MSE, MAPE, and optionally MRR@10.
+        Returns dict of computed metrics."""
+        result = {}
         self.model.eval()
         dc = self.config["data"]
         ts_len = dc.get("time_interval", 24)
@@ -560,6 +581,7 @@ class TIGERTrainer:
         self.writer.add_scalar("val/MSE", mse, epoch)
         self.writer.add_scalar("val/MAPE", mape, epoch)
         self.writer.add_scalar("val/WAPE", wape, epoch)
+        result.update({"MSE": mse, "MAPE": mape, "WAPE": wape})
 
         msg = f"         | MSE={mse:.6f} | MAPE={mape:.4f} | WAPE={wape:.4f}"
 
@@ -579,9 +601,11 @@ class TIGERTrainer:
             gen10_np = np.stack(all_gen10, axis=0)
             mrr = calc_mrr(real_np, gen10_np, k=10)
             self.writer.add_scalar("val/MRR@10", mrr, epoch)
+            result["MRR@10"] = mrr
             msg += f" | MRR@10={mrr:.4f}"
 
         print(msg)
+        return result
 
     def _save_checkpoint(self, epoch: int, val_loss: float = None, tag: str = None):
         if tag is None:
