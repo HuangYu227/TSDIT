@@ -130,9 +130,9 @@ def _frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
 
 def compute_jftsd(real, gen, cond, emb_dim=64, train_steps=200, device="cpu"):
     """Joint Frechet Time Series Distance (lower is better)."""
-    real = torch.as_tensor(real, dtype=torch.float32, device=device)
-    gen = torch.as_tensor(gen, dtype=torch.float32, device=device)
-    cond = torch.as_tensor(cond, dtype=torch.float32, device=device)
+    real = torch.tensor(real, dtype=torch.float32, device=device, requires_grad=False)
+    gen = torch.tensor(gen, dtype=torch.float32, device=device, requires_grad=False)
+    cond = torch.tensor(cond, dtype=torch.float32, device=device, requires_grad=False)
 
     if real.dim() == 2:
         real = real.unsqueeze(-1)
@@ -155,6 +155,8 @@ def compute_jftsd(real, gen, cond, emb_dim=64, train_steps=200, device="cpu"):
         logits = (z_t @ z_m.T) / np.sqrt(emb_dim)
         labels = torch.arange(B, device=device)
         loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
+        if not loss.requires_grad:
+            break
         opt.zero_grad()
         loss.backward()
         opt.step()
