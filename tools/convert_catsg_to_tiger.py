@@ -120,6 +120,15 @@ def convert(catsg_dir, output_dir, generate_embeddings=False):
 
             x = np.load(x_path)  # (N, T, 1)
             c = np.load(c_path)  # (N, T, D)
+
+            # Check for NaN/Inf in raw data
+            if np.any(np.isnan(x)) or np.any(np.isinf(x)):
+                n_bad = np.sum(np.any(np.isnan(x) | np.isinf(x), axis=(1, 2)))
+                print(f"  [WARN] {n_bad}/{x.shape[0]} samples have NaN/Inf, dropping them")
+                valid = ~np.any(np.isnan(x) | np.isinf(x), axis=(1, 2))
+                x = x[valid]
+                c = c[valid]
+
             N, T, _ = x.shape
             x_flat = x.squeeze(-1)  # (N, T)
 

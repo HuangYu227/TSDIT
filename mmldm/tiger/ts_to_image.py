@@ -69,7 +69,7 @@ def _normalize_01(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Te
     # Broadcast shape: (..., 1)
     x_norm = (x - min_val.unsqueeze(-1)) / (max_val - min_val).unsqueeze(-1)
     # Clamp for numerical safety after arccos.
-    x_norm = x_norm.clamp(0.0, 1.0)
+    x_norm = x_norm.clamp(1e-3, 1.0 - 1e-3)
     return x_norm, min_val, max_val
 
 
@@ -86,7 +86,7 @@ def ts_to_gasf(ts: torch.Tensor) -> torch.Tensor:
         (..., T, T) GASF matrix with values in [-1, 1].
     """
     # phi = arccos(x),  x in [0,1] -> phi in [0, pi]
-    phi = torch.acos(ts.clamp(0.0, 1.0))
+    phi = torch.acos(ts.clamp(1e-3, 1.0 - 1e-3))
     # G_ij = cos(phi_i + phi_j)
     phi_i = phi.unsqueeze(-1)   # (..., T, 1)
     phi_j = phi.unsqueeze(-2)   # (..., 1, T)
