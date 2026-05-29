@@ -549,7 +549,7 @@ class TIGERTrainer:
         image_size = dc["image_size"]
         image_shape = (3, image_size, image_size)
 
-        all_real, all_gen = [], []
+        all_real, all_gen, all_texts = [], [], []
         for batch in self.val_loader:
             texts = batch.get("cap", None)
             ts_real = batch["ts"].to(self.device).float()
@@ -569,9 +569,21 @@ class TIGERTrainer:
 
             all_real.append(real_ts.cpu().numpy())
             all_gen.append(gen_ts.cpu().numpy())
+            if texts is not None:
+                all_texts.extend(texts if isinstance(texts, list) else [texts])
 
         real_np = np.concatenate(all_real, axis=0)
         gen_np = np.concatenate(all_gen, axis=0)
+
+        # Encode text embeddings for J-FTSD
+        cond_np = None
+        if all_texts:
+            try:
+                with torch.no_grad():
+                    text_emb = self.model.encode_text(all_texts)
+                cond_np = text_emb.cpu().numpy()
+            except Exception:
+                cond_np = None
 
         mse = calc_mse(real_np, gen_np)
         mape = calc_mape(real_np, gen_np)
@@ -586,7 +598,7 @@ class TIGERTrainer:
         # --- CaTSG metrics (MDD, KL, MMD, J-FTSD) ---
         try:
             from .evaluation.catsg_metrics import compute_all_catsg_metrics
-            catsg = compute_all_catsg_metrics(real_np, gen_np, device=self.device)
+            catsg = compute_all_catsg_metrics(real_np, gen_np, cond=cond_np, device=self.device)
             for k, v in catsg.items():
                 self.writer.add_scalar(f"val/{k}", v, epoch)
                 result[k] = v
