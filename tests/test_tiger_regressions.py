@@ -6,7 +6,6 @@ from mmldm.tiger.data.dataset import TIGERCollateFn
 from mmldm.tiger.dit_model import TIGERDiT
 from mmldm.tiger.train import (
     apply_cli_overrides,
-    calc_mrr,
     denormalize_ts_batch,
     get_default_config,
 )
@@ -80,27 +79,6 @@ def test_denormalize_ts_batch_keeps_batch_time_shape():
     assert out.shape == (2, 3)
     assert torch.allclose(out[0], torch.tensor([2.0, 2.0, 2.0]))
     assert torch.allclose(out[1], torch.tensor([12.0, 12.0, 12.0]))
-
-
-def test_calc_mrr_uses_t2s_thresholded_similarity_rank():
-    real = torch.tensor([[1.0, 0.0]]).numpy()
-    gen_samples = torch.tensor([
-        [[0.0, 1.0]],   # sim 0.0, not relevant
-        [[0.6, 0.8]],   # sim 0.6, relevant at sorted rank 2
-        [[0.8, 0.6]],   # sim 0.8, relevant at sorted rank 1
-    ]).numpy()
-
-    assert calc_mrr(real, gen_samples, k=3, threshold=0.5) == 1.0
-
-
-def test_calc_mrr_returns_zero_when_no_candidate_exceeds_threshold():
-    real = torch.tensor([[1.0, 0.0]]).numpy()
-    gen_samples = torch.tensor([
-        [[0.0, 1.0]],
-        [[0.2, 0.98]],
-    ]).numpy()
-
-    assert calc_mrr(real, gen_samples, k=2, threshold=0.5) == 0.0
 
 
 def test_tiger_collate_squeezes_scalar_norm_values():

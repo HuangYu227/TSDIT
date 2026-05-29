@@ -325,6 +325,14 @@ class TIGERTrainer:
             "diffusion": self.config["diffusion"],
             "condition": self.config["condition"],
         }
+        # Pass top-level csa_moe / cticd configs so dit_model can read them
+        if "csa_moe" in self.config:
+            model_config["diffusion"]["csa_moe"] = self.config["csa_moe"]
+        if "cticd" in self.config:
+            model_config["diffusion"]["cticd"] = self.config["cticd"]
+        # Pass image_size for MoE grid computation
+        if "data" in self.config and "image_size" in self.config["data"]:
+            model_config["diffusion"]["image_size"] = self.config["data"]["image_size"]
         self.model = TIGERGenerator(model_config)
 
         if self.config.get("model_path"):
