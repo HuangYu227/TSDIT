@@ -1,0 +1,67 @@
+{
+  "epochs": 500,
+  "batch_size": 512,
+  "lr": 1e-4,
+  "warmup_steps": 500,
+  "val_interval": 10,
+  "display_interval": 1,
+  "save_interval": 50,
+  "eval_gen_interval": 10,
+  "eval_mrr_interval": 20,
+  "save_dir": "./checkpoints/catsg_traffic_causal",
+  "log_dir": "./runs/catsg_traffic_causal",
+
+  "condition": {
+    "cond_mode": "text",
+    "num_stages": 4,
+    "cfg_dropout": 0.3,
+    "text": {
+      "pretrain_model_path": "openai/clip-vit-base-patch32",
+      "pretrain_model_dim": 512,
+      "textemb_hidden_dim": 256,
+      "text_emb": 128
+    }
+  },
+
+  "diffusion": {
+    "num_steps": 50,
+    "beta_start": 0.0001,
+    "beta_end": 0.02,
+    "channels": 64,
+    "nheads": 8,
+    "layers": 8,
+    "n_var": 16,
+    "multipatch_num": 4,
+    "base_patch": 4,
+    "patch_scale": 2,
+    "diffusion_embedding_dim": 64,
+    "in_channels": 3,
+    "condition_type": "adaLN",
+    "attention_mask_type": "parallel",
+    "lambda_cticd": 0.1
+  },
+
+  "cticd": {
+    "enabled": true,
+    "d_model": 64,
+    "n_channels": 3,
+    "n_mechanisms_per_channel": 4,
+    "patch_size": 4,
+    "num_heads": 8,
+    "edge_bias": -4.0,
+    "branch_grad_scale": 0.2,
+    "lambda_causal": 0.1,
+    "lambda_notears": 1e-3,
+    "lambda_sparsity": 1e-2
+  },
+
+  "data": {
+    "dataset_type": "csv",
+    "datasets": ["catsg_traffic"],
+    "time_interval": 96,
+    "image_size": 64,
+    "n_fft": 64,
+    "hop_length": 8,
+    "epsilon_quantile": 0.1
+  }
+}

@@ -250,29 +250,27 @@ def calc_mrr(
 ) -> float:
     """T2S-compatible MRR@k by cosine similarity.
 
-    Matches T2S evaluation.py exactly:
-      - real: (B, T), gen_samples: (n_samples, B, T)
-      - Per-sample cosine similarity (sklearn), then np.mean
-      - Threshold 0.5 (same as T2S ``therehold = 0.5``)
+    Args:
+        real: (B, T) ground truth.
+        gen_samples: (n_samples, B, T) multiple generations.
     """
-    from sklearn.metrics.pairwise import cosine_similarity as _cos_sim
 
     n_samples = min(k, gen_samples.shape[0])
     B = real.shape[0]
     mrr_scores = np.zeros(B, dtype=np.float64)
 
     for b in range(B):
-        real_seq = real[b]  # (T,)
-        if real_seq.ndim == 1:
-            real_seq = real_seq.reshape(-1, 1)  # (T, 1) for sklearn
+        real_seq = real[b].reshape(-1)
+        real_norm = np.linalg.norm(real_seq)
 
         similarities = []
         for s in range(n_samples):
-            gen_seq = gen_samples[s, b]  # (T,)
-            if gen_seq.ndim == 1:
-                gen_seq = gen_seq.reshape(-1, 1)
-            sim = _cos_sim(real_seq, gen_seq)
-            similarities.append(float(np.mean(sim)))
+            gen_seq = gen_samples[s, b].reshape(-1)
+            gen_norm = np.linalg.norm(gen_seq)
+            if real_norm == 0 or gen_norm == 0:
+                similarities.append(0.0)
+            else:
+                similarities.append(float(np.dot(real_seq, gen_seq) / (real_norm * gen_norm)))
 
         sorted_idx = np.argsort(similarities)[::-1]
         rank = None
@@ -584,6 +582,19 @@ class TIGERTrainer:
         result.update({"MSE": mse, "MAPE": mape, "WAPE": wape})
 
         msg = f"         | MSE={mse:.6f} | MAPE={mape:.4f} | WAPE={wape:.4f}"
+
+        # --- CaTSG metrics (MDD, KL, MMD, J-FTSD) ---
+        try:
+            from .evaluation.catsg_metrics import compute_all_catsg_metrics
+            catsg = compute_all_catsg_metrics(real_np, gen_np, device=self.device)
+            for k, v in catsg.items():
+                self.writer.add_scalar(f"val/{k}", v, epoch)
+                result[k] = v
+            msg += f" | MDD={catsg['MDD']:.4f} KL={catsg['KL']:.4f} MMD={catsg['MMD']:.6f}"
+            if "J-FTSD" in catsg:
+                msg += f" J-FTSD={catsg['J-FTSD']:.4f}"
+        except Exception as e:
+            print(f"         | CaTSG metrics skipped: {e}")
 
         if do_mrr:
             all_gen10 = []
