@@ -30,30 +30,39 @@ def histogram_torch(x, n_bins, density=True):
 
 
 def compute_mdd(real: np.ndarray, gen: np.ndarray, n_bins: int = 20) -> float:
-    """Marginal Distribution Distance (lower is better)."""
-    if real.ndim == 3:
-        real = real.squeeze(-1)
-    if gen.ndim == 3:
-        gen = gen.squeeze(-1)
+    """Marginal Distribution Distance (lower is better).
 
+    Matches CaTSG HistoLoss: iterates over both variable dimension and time
+    step.  Accepts (N, T) for univariate or (N, T, D) for multivariate.
+    """
     real_t = torch.as_tensor(real, dtype=torch.float64)
     gen_t = torch.as_tensor(gen, dtype=torch.float64)
 
-    losses = []
-    N, T = real_t.shape
-    for t in range(T):
-        real_ti = real_t[:, t].reshape(-1, 1)
-        d_r, b = histogram_torch(real_ti, n_bins, density=True)
-        delta = b[1:2] - b[:1]
-        loc = 0.5 * (b[1:] + b[:-1])
+    # Ensure 3D: (N, T, D)
+    if real_t.ndim == 2:
+        real_t = real_t.unsqueeze(-1)
+    if gen_t.ndim == 2:
+        gen_t = gen_t.unsqueeze(-1)
 
-        x_ti = gen_t[:, t].contiguous().view(-1, 1).repeat(1, loc.shape[0])
-        dist = torch.abs(x_ti - loc)
-        left_counter = ((delta / 2. - (loc - x_ti)) == 0.).float()
-        counter = (torch.relu(delta / 2. - dist) > 0.).float() + left_counter
-        density = counter.mean(0) / delta
-        abs_metric = torch.abs(density - d_r)
-        losses.append(torch.mean(abs_metric))
+    losses = []
+    N, T, D = real_t.shape
+
+    for i in range(D):
+        for t in range(T):
+            # Build histogram from real data (same as HistoLoss.__init__)
+            real_ti = real_t[:, t, i].reshape(-1, 1)
+            d_r, b = histogram_torch(real_ti, n_bins, density=True)
+            delta = b[1:2] - b[:1]
+            loc = 0.5 * (b[1:] + b[:-1]).view(1, -1)
+
+            # Compute density from generated data (same as HistoLoss.compute())
+            x_ti = gen_t[:, t, i].contiguous().view(-1, 1).repeat(1, loc.shape[1])
+            dist = torch.abs(x_ti - loc)
+            left_counter = ((delta / 2. - (loc - x_ti)) == 0.).float()
+            counter = (torch.relu(delta / 2. - dist) > 0.).float() + left_counter
+            density = counter.mean(0) / delta
+            abs_metric = torch.abs(density - d_r)
+            losses.append(torch.mean(abs_metric))
 
     return float(torch.stack(losses).mean().item())
 
@@ -129,6 +138,8 @@ def compute_jftsd(real, gen, cond, emb_dim=64, train_steps=200, device="cpu"):
         real = real.unsqueeze(-1)
     if gen.dim() == 2:
         gen = gen.unsqueeze(-1)
+    if cond.dim() == 2:
+        cond = cond.unsqueeze(1)  # (B, D) -> (B, 1, D) for CEncoder
 
     B, L, D_x = real.shape
     D = cond.shape[-1]
