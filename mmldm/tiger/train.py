@@ -242,47 +242,6 @@ def calc_wape(real: np.ndarray, gen: np.ndarray) -> float:
     return float(np.sum(np.abs(real - gen)) / (np.sum(np.abs(real)) + 1e-8))
 
 
-def calc_mrr(
-    real: np.ndarray,
-    gen_samples: np.ndarray,
-    k: int = 10,
-    threshold: float = 0.5,
-) -> float:
-    """T2S-compatible MRR@k by cosine similarity.
-
-    Args:
-        real: (B, T) ground truth.
-        gen_samples: (n_samples, B, T) multiple generations.
-    """
-
-    n_samples = min(k, gen_samples.shape[0])
-    B = real.shape[0]
-    mrr_scores = np.zeros(B, dtype=np.float64)
-
-    for b in range(B):
-        real_seq = real[b].reshape(-1)
-        real_norm = np.linalg.norm(real_seq)
-
-        similarities = []
-        for s in range(n_samples):
-            gen_seq = gen_samples[s, b].reshape(-1)
-            gen_norm = np.linalg.norm(gen_seq)
-            if real_norm == 0 or gen_norm == 0:
-                similarities.append(0.0)
-            else:
-                similarities.append(float(np.dot(real_seq, gen_seq) / (real_norm * gen_norm)))
-
-        sorted_idx = np.argsort(similarities)[::-1]
-        rank = None
-        for position, idx in enumerate(sorted_idx):
-            if similarities[idx] > threshold:
-                rank = position + 1
-                break
-        mrr_scores[b] = 1.0 / rank if rank is not None else 0.0
-
-    return float(np.mean(mrr_scores))
-
-
 # ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
@@ -298,7 +257,6 @@ class TIGERTrainer:
         self.display_interval = config["display_interval"]
         self.save_interval = config["save_interval"]
         self.eval_gen_interval = config.get("eval_gen_interval", 5)
-        self.eval_mrr_interval = config.get("eval_mrr_interval", 10)
 
         if not config.get("eval_only", False):
             os.makedirs(config["save_dir"], exist_ok=True)
@@ -443,7 +401,6 @@ class TIGERTrainer:
             epoch=0,
             save_best=False,
             force_gen_metrics=True,
-            force_mrr=True,
         )
         self.writer.close()
         print(f"Eval complete. val_loss={val_loss:.6f}")
@@ -499,7 +456,6 @@ class TIGERTrainer:
         epoch: int,
         save_best: bool = True,
         force_gen_metrics: bool = False,
-        force_mrr: bool = False,
     ) -> float:
         self.model.eval()
         total_loss = 0.0
@@ -517,13 +473,12 @@ class TIGERTrainer:
         self.writer.add_scalar("val/loss", avg_loss, epoch)
         print(f"         | val_loss  ={avg_loss:.6f}")
 
-        # MSE/MAPE every eval_gen_interval, MRR@10 every eval_mrr_interval.
+        # MSE/MAPE every eval_gen_interval.
         # Eval-only forces generation metrics so a checkpoint validation is useful.
         do_gen_metrics = force_gen_metrics or (epoch + 1) % self.eval_gen_interval == 0
-        do_mrr = force_mrr or (epoch + 1) % self.eval_mrr_interval == 0
         gen_metrics = {}
         if do_gen_metrics:
-            gen_metrics = self._compute_gen_metrics(epoch, do_mrr=do_mrr)
+            gen_metrics = self._compute_gen_metrics(epoch)
 
         # Merge gen metrics into the latest metrics_history entry
         if self.metrics_history and gen_metrics:
@@ -539,8 +494,8 @@ class TIGERTrainer:
         return avg_loss
 
     @torch.no_grad()
-    def _compute_gen_metrics(self, epoch: int, do_mrr: bool = False) -> dict:
-        """Generate samples and compute MSE, MAPE, and optionally MRR@10.
+    def _compute_gen_metrics(self, epoch: int) -> dict:
+        """Generate samples and compute MSE, MAPE, and CaTSG metrics.
         Returns dict of computed metrics."""
         result = {}
         self.model.eval()
@@ -607,25 +562,6 @@ class TIGERTrainer:
                 msg += f" J-FTSD={catsg['J-FTSD']:.4f}"
         except Exception as e:
             print(f"         | CaTSG metrics skipped: {e}")
-
-        if do_mrr:
-            all_gen10 = []
-            for s in range(10):
-                gen_list = []
-                for batch in self.val_loader:
-                    texts = batch.get("cap", None)
-                    ts_min = _squeeze_trailing_singletons(batch["ts_min"].to(self.device).float())
-                    ts_max = _squeeze_trailing_singletons(batch["ts_max"].to(self.device).float())
-                    gen_imgs = self.model.generate(image_shape, texts, n_samples=1)
-                    norm_params = NormParams(min_val=ts_min, max_val=ts_max, n_vars=1, original_length=ts_len)
-                    gen_ts = self.decoder.decode(gen_imgs[0], ts_len, norm_params)
-                    gen_list.append(gen_ts.cpu().numpy())
-                all_gen10.append(np.concatenate(gen_list, axis=0))
-            gen10_np = np.stack(all_gen10, axis=0)
-            mrr = calc_mrr(real_np, gen10_np, k=10)
-            self.writer.add_scalar("val/MRR@10", mrr, epoch)
-            result["MRR@10"] = mrr
-            msg += f" | MRR@10={mrr:.4f}"
 
         print(msg)
         return result
