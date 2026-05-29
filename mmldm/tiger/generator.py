@@ -151,7 +151,7 @@ class TIGERGenerator(nn.Module):
             attr_emb = self.compute_condition(texts, B, t)
             step_losses = self._noise_estimation_loss(images, attr_emb, t)
             for k, v in step_losses.items():
-                loss_acc[k] = loss_acc.get(k, 0.0) + v
+                loss_acc[k] = loss_acc.get(k, 0.0) + v.item()
 
         return {k: v / self.num_steps for k, v in loss_acc.items()}
 

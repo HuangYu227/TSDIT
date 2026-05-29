@@ -174,7 +174,11 @@ class TIGEREvaluator:
         return results
 
     def _encode_ts_batch(self, ts_np, ts_len, ts_min, ts_max):
-        """Encode a batch of TS to images for round-trip testing."""
+        """Encode a batch of TS to images for round-trip testing.
+
+        Uses original-scale ts_min/ts_max for NormParams so the decoder
+        correctly denormalizes back to the original scale.
+        """
         from ..ts_to_image import TSToImageEncoder, NormParams
 
         encoder = TSToImageEncoder(
@@ -183,12 +187,15 @@ class TIGEREvaluator:
             hop_length=self.config["data"].get("hop_length", 8),
         )
         ts_tensor = torch.tensor(ts_np, dtype=torch.float32)
-        ts_min_t = ts_tensor.min(dim=-1, keepdim=True).values
-        ts_max_t = ts_tensor.max(dim=-1, keepdim=True).values
-        ts_range = (ts_max_t - ts_min_t).clamp(min=1e-8)
-        ts_norm = (ts_tensor - ts_min_t) / ts_range
 
-        images, _ = encoder.encode(ts_norm)
+        images, _ = encoder.encode(ts_tensor)
+
+        # Use original-scale min/max for correct denormalization
+        ts_min_t = torch.tensor(ts_min, dtype=torch.float32)
+        ts_max_t = torch.tensor(ts_max, dtype=torch.float32)
+        if ts_min_t.dim() == 1:
+            ts_min_t = ts_min_t.unsqueeze(-1)
+            ts_max_t = ts_max_t.unsqueeze(-1)
         norm_params = NormParams(
             min_val=ts_min_t.squeeze(-1),
             max_val=ts_max_t.squeeze(-1),

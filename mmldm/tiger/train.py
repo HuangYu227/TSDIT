@@ -337,8 +337,12 @@ class TIGERTrainer:
 
         if self.config.get("model_path"):
             print(f"Loading pretrained model from {self.config['model_path']}")
-            state = torch.load(self.config["model_path"], map_location=self.device)
-            self.model.load_state_dict(state, strict=False)
+            ckpt = torch.load(self.config["model_path"], map_location=self.device)
+            # Support both old (state_dict only) and new (dict) checkpoint formats
+            if isinstance(ckpt, dict) and "model" in ckpt:
+                self.model.load_state_dict(ckpt["model"], strict=False)
+            else:
+                self.model.load_state_dict(ckpt, strict=False)
 
     # ---- optimizer ----------------------------------------------------------
 
@@ -513,7 +517,9 @@ class TIGERTrainer:
         image_shape = (3, image_size, image_size)
 
         # Global min/max for scale-leakage-free comparison
-        ds = self.train_loader.dataset
+        # Use val_loader.dataset (always available) instead of train_loader
+        # (which is None in eval-only mode)
+        ds = self.val_loader.dataset
         g_min = ds.global_ts_min
         g_max = ds.global_ts_max
         g_range = g_max - g_min if g_max != g_min else 1.0
@@ -590,7 +596,14 @@ class TIGERTrainer:
         ckpt_dir = os.path.join(self.config["save_dir"], "ckpts")
         os.makedirs(ckpt_dir, exist_ok=True)
         path = os.path.join(ckpt_dir, f"{tag}.pth")
-        torch.save(self.model.state_dict(), path)
+        torch.save({
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict() if self.optimizer else None,
+            "scheduler": self.scheduler.state_dict() if self.scheduler else None,
+            "epoch": epoch,
+            "val_loss": val_loss,
+            "global_step": self.global_step,
+        }, path)
 
 
 # ---------------------------------------------------------------------------
