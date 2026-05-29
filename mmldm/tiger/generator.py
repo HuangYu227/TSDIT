@@ -99,10 +99,33 @@ class TIGERGenerator(nn.Module):
         """Compute noise estimation loss for a given timestep."""
         noise = torch.randn_like(x)
         noisy_x = self.ddpm.forward(x, t, noise)
-        
+
         pred_noise = self.dit(noisy_x, t, attr_emb)
         residual = noise - pred_noise
-        return (residual ** 2).mean()
+        noise_loss = (residual ** 2).mean()
+
+        loss = noise_loss
+        loss_dict = {
+            "noise_loss": noise_loss.detach(),
+        }
+
+        # --- CTICD: add causal auxiliary losses if available ---
+        if hasattr(self.dit, '_cticd_losses') and self.dit._cticd_losses is not None:
+            lambda_cticd = self.config["diffusion"].get("lambda_cticd", 0.1)
+            cticd_total = self.dit._cticd_losses['cticd_total']
+            loss = loss + lambda_cticd * cticd_total
+            loss_dict["cticd_weighted"] = (lambda_cticd * cticd_total).detach()
+            for k, v in self.dit._cticd_losses.items():
+                loss_dict[k] = v.detach()
+
+        # --- CSA-MoE: add auxiliary load-balancing loss if available ---
+        if hasattr(self.dit, '_csa_moe_losses') and self.dit._csa_moe_losses is not None:
+            lambda_moe = self.config["diffusion"].get("lambda_moe", 0.1)
+            loss = loss + lambda_moe * self.dit._csa_moe_losses
+            loss_dict["moe_aux"] = self.dit._csa_moe_losses.detach()
+
+        loss_dict["all"] = loss
+        return loss_dict
 
     def forward(self, batch, is_train=True):
         """Training forward pass."""
@@ -120,17 +143,17 @@ class TIGERGenerator(nn.Module):
                     texts = None
 
             attr_emb = self.compute_condition(texts, B, t)
-            loss = self._noise_estimation_loss(images, attr_emb, t)
-            return {"noise_loss": loss, "all": loss}
+            return self._noise_estimation_loss(images, attr_emb, t)
 
-        loss_total = 0.0
+        loss_acc = {}
         for step in range(self.num_steps):
             t = torch.full((B,), step, device=self.device, dtype=torch.long)
             attr_emb = self.compute_condition(texts, B, t)
-            loss_total += self._noise_estimation_loss(images, attr_emb, t)
+            step_losses = self._noise_estimation_loss(images, attr_emb, t)
+            for k, v in step_losses.items():
+                loss_acc[k] = loss_acc.get(k, 0.0) + v
 
-        avg_loss = loss_total / self.num_steps
-        return {"noise_loss": avg_loss, "all": avg_loss}
+        return {k: v / self.num_steps for k, v in loss_acc.items()}
 
     @torch.no_grad()
     def generate(self, image_shape, texts, n_samples=1, sampler="ddim",

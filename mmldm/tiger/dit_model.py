@@ -523,7 +523,7 @@ class TIGERDiT(nn.Module):
         self.output_projection = Conv1d_with_init(self.channels, self.channels, 1)
 
         # -- residual transformer layers -----------------------------------------
-        self.residual_layers = nn.ModuleList([
+        _base_layers = nn.ModuleList([
             ResidualBlock(
                 side_dim=side_dim,
                 channels=self.channels,
@@ -533,6 +533,59 @@ class TIGERDiT(nn.Module):
             )
             for _ in range(config["layers"])
         ])
+
+        # --- CSA-MoE: optional channel-structure-aware MoE (ablation toggle) ---
+        moe_cfg = config.get("csa_moe", None)
+        self._csa_moe_enabled = moe_cfg is not None and moe_cfg.get("enabled", True)
+        self._csa_moe_losses = None
+
+        if self._csa_moe_enabled:
+            from .csa_moe import ChannelAwareResidualBlock
+
+            image_size = config.get("image_size", 64)
+            moe_grids = []
+            for i in range(self.multipatch_num):
+                ps = base_patch * (patch_scale ** i)
+                moe_grids.append((image_size // ps, image_size // ps))
+
+            self.residual_layers = nn.ModuleList()
+            for base_layer in _base_layers:
+                self.residual_layers.append(ChannelAwareResidualBlock(
+                    base=base_layer,
+                    grids=moe_grids,
+                    ch=self.channels,
+                    t_dim=config["diffusion_embedding_dim"],
+                    k=moe_cfg.get("k", 1),
+                    alpha=moe_cfg.get("alpha", 0.01),
+                    inject_aux=moe_cfg.get("inject_aux", False),
+                    scca_heads=moe_cfg.get("scca_heads", self.nheads),
+                ))
+        else:
+            self.residual_layers = _base_layers
+
+        # --- CTICD: optional causal module ---
+        cticd_cfg = config.get("cticd", None)
+        self.cticd = None
+        self._cticd_losses = None
+        self._cticd_graph = None
+
+        if cticd_cfg is not None and cticd_cfg.get("enabled", True):
+            from .cticd import CTICD
+
+            self.cticd = CTICD(
+                d_model=cticd_cfg.get("d_model", self.channels),
+                output_channels=self.channels,
+                attr_dim=self.channels,
+                n_channels=cticd_cfg.get("n_channels", 3),
+                n_mechanisms_per_channel=cticd_cfg.get("n_mechanisms_per_channel", 4),
+                patch_size=cticd_cfg.get("patch_size", config.get("base_patch", 4)),
+                num_heads=cticd_cfg.get("num_heads", self.nheads),
+                edge_bias=cticd_cfg.get("edge_bias", -4.0),
+                branch_grad_scale=cticd_cfg.get("branch_grad_scale", 0.2),
+                lambda_causal=cticd_cfg.get("lambda_causal", 0.1),
+                lambda_notears=cticd_cfg.get("lambda_notears", 1e-3),
+                lambda_sparsity=cticd_cfg.get("lambda_sparsity", 1e-2),
+            )
 
     # -- mask builder -----------------------------------------------------------
 
@@ -648,17 +701,48 @@ class TIGERDiT(nn.Module):
         side_in = side_in.unsqueeze(2)    # (B, side_dim,   1, total_tokens)
         attr_in = attr_cat.unsqueeze(2)   # (B, channels,   1, total_tokens)
 
+        # --- CTICD causal feature injection ---
+        self._cticd_losses = None
+        self._cticd_graph = None
+
+        if self.cticd is not None:
+            cticd_out = self.cticd(
+                image=image,
+                x_in=x_in,
+                attr_emb=attr_in,
+            )
+
+            self._cticd_losses = cticd_out.losses
+            self._cticd_graph = cticd_out.causal_graph
+
+            x_in = x_in + cticd_out.causal_features
+
         # ------------------------------------------------------------------
         # 6. Residual layers with skip connections
         # ------------------------------------------------------------------
         _x_in = x_in
         skips: list[torch.Tensor] = []
+        moe_aux_losses: list[torch.Tensor] = []
         for layer in self.residual_layers:
-            x_in, skip = layer(
-                x_in + _x_in, side_in, attr_in, diffusion_emb,
-                attention_mask=attention_mask,
-            )
+            if self._csa_moe_enabled:
+                x_in, skip, aux = layer(
+                    x_in + _x_in, side_in, attr_in, diffusion_emb,
+                    t_emb=diffusion_emb, am=attention_mask,
+                )
+                if aux is not None:
+                    moe_aux_losses.append(aux)
+            else:
+                x_in, skip = layer(
+                    x_in + _x_in, side_in, attr_in, diffusion_emb,
+                    attention_mask=attention_mask,
+                )
             skips.append(skip)
+
+        # Store CSA-MoE losses for generator to pick up
+        if self._csa_moe_enabled and moe_aux_losses:
+            self._csa_moe_losses = torch.stack(moe_aux_losses).mean()
+        else:
+            self._csa_moe_losses = None
 
         x = torch.sum(torch.stack(skips), dim=0) / math.sqrt(len(skips))
 
