@@ -162,10 +162,10 @@ def stft_image_to_ts(
 
     # Resize back to (F, frames) expected by Griffin-Lim.
     # torch.stft with center=True pads signal by n_fft//2 on both sides,
-    # so output frames = 1 + floor((ts_length + n_fft) / hop_length).
+    # torch.stft with center=True: frames = 1 + ts_length // hop_length
     F_bins = n_fft // 2 + 1
     hp = hop_length or (n_fft // 4)
-    frames = max(1, 1 + (ts_length + n_fft) // hp)
+    frames = max(1, 1 + ts_length // hp)
 
     # Interpolate to the required spectrogram shape.
     # bicubic requires (N, C, H, W) — add channel dim if needed.

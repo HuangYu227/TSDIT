@@ -136,11 +136,12 @@ class TIGERGenerator(nn.Module):
         if is_train:
             t = torch.randint(0, self.num_steps, [B], device=self.device)
 
-            # CFG: randomly drop text conditioning during training
+            # CFG: randomly drop text conditioning per-sample during training
             cfg_dropout = self.config["condition"].get("cfg_dropout", 0.0)
             if cfg_dropout > 0 and texts is not None:
-                if torch.rand(1).item() < cfg_dropout:
-                    texts = None
+                mask = torch.rand(B) < cfg_dropout
+                if mask.any():
+                    texts = [t if not m else "" for t, m in zip(texts, mask)]
 
             attr_emb = self.compute_condition(texts, B, t)
             return self._noise_estimation_loss(images, attr_emb, t)
@@ -151,7 +152,7 @@ class TIGERGenerator(nn.Module):
             attr_emb = self.compute_condition(texts, B, t)
             step_losses = self._noise_estimation_loss(images, attr_emb, t)
             for k, v in step_losses.items():
-                loss_acc[k] = loss_acc.get(k, 0.0) + v.item()
+                loss_acc[k] = loss_acc.get(k, 0.0) + v.detach()
 
         return {k: v / self.num_steps for k, v in loss_acc.items()}
 

@@ -546,7 +546,10 @@ class TIGERDiT(nn.Module):
             moe_grids = []
             for i in range(self.multipatch_num):
                 ps = base_patch * (patch_scale ** i)
-                moe_grids.append((image_size // ps, image_size // ps))
+                # Match ImagePatchEmbedding padding: ceil division
+                n_h = (image_size + ps - 1) // ps
+                n_w = (image_size + ps - 1) // ps
+                moe_grids.append((n_h, n_w))
 
             self.residual_layers = nn.ModuleList()
             for base_layer in _base_layers:

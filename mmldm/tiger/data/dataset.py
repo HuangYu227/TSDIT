@@ -131,18 +131,18 @@ class TIGERDataset(Dataset):
         ts_tensor = torch.tensor(self.ts_data[:self.n_samples], dtype=torch.float32)
         if ts_tensor.ndim == 1:
             ts_tensor = ts_tensor.unsqueeze(0)
-        
-        # Normalize to [0,1] per sample
-        ts_min = ts_tensor.min(dim=-1, keepdim=True).values
-        ts_max = ts_tensor.max(dim=-1, keepdim=True).values
-        ts_range = ts_max - ts_min
-        ts_range = torch.clamp(ts_range, min=1e-8)
-        ts_norm = (ts_tensor - ts_min) / ts_range
-        
-        self.images, self.norm_params = self.ts_to_image.encode(ts_norm)
-        self.ts_norm = ts_norm
-        self.ts_min = ts_min
-        self.ts_max = ts_max
+
+        # Pass raw data to encoder; it handles normalization internally
+        # and returns correct NormParams with original-scale min/max
+        self.images, self.norm_params = self.ts_to_image.encode(ts_tensor)
+
+        # Store per-sample normalized TS for training
+        ts_min = self.norm_params.min_val.unsqueeze(-1)
+        ts_max = self.norm_params.max_val.unsqueeze(-1)
+        ts_range = (ts_max - ts_min).clamp(min=1e-8)
+        self.ts_norm = (ts_tensor - ts_min) / ts_range
+        self.ts_min = self.norm_params.min_val
+        self.ts_max = self.norm_params.max_val
         print(f"Images computed: {self.images.shape}")
 
     def __len__(self):

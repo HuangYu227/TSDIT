@@ -224,7 +224,7 @@ class DynamicCausalGraphLearner(nn.Module):
         # not just the average (mean could be 0 with positive/negative cancellation)
         expm = torch.linalg.matrix_exp(W_sq)  # (B, M, M) batched
         h = expm.diagonal(dim1=-2, dim2=-1).sum(dim=-1) - M  # (B,)
-        notears_loss = (h * h).max()  # max ensures every sample is constrained
+        notears_loss = (h * h).mean()  # mean for smoother gradient flow
         sparsity_loss = A.mean()
         return A, notears_loss, sparsity_loss
 

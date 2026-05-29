@@ -61,8 +61,12 @@ class TIGEREvaluator:
             "condition": config["condition"],
         }
         self.model = TIGERGenerator(model_config)
-        state = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(state)
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        # Support both old (state_dict only) and new (dict) checkpoint formats
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            self.model.load_state_dict(ckpt["model"])
+        else:
+            self.model.load_state_dict(ckpt)
         self.model.eval()
 
         # Image -> TS decoder

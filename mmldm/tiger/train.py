@@ -222,6 +222,13 @@ class WarmupCosineScheduler:
     def get_lr(self):
         return self.optimizer.param_groups[0]["lr"]
 
+    def state_dict(self) -> dict:
+        return {"step_count": self.step_count, "base_lrs": self.base_lrs}
+
+    def load_state_dict(self, d: dict):
+        self.step_count = d["step_count"]
+        self.base_lrs = d["base_lrs"]
+
 
 # ---------------------------------------------------------------------------
 # Evaluation metrics
@@ -522,7 +529,7 @@ class TIGERTrainer:
         ds = self.val_loader.dataset
         g_min = ds.global_ts_min
         g_max = ds.global_ts_max
-        g_range = g_max - g_min if g_max != g_min else 1.0
+        g_range = max(g_max - g_min, 1e-8)
 
         all_real, all_gen, all_texts = [], [], []
         for batch in self.val_loader:
