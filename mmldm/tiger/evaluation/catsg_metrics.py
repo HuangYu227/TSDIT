@@ -47,7 +47,7 @@ def compute_mdd(real: np.ndarray, gen: np.ndarray, n_bins: int = 20) -> float:
         delta = b[1:2] - b[:1]
         loc = 0.5 * (b[1:] + b[:-1])
 
-        x_ti = gen_t[:, t].contiguous().view(-1, 1).repeat(1, loc.shape[1])
+        x_ti = gen_t[:, t].contiguous().view(-1, 1).repeat(1, loc.shape[0])
         dist = torch.abs(x_ti - loc)
         left_counter = ((delta / 2. - (loc - x_ti)) == 0.).float()
         counter = (torch.relu(delta / 2. - dist) > 0.).float() + left_counter
