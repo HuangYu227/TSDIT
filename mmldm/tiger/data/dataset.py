@@ -101,16 +101,17 @@ class TIGERDataset(Dataset):
         # Text captions
         caps = [[t] for t in df["Text"].tolist()]  # wrap in list for consistency
 
-        # Train/test split: 99% train, 1% test (same as T2S)
-        n = len(ts_data)
-        rng = np.random.RandomState(123)
-        perm = rng.permutation(n)
-        n_train = int(np.ceil(n * 0.99))
-
-        if self.split == "train":
-            idx = perm[:n_train]
-        else:  # valid/test
-            idx = perm[n_train:]
+        # Split: use 'split' column if available (CaTSG), otherwise random 99/1
+        if "split" in df.columns:
+            split_map = {"train": "train", "val": "test", "test": "test"}
+            mask = df["split"].map(split_map).fillna("train") == self.split
+            idx = np.where(mask.values)[0]
+        else:
+            n = len(ts_data)
+            rng = np.random.RandomState(123)
+            perm = rng.permutation(n)
+            n_train = int(np.ceil(n * 0.99))
+            idx = perm[:n_train] if self.split == "train" else perm[n_train:]
 
         self.ts_data = ts_data[idx]
         self.caps = np.array([caps[i] for i in idx], dtype=object)
@@ -119,6 +120,10 @@ class TIGERDataset(Dataset):
         self.n_samples = len(self.ts_data)
         self.n_steps = self.ts_data.shape[1]
         self.time_points = np.arange(self.n_steps)
+
+        # Global min/max for scale-leakage-free denormalization
+        self.global_ts_min = float(np.min(self.ts_data))
+        self.global_ts_max = float(np.max(self.ts_data))
 
     def _precompute_images(self):
         """Pre-compute GAF/STFT/RP images for all samples."""

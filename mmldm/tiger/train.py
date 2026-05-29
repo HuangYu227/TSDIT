@@ -512,6 +512,12 @@ class TIGERTrainer:
         image_size = dc["image_size"]
         image_shape = (3, image_size, image_size)
 
+        # Global min/max for scale-leakage-free comparison
+        ds = self.train_loader.dataset
+        g_min = ds.global_ts_min
+        g_max = ds.global_ts_max
+        g_range = g_max - g_min if g_max != g_min else 1.0
+
         all_real, all_gen, all_texts = [], [], []
         for batch in self.val_loader:
             texts = batch.get("cap", None)
@@ -523,7 +529,14 @@ class TIGERTrainer:
             gen_img = gen_imgs[0]
             norm_params = NormParams(min_val=ts_min, max_val=ts_max, n_vars=1, original_length=ts_len)
             gen_ts = self.decoder.decode(gen_img, ts_len, norm_params)
+
+            # Denormalize real, then both normalize to global [0,1] for fair comparison
             real_ts = denormalize_ts_batch(ts_real, ts_min, ts_max)
+            real_global = (real_ts - g_min) / g_range
+            gen_global = (gen_ts - g_min) / g_range
+
+            all_real.append(real_global.cpu().numpy())
+            all_gen.append(gen_global.cpu().numpy())
 
             if real_ts.shape != gen_ts.shape:
                 raise RuntimeError(

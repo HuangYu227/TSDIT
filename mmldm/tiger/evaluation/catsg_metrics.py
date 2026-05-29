@@ -168,13 +168,19 @@ def compute_jftsd(real, gen, cond, emb_dim=64, train_steps=200, device="cpu"):
                                   z_gen.mean(0), torch.cov(z_gen.T))
 
 
-def compute_all_catsg_metrics(real, gen, cond=None, device="cpu"):
-    """Compute all CaTSG metrics. Returns dict with MDD, KL, MMD, [J-FTSD]."""
+def compute_all_catsg_metrics(real, gen, cond=None, device="cpu", include_jftsd=False):
+    """Compute all CaTSG metrics. Returns dict with MDD, KL, MMD, [J-FTSD].
+
+    Args:
+        include_jftsd: If True, compute J-FTSD (slow, ~200 training steps).
+                       Default False for training-time metrics; set True for
+                       final evaluation only.
+    """
     metrics = {
         "MDD": compute_mdd(real, gen),
         "KL": compute_kl(real, gen),
         "MMD": compute_mmd(real, gen),
     }
-    if cond is not None:
+    if include_jftsd and cond is not None:
         metrics["J-FTSD"] = compute_jftsd(real, gen, cond, device=device)
     return metrics
