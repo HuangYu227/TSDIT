@@ -31,6 +31,13 @@ def gasf_to_ts(gasf: torch.Tensor, ts_length: int) -> torch.Tensor:
     The diagonal satisfies G_tt = cos(2 * arccos(x_t)), so
         x_t = sqrt((G_tt + 1) / 2).
 
+    .. warning::
+        This reconstruction is **exact only for the original (non-resized)
+        GASF matrix**.  If the GASF was resized (e.g., via bicubic
+        interpolation to a fixed image size), the diagonal pixels are
+        interpolated and the formula is only approximate.  See
+        :meth:`TSToImageEncoder._compute_gasf` for details.
+
     Args:
         gasf: (..., H, W) GASF image with values in [0, 1] (mapped from [-1,1]).
         ts_length: desired output length T.

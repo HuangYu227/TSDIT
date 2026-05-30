@@ -19,13 +19,15 @@ class TIGERDataset(Dataset):
     def __init__(self, data_dir, split="train", dataset_type="weather_npy",
                  datasets=None, time_interval=24, max_samples=None,
                  image_size=64, n_fft=64, hop_length=8, epsilon_quantile=0.1,
-                 seed=123):
+                 seed=123, split_ratio=(0.8, 0.1, 0.1)):
         super().__init__()
         self.data_dir = data_dir
         self.split = split
         self.dataset_type = dataset_type
         self.image_size = image_size
         self.max_samples = max_samples
+        self.seed = seed
+        self.split_ratio = split_ratio  # (train, val, test) for CSV without 'split' column
 
         # TS→Image encoder
         self.ts_to_image = TSToImageEncoder(
@@ -59,6 +61,11 @@ class TIGERDataset(Dataset):
         self.n_samples = self.ts_data.shape[0]
         self.n_steps = self.ts_data.shape[1]
         self.time_points = np.arange(self.n_steps)
+
+        # Global min/max for T2S metric normalization on [0,1] scale.
+        # Must be present for _compute_gen_metrics (same contract as _load_csv).
+        self.global_ts_min = float(np.min(self.ts_data))
+        self.global_ts_max = float(np.max(self.ts_data))
 
     def _load_csv(self, datasets, time_interval):
         """Load T2S-style CSV dataset.
@@ -101,17 +108,27 @@ class TIGERDataset(Dataset):
         # Text captions
         caps = [[t] for t in df["Text"].tolist()]  # wrap in list for consistency
 
-        # Split: use 'split' column if available (CaTSG), otherwise random 99/1
+        # Split: use 'split' column if available (CaTSG), otherwise random split.
+        # The random split uses split_ratio (default 80/10/10) for a proper
+        # three-way partition, matching the project's split_dataset.py convention.
         if "split" in df.columns:
-            split_map = {"train": "train", "val": "test", "test": "test"}
+            split_map = {"train": "train", "val": "val", "test": "test"}
             mask = df["split"].map(split_map).fillna("train") == self.split
             idx = np.where(mask.values)[0]
         else:
             n = len(ts_data)
-            rng = np.random.RandomState(123)
+            rng = np.random.RandomState(self.seed)
             perm = rng.permutation(n)
-            n_train = int(np.ceil(n * 0.99))
-            idx = perm[:n_train] if self.split == "train" else perm[n_train:]
+            r_train, r_val, r_test = self.split_ratio
+            n_train = int(n * r_train)
+            n_val  = int(n * r_val)
+            # test gets the remainder (avoids off-by-one from float rounding)
+            if self.split == "train":
+                idx = perm[:n_train]
+            elif self.split in ("val", "valid"):
+                idx = perm[n_train : n_train + n_val]
+            else:  # "test"
+                idx = perm[n_train + n_val :]
 
         self.ts_data = ts_data[idx]
         self.caps = np.array([caps[i] for i in idx], dtype=object)

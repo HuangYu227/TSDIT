@@ -58,7 +58,9 @@ def compute_mdd(real: np.ndarray, gen: np.ndarray, n_bins: int = 20) -> float:
             # Compute density from generated data (same as HistoLoss.compute())
             x_ti = gen_t[:, t, i].contiguous().view(-1, 1).repeat(1, loc.shape[1])
             dist = torch.abs(x_ti - loc)
-            left_counter = ((delta / 2. - (loc - x_ti)) == 0.).float()
+            # Use a tolerance-based boundary check instead of exact equality,
+            # which is virtually never true for floating-point values.
+            left_counter = ((delta / 2. - (loc - x_ti)).abs() < 1e-8).float()
             counter = (torch.relu(delta / 2. - dist) > 0.).float() + left_counter
             density = counter.mean(0) / delta
             abs_metric = torch.abs(density - d_r)
@@ -170,8 +172,8 @@ def compute_jftsd(real, gen, cond, emb_dim=64, train_steps=200, device="cpu"):
     with torch.no_grad():
         z_real = torch.cat([x_enc(real), c_enc(cond)], dim=-1)
         z_gen = torch.cat([x_enc(gen), c_enc(cond)], dim=-1)
-        return _frechet_distance(z_real.mean(0), torch.cov(z_real.T),
-                                  z_gen.mean(0), torch.cov(z_gen.T))
+        return _frechet_distance(z_real.mean(0), torch.cov(z_real),
+                                  z_gen.mean(0), torch.cov(z_gen))
 
 
 def compute_all_catsg_metrics(real, gen, cond=None, device="cpu", include_jftsd=False):

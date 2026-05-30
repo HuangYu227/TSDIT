@@ -244,7 +244,17 @@ class TSToImageEncoder:
         return ts, True
 
     def _compute_gasf(self, ts_norm: torch.Tensor) -> torch.Tensor:
-        """GASF channel.  Input (B, T) in [0,1], output (B, 1, H, W)."""
+        """GASF channel.  Input (B, T) in [0,1], output (B, 1, H, W).
+
+        .. note::
+            The GASF matrix is resized to ``image_size x image_size`` via
+            bicubic interpolation.  This means the diagonal values used by
+            :func:`gasf_to_ts` are interpolated (a weighted blend of nearby
+            GASF entries), not the exact original diagonal.  The TS→image→TS
+            round-trip is therefore **approximate**, not exact.  The
+            reconstruction fidelity depends on how much ``image_size``
+            differs from the original series length ``T``.
+        """
         gasf = ts_to_gasf(ts_norm)                       # (B, T, T)
         gasf = self._resize(gasf)                         # (B, img, img)
         # Map from [-1, 1] to [0, 1] for image range.
@@ -340,16 +350,18 @@ class TSToImageEncoder:
         ts_2d, is_multi, n_vars = self._to_2d(ts)
         B_flat, T = ts_2d.shape
 
-        min_len = max(self.n_fft, 4)
-        ts_2d, _ = self._pad_short(ts_2d, min_len)
-
+        # Normalize FIRST (before any padding) — consistent with encode().
         ts_norm, min_val, max_val = _normalize_01(ts_2d)
         ts_norm = torch.nan_to_num(ts_norm, nan=0.0, posinf=1.0, neginf=0.0)
+
+        # Pad only for STFT (requires at least n_fft samples).
+        min_len = max(self.n_fft, 4)
+        ts_padded, _ = self._pad_short(ts_norm, min_len)
 
         if channel == "gasf":
             ch = self._compute_gasf(ts_norm)
         elif channel == "stft":
-            ch = self._compute_stft(ts_2d)
+            ch = self._compute_stft(ts_padded)
         elif channel == "rp":
             ch = self._compute_rp(ts_norm)
         else:

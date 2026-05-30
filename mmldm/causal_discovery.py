@@ -361,9 +361,10 @@ class CausalMechanismTransition(nn.Module):
         Returns:
             updated_states: K x (L_total, latent_dim)
         """
-        # Ensure regime is 2-D: (B, regime_dim)
+        # Ensure regime is 2-D with one row per sample: (B, regime_dim)
         if regime.ndim == 1:
-            regime = regime.unsqueeze(0)  # (1, regime_dim)
+            B = ts_shape.shape[0]
+            regime = regime.unsqueeze(0).expand(B, -1)  # (B, regime_dim)
 
         # Expand regime to per-token: (L_total, regime_dim)
         regime_expanded = self._expand_regime(regime, ts_shape)

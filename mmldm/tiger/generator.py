@@ -95,6 +95,18 @@ class TIGERGenerator(nn.Module):
             text_emb = self.encode_text([""] * batch_size)
         return self.cond_projector(text_emb, diffusion_step)
 
+    def compute_condition_from_emb(self, text_emb, diffusion_step):
+        """Compute condition from pre-encoded text embeddings.
+
+        Avoids re-encoding text every diffusion timestep during generation.
+        Training uses :meth:`compute_condition` instead.
+
+        Args:
+            text_emb: (B, N_tokens, text_emb) pre-encoded text embeddings.
+            diffusion_step: (B,) integer timestep tensor.
+        """
+        return self.cond_projector(text_emb, diffusion_step)
+
     def _noise_estimation_loss(self, x, attr_emb, t):
         """Compute noise estimation loss for a given timestep."""
         noise = torch.randn_like(x)
@@ -146,15 +158,11 @@ class TIGERGenerator(nn.Module):
             attr_emb = self.compute_condition(texts, B, t)
             return self._noise_estimation_loss(images, attr_emb, t)
 
-        loss_acc = {}
-        for step in range(self.num_steps):
-            t = torch.full((B,), step, device=self.device, dtype=torch.long)
-            attr_emb = self.compute_condition(texts, B, t)
-            step_losses = self._noise_estimation_loss(images, attr_emb, t)
-            for k, v in step_losses.items():
-                loss_acc[k] = loss_acc.get(k, 0.0) + v.detach()
-
-        return {k: v / self.num_steps for k, v in loss_acc.items()}
+        # Eval mode: sample a single random timestep per batch for efficiency.
+        # Looping over all num_steps would make validation ~50x slower than training.
+        t = torch.randint(0, self.num_steps, [B], device=self.device)
+        attr_emb = self.compute_condition(texts, B, t)
+        return self._noise_estimation_loss(images, attr_emb, t)
 
     @torch.no_grad()
     def generate(self, image_shape, texts, n_samples=1, sampler="ddim",
@@ -177,17 +185,27 @@ class TIGERGenerator(nn.Module):
         samples = []
         use_cfg = guidance_scale > 1.0 and texts is not None
 
+        # Pre-encode text embeddings ONCE (CLIP encoding is expensive and
+        # its output does not depend on the diffusion timestep).
+        if texts is not None:
+            text_emb = self.encode_text(texts)
+        else:
+            text_emb = self.encode_text([""] * B)
+
+        if use_cfg:
+            uncond_emb = self.encode_text([""] * B)
+
         for i in range(n_samples):
             x = torch.randn(sample_shape, device=self.device)
             for step in range(self.num_steps - 1, -1, -1):
                 noise = torch.randn_like(x)
                 t = torch.full((B,), step, device=self.device, dtype=torch.long)
-                attr_emb = self.compute_condition(texts, B, t)
+                attr_emb = self.compute_condition_from_emb(text_emb, t)
                 pred_noise = self.dit(x, t, attr_emb)
 
                 # CFG: blend conditional and unconditional predictions
                 if use_cfg:
-                    attr_uncond = self.compute_condition(None, B, t)
+                    attr_uncond = self.compute_condition_from_emb(uncond_emb, t)
                     pred_uncond = self.dit(x, t, attr_uncond)
                     pred_noise = pred_uncond + guidance_scale * (pred_noise - pred_uncond)
 

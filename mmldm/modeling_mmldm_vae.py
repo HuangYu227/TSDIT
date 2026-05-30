@@ -296,7 +296,7 @@ class MultiResolutionFFTLoss(nn.Module):
                                  win_length=n_fft, window=win, return_complex=True)
                 loss_n = loss_n + F.l1_loss(s_r.real, s_t.real) + F.l1_loss(s_r.imag, s_t.imag)
             losses.append(loss_n / recon.shape[1])
-        return torch.stack(losses).mean()
+        return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=recon.device, dtype=recon.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +484,11 @@ class MMLDMVAEModel(PreTrainedModel):
             self.period_proj = nn.Conv1d(config.dim, self.period_dim * mul, kernel_size=1)
             self.residual_proj = nn.Conv1d(config.dim, self.residual_dim * mul, kernel_size=1)
 
-            self.band_boundaries = nn.Parameter(torch.tensor([0.0, 0.7]))  # pre-sigmoid
+            # Pre-sigmoid band boundaries for tri-band frequency decomposition.
+            # After sigmoid, boundaries map to actual frequency fractions.
+            # sigmoid(-1.4) ≈ 0.20, sigmoid(-0.5) ≈ 0.38 — both within [0, 0.5] (Nyquist).
+            # Trend: [0, 0.20), Period: [0.20, 0.38), Residual: [0.38, 0.5]
+            self.band_boundaries = nn.Parameter(torch.tensor([-1.4, -0.5]))
             self.poe_fusion = ProductOfExperts()
         else:
             # Dual-band: trend (low) + residual (high)

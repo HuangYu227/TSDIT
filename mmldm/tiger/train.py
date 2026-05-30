@@ -304,10 +304,16 @@ class TIGERTrainer:
             datasets=dc.get("datasets"),
             time_interval=dc.get("time_interval", 24),
         )
-        val_ds = TIGERDataset(split="valid" if dc["dataset_type"] == "weather_npy" else "test",
-                              **common)
+        # ── split naming ──────────────────────────────────────────────────
+        # Weather   .npy files: train / valid / test
+        # CSV       with 'split' column: train / val / test
+        # CSV       without 'split' column: random three-way split via split_ratio
+        val_name = "valid" if dc["dataset_type"] == "weather_npy" else "val"
+        # ────────────────────────────────────────────────────────────────────
 
         collate = TIGERCollateFn()
+
+        # --- train split ---
         if self.config.get("eval_only", False):
             self.train_loader = None
             self.train_dataset = None
@@ -319,8 +325,18 @@ class TIGERTrainer:
                 drop_last=True,
             )
             self.train_dataset = train_ds
+
+        # --- validation split (for early stopping / hyperparameter selection) ---
+        val_ds = TIGERDataset(split=val_name, **common)
         self.val_loader = DataLoader(
             val_ds, batch_size=self.config["batch_size"],
+            shuffle=False, collate_fn=collate, num_workers=0,
+        )
+
+        # --- test split (held out; only used by evaluate_only / evaluator.py) ---
+        test_ds = TIGERDataset(split="test", **common)
+        self.test_loader = DataLoader(
+            test_ds, batch_size=self.config["batch_size"],
             shuffle=False, collate_fn=collate, num_workers=0,
         )
 
@@ -347,9 +363,17 @@ class TIGERTrainer:
             ckpt = torch.load(self.config["model_path"], map_location=self.device)
             # Support both old (state_dict only) and new (dict) checkpoint formats
             if isinstance(ckpt, dict) and "model" in ckpt:
-                self.model.load_state_dict(ckpt["model"], strict=False)
+                missing, unexpected = self.model.load_state_dict(ckpt["model"], strict=False)
+                if missing:
+                    print(f"WARNING: Checkpoint missing keys ({len(missing)}): {missing[:5]}...")
+                if unexpected:
+                    print(f"WARNING: Checkpoint unexpected keys ({len(unexpected)}): {unexpected[:5]}...")
             else:
-                self.model.load_state_dict(ckpt, strict=False)
+                missing, unexpected = self.model.load_state_dict(ckpt, strict=False)
+                if missing:
+                    print(f"WARNING: Checkpoint missing keys ({len(missing)}): {missing[:5]}...")
+                if unexpected:
+                    print(f"WARNING: Checkpoint unexpected keys ({len(unexpected)}): {unexpected[:5]}...")
 
     # ---- optimizer ----------------------------------------------------------
 
@@ -399,6 +423,9 @@ class TIGERTrainer:
 
             epoch_metrics = {"epoch": epoch + 1, "train_loss": train_loss}
 
+            # Append BEFORE _validate so gen_metrics merge targets the current epoch.
+            self.metrics_history.append(epoch_metrics)
+
             if (epoch + 1) % self.val_interval == 0:
                 val_loss = self._validate(epoch)
                 epoch_metrics["val_loss"] = val_loss
@@ -407,7 +434,6 @@ class TIGERTrainer:
             if (epoch + 1) % self.save_interval == 0:
                 self._save_checkpoint(epoch, tag=f"epoch_{epoch+1}")
 
-            self.metrics_history.append(epoch_metrics)
             with open(self.metrics_path, "w") as f:
                 json.dump(self.metrics_history, f, indent=2)
 
@@ -415,24 +441,58 @@ class TIGERTrainer:
         print("Training complete.")
 
     def evaluate_only(self):
-        """Evaluate a checkpoint without training or writing checkpoint files."""
+        """Evaluate a checkpoint on the HELD-OUT TEST SET.
+
+        The test set is never used during training or hyperparameter selection
+        (which use val_loader).  This method is for final checkpoint evaluation
+        only — it reports metrics on data the model has never seen.
+        """
         if not self.config.get("model_path"):
             raise ValueError("--eval_only requires --model_path")
 
-        print("Starting eval-only run")
-        print(f"  Eval samples: {len(self.val_loader.dataset)}")
+        print("Starting eval-only run on TEST SET (held-out data)")
+        print(f"  Test samples: {len(self.test_loader.dataset)}")
         print(f"  Batch size:   {self.config['batch_size']}")
         print(f"  Device:       {self.device}")
         print(f"  Checkpoint:   {self.config['model_path']}")
 
-        val_loss = self._validate(
+        self.model.eval()
+        total_loss = 0.0
+        num_batches = 0
+
+        for batch in tqdm(self.test_loader, desc="Evaluating on test"):
+            loss_dict = self.model(batch, is_train=False)
+            if not torch.isfinite(loss_dict["all"]):
+                print("WARNING: NaN/INF test loss, skipping batch")
+                continue
+            total_loss += loss_dict["all"].item()
+            num_batches += 1
+
+        avg_loss = total_loss / num_batches if num_batches else float("inf")
+        self.writer.add_scalar("test/loss", avg_loss, 0)
+        print(f"Test loss = {avg_loss:.6f}")
+
+        # Compute full gen metrics on test set
+        gen_metrics = self._compute_gen_metrics(
             epoch=0,
-            save_best=False,
-            force_gen_metrics=True,
+            loader=self.test_loader,
+            prefix="test",
         )
+        for k, v in gen_metrics.items():
+            self.writer.add_scalar(f"test/{k}", v, 0)
+
         self.writer.close()
-        print(f"Eval complete. val_loss={val_loss:.6f}")
-        return val_loss
+        print(f"Eval complete. test_loss={avg_loss:.6f}")
+
+        # Save results
+        results = {"test_loss": avg_loss, **gen_metrics}
+        results_path = os.path.join(
+            self.config.get("log_dir", "."), "test_results.json",
+        )
+        with open(results_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"Test results saved to {results_path}")
+        return results
 
     def _train_epoch(self, epoch: int) -> float:
         self.model.train()
@@ -450,7 +510,15 @@ class TIGERTrainer:
             self.optimizer.zero_grad()
             loss_dict = self.model(batch, is_train=True)
             loss = loss_dict["all"]
-            if not torch.isfinite(loss) or loss.item() < 1e-7:
+            # Skip NaN/Inf (caught by isfinite) and genuine underflow.
+            # Threshold of 1e-15 is safely below any legitimate float32 loss:
+            # float32 machine epsilon is ~1.19e-7, but loss values near 0 are
+            # well-represented in float32 (smallest normalized ~1.17e-38).
+            # 1e-15 catches values approaching the subnormal range while
+            # allowing well-converged models to keep learning at low LR.
+            # The NaN/Inf check and the gradient-finiteness check below already
+            # catch the real problems.
+            if not torch.isfinite(loss) or loss.item() < 1e-15:
                 reason = "NaN/INF" if not torch.isfinite(loss) else "underflow"
                 num_skipped += 1
                 current_lr = self.scheduler.get_lr()
@@ -508,29 +576,43 @@ class TIGERTrainer:
         epoch: int,
         save_best: bool = True,
         force_gen_metrics: bool = False,
+        loader: DataLoader | None = None,
+        prefix: str = "val",
     ) -> float:
+        """Compute loss on a data loader (default: val_loader).
+
+        Args:
+            epoch: current epoch (for TensorBoard logging).
+            save_best: whether to save a best checkpoint.
+            force_gen_metrics: compute gen metrics regardless of interval.
+            loader: data loader to evaluate (defaults to self.val_loader).
+            prefix: log prefix ("val" or "test").
+        """
+        if loader is None:
+            loader = self.val_loader
+
         self.model.eval()
         total_loss = 0.0
         num_batches = 0
 
-        for batch in tqdm(self.val_loader, desc="Validating"):
+        for batch in tqdm(loader, desc=f"Evaluating ({prefix})"):
             loss_dict = self.model(batch, is_train=False)
             if not torch.isfinite(loss_dict["all"]):
-                print("WARNING: NaN/INF validation loss, skipping batch")
+                print(f"WARNING: NaN/INF {prefix} loss, skipping batch")
                 continue
             total_loss += loss_dict["all"].item()
             num_batches += 1
 
         avg_loss = total_loss / num_batches if num_batches else float("inf")
-        self.writer.add_scalar("val/loss", avg_loss, epoch)
-        print(f"         | val_loss  ={avg_loss:.6f}")
+        self.writer.add_scalar(f"{prefix}/loss", avg_loss, epoch)
+        print(f"         | {prefix}_loss  ={avg_loss:.6f}")
 
         # MSE/MAPE every eval_gen_interval.
         # Eval-only forces generation metrics so a checkpoint validation is useful.
         do_gen_metrics = force_gen_metrics or (epoch + 1) % self.eval_gen_interval == 0
         gen_metrics = {}
         if do_gen_metrics:
-            gen_metrics = self._compute_gen_metrics(epoch)
+            gen_metrics = self._compute_gen_metrics(epoch, loader=loader, prefix=prefix)
 
         # Merge gen metrics into the latest metrics_history entry
         if self.metrics_history and gen_metrics:
@@ -546,9 +628,20 @@ class TIGERTrainer:
         return avg_loss
 
     @torch.no_grad()
-    def _compute_gen_metrics(self, epoch: int) -> dict:
+    def _compute_gen_metrics(
+        self, epoch: int, loader: DataLoader | None = None, prefix: str = "val",
+    ) -> dict:
         """Generate samples and compute MSE, MAPE, and CaTSG metrics.
-        Returns dict of computed metrics."""
+
+        Args:
+            epoch: current epoch (for TensorBoard logging).
+            loader: data loader (defaults to self.val_loader).
+            prefix: log prefix ("val" or "test").
+        Returns dict of computed metrics.
+        """
+        if loader is None:
+            loader = self.val_loader
+
         result = {}
         self.model.eval()
         dc = self.config["data"]
@@ -556,10 +649,8 @@ class TIGERTrainer:
         image_size = dc["image_size"]
         image_shape = (3, image_size, image_size)
 
-        # Global min/max for scale-leakage-free comparison
-        # Use val_loader.dataset (always available) instead of train_loader
-        # (which is None in eval-only mode)
-        ds = self.val_loader.dataset
+        # Global min/max for T2S [0,1]-scale metric normalization.
+        ds = loader.dataset
         g_min = ds.global_ts_min
         g_max = ds.global_ts_max
         g_range = max(g_max - g_min, 1e-8)
@@ -569,7 +660,7 @@ class TIGERTrainer:
         all_real_orig, all_gen_orig = [], []
         all_texts = []
 
-        for batch in self.val_loader:
+        for batch in loader:
             texts = batch.get("cap", None)
             ts_real = batch["ts"].to(self.device).float()
             ts_min = _squeeze_trailing_singletons(batch["ts_min"].to(self.device).float())
@@ -615,9 +706,9 @@ class TIGERTrainer:
         mse = calc_mse(real_01, gen_01)
         mape = calc_mape(real_01, gen_01)
         wape = calc_wape(real_01, gen_01)
-        self.writer.add_scalar("val/MSE", mse, epoch)
-        self.writer.add_scalar("val/MAPE", mape, epoch)
-        self.writer.add_scalar("val/WAPE", wape, epoch)
+        self.writer.add_scalar(f"{prefix}/MSE", mse, epoch)
+        self.writer.add_scalar(f"{prefix}/MAPE", mape, epoch)
+        self.writer.add_scalar(f"{prefix}/WAPE", wape, epoch)
         result.update({"MSE": mse, "MAPE": mape, "WAPE": wape})
 
         msg = f"         | MSE={mse:.6f} | MAPE={mape:.4f} | WAPE={wape:.4f}"
@@ -627,7 +718,7 @@ class TIGERTrainer:
             from .evaluation.catsg_metrics import compute_all_catsg_metrics
             catsg = compute_all_catsg_metrics(real_orig, gen_orig, cond=cond_np, device=self.device)
             for k, v in catsg.items():
-                self.writer.add_scalar(f"val/{k}", v, epoch)
+                self.writer.add_scalar(f"{prefix}/{k}", v, epoch)
                 result[k] = v
             msg += f" | MDD={catsg['MDD']:.4f} KL={catsg['KL']:.4f} MMD={catsg['MMD']:.6f}"
             if "J-FTSD" in catsg:

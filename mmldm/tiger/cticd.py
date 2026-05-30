@@ -220,8 +220,8 @@ class DynamicCausalGraphLearner(nn.Module):
         A = A * (1.0 - eye)
         W_sq = A * A
         # NOTEARS: tr(exp(A∘A)) - M = 0 guarantees DAG
-        # Use max(h²) instead of mean(h²) to ensure ALL samples are DAGs,
-        # not just the average (mean could be 0 with positive/negative cancellation)
+        # We use mean(h²) for smoother gradient flow.  Using max(h²) would
+        # enforce per-sample DAG more strictly but produces sparser gradients.
         expm = torch.linalg.matrix_exp(W_sq)  # (B, M, M) batched
         h = expm.diagonal(dim1=-2, dim2=-1).sum(dim=-1) - M  # (B,)
         notears_loss = (h * h).mean()  # mean for smoother gradient flow
@@ -429,15 +429,21 @@ class CTICD(nn.Module):
             causal_features = GradientScale.apply(causal_features, self.branch_grad_scale)
 
         # Losses
+        # ──────────────────────────────────────────────────────────────────
+        # DESIGN NOTE (M3 in code audit):
+        #   L_causal = MSE(updated, raw.detach()) is an information-preservation
+        #   regularizer, NOT a true causal prediction loss.  A trivial solution
+        #   (A = 0, transition = identity) minimizes ALL three CTICD losses
+        #   simultaneously.  The ONLY signal preventing this collapse is the
+        #   diffusion gradient backpropagating through GradientScale(0.2).
+        #
+        #   For true causal semantics, paired states (e.g., t and t+1) or a
+        #   contrastive/counterfactual formulation would be needed.  In the
+        #   single-image setting, the module functions as a structured
+        #   regularizer with a DAG bottleneck, not a causal discovery module.
+        # ──────────────────────────────────────────────────────────────────
         # NOTE: raw.detach() prevents degeneration where model moves both
         # raw and updated to reduce loss without learning real causal mechanisms.
-        #
-        # Current design: L_causal encourages graph transition to preserve
-        # information from raw encoding. This is an information-preservation
-        # loss, not a true causal prediction loss. For true causal semantics,
-        # we would need temporal data (t and t+1 states) to predict changes.
-        # In the single-image setting, this serves as a regularizer ensuring
-        # the causal graph doesn't lose information from the original encoding.
         causal_loss = F.mse_loss(updated, raw.detach())
 
         total = (
