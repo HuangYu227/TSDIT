@@ -71,8 +71,14 @@ def compute_kl(real: np.ndarray, gen: np.ndarray, n_bins: int = 50) -> float:
     """KL divergence on flattened distributions (lower is better)."""
     real_flat = real.flatten()
     gen_flat = gen.flatten()
-    real_flat = real_flat[~np.isnan(real_flat)]
-    gen_flat = gen_flat[~np.isnan(gen_flat)]
+    # Joint NaN filtering: remove positions where EITHER array has NaN
+    valid_mask = ~(np.isnan(real_flat) | np.isnan(gen_flat))
+    real_flat = real_flat[valid_mask]
+    gen_flat = gen_flat[valid_mask]
+
+    n_dropped = np.sum(~valid_mask)
+    if n_dropped > 0:
+        print(f"WARNING: KL computation dropped {n_dropped} NaN values")
 
     hist_real, edge_real = np.histogram(real_flat, density=True, bins=n_bins)
     hist_gen, _ = np.histogram(gen_flat, density=True, bins=edge_real)

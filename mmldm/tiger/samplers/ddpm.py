@@ -30,4 +30,6 @@ class DDPMSampler(BaseSampler):
         denom = torch.sqrt(torch.clamp(1 - alpha_bar_t, min=1e-12))
         mean = (1 / torch.sqrt(alpha_t)) * (x - (beta_t / denom) * pred_noise)
         sigma = torch.sqrt(beta_t)
-        return mean + sigma * noise
+        # t=0 is the final step: return clean prediction without noise
+        mask = (t > 0).float().view(-1, 1, 1, 1)
+        return mask * (mean + sigma * noise) + (1 - mask) * mean
