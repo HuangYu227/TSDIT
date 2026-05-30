@@ -384,9 +384,18 @@ class TIGERTrainer:
         print(f"  Val samples:   {len(self.val_loader.dataset)}")
         print(f"  Batch size:    {self.config['batch_size']}")
         print(f"  Device:        {self.device}")
+        print(f"  Early stop lr: {self.config.get('early_stop_lr', 1e-6):.2e}")
 
         for epoch in range(self.n_epochs):
             train_loss = self._train_epoch(epoch)
+
+            # Early stopping signal
+            if not np.isfinite(train_loss):
+                print(f"\n{'='*60}")
+                print(f"TRAINING STOPPED EARLY at epoch {epoch + 1}")
+                print(f"Reason: Loss underflow/NaN at low learning rate")
+                print(f"{'='*60}")
+                break
 
             epoch_metrics = {"epoch": epoch + 1, "train_loss": train_loss}
 
@@ -429,7 +438,12 @@ class TIGERTrainer:
         self.model.train()
         total_loss = 0.0
         num_updates = 0
+        num_skipped = 0
         t0 = time.time()
+
+        # Early stopping config
+        early_stop_lr = self.config.get("early_stop_lr", 1e-6)
+        max_skip_ratio = self.config.get("max_skip_ratio", 0.5)
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}")
         for batch in pbar:
@@ -438,6 +452,12 @@ class TIGERTrainer:
             loss = loss_dict["all"]
             if not torch.isfinite(loss) or loss.item() < 1e-7:
                 reason = "NaN/INF" if not torch.isfinite(loss) else "underflow"
+                num_skipped += 1
+                current_lr = self.scheduler.get_lr()
+                if current_lr <= early_stop_lr:
+                    print(f"\nEARLY STOP: lr={current_lr:.2e} <= {early_stop_lr:.2e} and {reason} loss at step {self.global_step}")
+                    print(f"  Skipped {num_skipped}/{num_skipped + num_updates} batches this epoch")
+                    return float("inf")  # Signal to stop training
                 print(f"WARNING: {reason} loss={loss.item():.2e} at step {self.global_step}, skipping batch")
                 self.optimizer.zero_grad()
                 continue
@@ -445,6 +465,12 @@ class TIGERTrainer:
 
             grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             if not torch.isfinite(grad_norm):
+                num_skipped += 1
+                current_lr = self.scheduler.get_lr()
+                if current_lr <= early_stop_lr:
+                    print(f"\nEARLY STOP: lr={current_lr:.2e} <= {early_stop_lr:.2e} and NaN/INF grad at step {self.global_step}")
+                    print(f"  Skipped {num_skipped}/{num_skipped + num_updates} batches this epoch")
+                    return float("inf")  # Signal to stop training
                 print(f"WARNING: NaN/INF grad at step {self.global_step}, skipping optimizer step")
                 self.optimizer.zero_grad()
                 continue
@@ -462,11 +488,18 @@ class TIGERTrainer:
                 self.writer.add_scalar(f"train_step/{k}", v.item(), self.global_step)
             self.writer.add_scalar("train_step/lr", self.scheduler.get_lr(), self.global_step)
 
+        # Check skip ratio at end of epoch
+        total_batches = num_updates + num_skipped
+        skip_ratio = num_skipped / total_batches if total_batches > 0 else 0
+        if skip_ratio > max_skip_ratio:
+            print(f"\nWARNING: High skip ratio {skip_ratio:.1%} ({num_skipped}/{total_batches}) at epoch {epoch+1}")
+
         avg_loss = total_loss / max(1, num_updates)
         dt = time.time() - t0
-        print(f"Epoch {epoch+1:>4d} | train_loss={avg_loss:.6f} | lr={self.scheduler.get_lr():.2e} | {dt:.1f}s")
+        print(f"Epoch {epoch+1:>4d} | train_loss={avg_loss:.6f} | lr={self.scheduler.get_lr():.2e} | {dt:.1f}s | skipped={num_skipped}/{total_batches}")
 
         self.writer.add_scalar("train_epoch/loss", avg_loss, epoch)
+        self.writer.add_scalar("train_epoch/skip_ratio", skip_ratio, epoch)
         return avg_loss
 
     @torch.no_grad()
@@ -531,7 +564,11 @@ class TIGERTrainer:
         g_max = ds.global_ts_max
         g_range = max(g_max - g_min, 1e-8)
 
-        all_real, all_gen, all_texts = [], [], []
+        # Collect both scales: [0,1] for T2S metrics, original for CaTSG metrics
+        all_real_01, all_gen_01 = [], []
+        all_real_orig, all_gen_orig = [], []
+        all_texts = []
+
         for batch in self.val_loader:
             texts = batch.get("cap", None)
             ts_real = batch["ts"].to(self.device).float()
@@ -542,24 +579,26 @@ class TIGERTrainer:
             gen_img = gen_imgs[0]
             norm_params = NormParams(min_val=ts_min, max_val=ts_max, n_vars=1, original_length=ts_len)
             gen_ts = self.decoder.decode(gen_img, ts_len, norm_params)
-
-            # Denormalize real, then both normalize to global [0,1] for fair comparison
             real_ts = denormalize_ts_batch(ts_real, ts_min, ts_max)
-            real_global = (real_ts - g_min) / g_range
-            gen_global = (gen_ts - g_min) / g_range
 
             if real_ts.shape != gen_ts.shape:
                 raise RuntimeError(
                     f"Metric shape mismatch: real={tuple(real_ts.shape)}, gen={tuple(gen_ts.shape)}"
                 )
 
-            all_real.append(real_global.cpu().numpy())
-            all_gen.append(gen_global.cpu().numpy())
+            # T2S metrics: global [0,1] scale
+            all_real_01.append(((real_ts - g_min) / g_range).cpu().numpy())
+            all_gen_01.append(((gen_ts - g_min) / g_range).cpu().numpy())
+            # CaTSG metrics: original scale
+            all_real_orig.append(real_ts.cpu().numpy())
+            all_gen_orig.append(gen_ts.cpu().numpy())
             if texts is not None:
                 all_texts.extend(texts if isinstance(texts, list) else [texts])
 
-        real_np = np.concatenate(all_real, axis=0)
-        gen_np = np.concatenate(all_gen, axis=0)
+        real_01 = np.concatenate(all_real_01, axis=0)
+        gen_01 = np.concatenate(all_gen_01, axis=0)
+        real_orig = np.concatenate(all_real_orig, axis=0)
+        gen_orig = np.concatenate(all_gen_orig, axis=0)
 
         # Encode text embeddings for J-FTSD
         cond_np = None
@@ -568,12 +607,14 @@ class TIGERTrainer:
                 with torch.no_grad():
                     text_emb = self.model.encode_text(all_texts)
                 cond_np = text_emb.cpu().numpy()
-            except Exception:
+            except Exception as e:
+                print(f"WARNING: text encoding failed for J-FTSD: {e}")
                 cond_np = None
 
-        mse = calc_mse(real_np, gen_np)
-        mape = calc_mape(real_np, gen_np)
-        wape = calc_wape(real_np, gen_np)
+        # T2S metrics on global [0,1] scale
+        mse = calc_mse(real_01, gen_01)
+        mape = calc_mape(real_01, gen_01)
+        wape = calc_wape(real_01, gen_01)
         self.writer.add_scalar("val/MSE", mse, epoch)
         self.writer.add_scalar("val/MAPE", mape, epoch)
         self.writer.add_scalar("val/WAPE", wape, epoch)
@@ -581,10 +622,10 @@ class TIGERTrainer:
 
         msg = f"         | MSE={mse:.6f} | MAPE={mape:.4f} | WAPE={wape:.4f}"
 
-        # --- CaTSG metrics (MDD, KL, MMD, J-FTSD) ---
+        # CaTSG metrics on original scale (matches CaTSG paper evaluation)
         try:
             from .evaluation.catsg_metrics import compute_all_catsg_metrics
-            catsg = compute_all_catsg_metrics(real_np, gen_np, cond=cond_np, device=self.device)
+            catsg = compute_all_catsg_metrics(real_orig, gen_orig, cond=cond_np, device=self.device)
             for k, v in catsg.items():
                 self.writer.add_scalar(f"val/{k}", v, epoch)
                 result[k] = v
