@@ -322,7 +322,7 @@ class TIGERTrainer:
         self.val_interval = config["val_interval"]
         self.display_interval = config["display_interval"]
         self.save_interval = config["save_interval"]
-        self.eval_gen_interval = config.get("eval_gen_interval", 3)  # gen metrics every 3 epochs
+        self.eval_gen_interval = config.get("eval_gen_interval", config.get("val_interval", 10))
 
         if not config.get("eval_only", False):
             os.makedirs(config["save_dir"], exist_ok=True)
