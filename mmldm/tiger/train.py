@@ -294,11 +294,6 @@ def calc_mse(real: np.ndarray, gen: np.ndarray) -> float:
     return float(np.mean((real - gen) ** 2))
 
 
-def calc_mape(real: np.ndarray, gen: np.ndarray, eps: float = 1e-3) -> float:
-    """MAPE between real and generated time series. Both (B, T)."""
-    return float(np.mean(np.abs(real - gen) / np.maximum(np.abs(real), eps)))
-
-
 def calc_wape(real: np.ndarray, gen: np.ndarray) -> float:
     """WAPE: sum(|real - gen|) / sum(|real|). T2S style."""
     return float(np.sum(np.abs(real - gen)) / (np.sum(np.abs(real)) + 1e-8))
@@ -712,7 +707,7 @@ class TIGERTrainer:
         self.writer.add_scalar(f"{prefix}/loss", avg_loss, epoch)
         print(f"         | {prefix}_loss  ={avg_loss:.6f}")
 
-        # MSE/MAPE every eval_gen_interval.
+        # MSE_01/WAPE_01 every eval_gen_interval.
         # Eval-only forces generation metrics so a checkpoint validation is useful.
         do_gen_metrics = force_gen_metrics or (epoch + 1) % self.eval_gen_interval == 0
         gen_metrics = {}
@@ -736,7 +731,7 @@ class TIGERTrainer:
     def _compute_gen_metrics(
         self, epoch: int, loader: DataLoader | None = None, prefix: str = "val",
     ) -> dict:
-        """Generate samples and compute MSE, MAPE, and CaTSG metrics.
+        """Generate samples and compute MSE_01, WAPE_01, and CaTSG metrics.
 
         Args:
             epoch: current epoch (for TensorBoard logging).
@@ -830,15 +825,13 @@ class TIGERTrainer:
                 cond_np = None
 
         # T2S metrics on global [0,1] scale
-        mse = calc_mse(real_01, gen_01)
-        mape = calc_mape(real_01, gen_01)
-        wape = calc_wape(real_01, gen_01)
-        self.writer.add_scalar(f"{prefix}/MSE", mse, epoch)
-        self.writer.add_scalar(f"{prefix}/MAPE", mape, epoch)
-        self.writer.add_scalar(f"{prefix}/WAPE", wape, epoch)
-        result.update({"MSE": mse, "MAPE": mape, "WAPE": wape})
+        mse_01 = calc_mse(real_01, gen_01)
+        wape_01 = calc_wape(real_01, gen_01)
+        self.writer.add_scalar(f"{prefix}/MSE_01", mse_01, epoch)
+        self.writer.add_scalar(f"{prefix}/WAPE_01", wape_01, epoch)
+        result.update({"MSE_01": mse_01, "WAPE_01_macro": wape_01})
 
-        msg = f"         | MSE={mse:.6f} | MAPE={mape:.4f} | WAPE={wape:.4f}"
+        msg = f"         | MSE_01={mse_01:.6f} | WAPE_01={wape_01:.4f}"
 
         # CaTSG metrics on original scale (matches CaTSG paper evaluation)
         try:
