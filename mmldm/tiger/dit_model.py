@@ -542,13 +542,14 @@ class TIGERDiT(nn.Module):
         if self._csa_moe_enabled:
             from .csa_moe import ChannelAwareResidualBlock
 
-            image_size = config.get("image_size", 64)
+            image_size_h = config.get("image_size_h", config.get("image_size", 64))
+            image_size_w = config.get("image_size_w", config.get("image_size", 64))
             moe_grids = []
             for i in range(self.multipatch_num):
                 ps = base_patch * (patch_scale ** i)
                 # Match ImagePatchEmbedding padding: ceil division
-                n_h = (image_size + ps - 1) // ps
-                n_w = (image_size + ps - 1) // ps
+                n_h = (image_size_h + ps - 1) // ps
+                n_w = (image_size_w + ps - 1) // ps
                 moe_grids.append((n_h, n_w))
 
             self.residual_layers = nn.ModuleList()
@@ -592,6 +593,14 @@ class TIGERDiT(nn.Module):
                 lambda_notears=cticd_cfg.get("lambda_notears", 1e-3),
                 lambda_sparsity=cticd_cfg.get("lambda_sparsity", 1e-2),
                 lambda_smooth=cticd_cfg.get("lambda_smooth", 1e-3),
+                lambda_prior=cticd_cfg.get("lambda_prior", 1e-1),
+                use_lag_prior=cticd_cfg.get("use_lag_prior", True),
+                lag_prior_method=cticd_cfg.get("lag_prior_method", "acf"),
+                lag_prior_mode=cticd_cfg.get("lag_prior_mode", "bias_gate"),
+                lag_prior_strength=cticd_cfg.get("lag_prior_strength", 1.0),
+                lag_prior_significance=cticd_cfg.get("lag_prior_significance", True),
+                lag_prior_bins=cticd_cfg.get("lag_prior_bins", 16),
+                signal_length=cticd_cfg.get("signal_length", None),
             )
 
     # -- mask builder -----------------------------------------------------------
@@ -621,6 +630,7 @@ class TIGERDiT(nn.Module):
         attr_emb: torch.Tensor | None = None,   # (B, attr_dim, n_h, n_w) or None
         clean_image: torch.Tensor | None = None, # clean target image for CTICD during training
         intervention: dict | None = None,        # optional do-intervention for causal sampling
+        enable_cticd: bool = True,               # whether to run CTICD (skip at high noise)
     ) -> torch.Tensor:
         """
         Args:
@@ -631,6 +641,8 @@ class TIGERDiT(nn.Module):
             clean_image:    optional clean image used by CTICD to avoid learning
                             graphs purely from noisy diffusion states.
             intervention:   optional causal intervention dictionary passed to CTICD.
+            enable_cticd:   if ``False``, skip CTICD entirely and inject zero features.
+                            Used during sampling to disable CTICD at high noise levels.
 
         Returns:
             noise_pred: ``(B, in_channels, H, W)`` predicted noise.
@@ -717,7 +729,7 @@ class TIGERDiT(nn.Module):
         self._cticd_losses = None
         self._cticd_graph = None
 
-        if self.cticd is not None:
+        if self.cticd is not None and enable_cticd:
             cticd_out = self.cticd(
                 image=image,
                 clean_image=clean_image,

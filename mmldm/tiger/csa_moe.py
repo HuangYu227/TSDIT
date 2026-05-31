@@ -6,18 +6,18 @@ consistency cross-attention, and auxiliary load-balancing loss.
 Reference: Diff-MoE (ICML 2025), TIGER dit_model.py
 
 .. important::
-   **Expert Naming Convention.**  ``GASFExpert``, ``STFTExpert``, and
-   ``RPExpert`` are named after the *inductive bias* each expert carries,
+   **Expert Naming Convention.**  ``LocalTrendExpert``, ``RowContextExpert``, and
+   ``PatchStateExpert`` are named after the *inductive bias* each expert carries,
    NOT after the image channel they process.  All three experts receive
    tokens from all channels mixed together; the :class:`MoEGate` router
    learns per-token routing based on token content, not channel identity.
 
-   - ``GASFExpert``: inductive bias for symmetric row/column structure
-     (computes row-mean and column-mean context).
-   - ``STFTExpert``: inductive bias for local frequency-time patterns
-     (learned depthwise convolution over a spatial patch).
-   - ``RPExpert``: inductive bias for gated nonlinear state transitions
-     (pointwise gated MLP, no spatial context).
+   - ``LocalTrendExpert``: inductive bias for symmetric row/column structure
+     (computes row-mean and column-mean context for local trends).
+   - ``RowContextExpert``: inductive bias for local row-major neighborhoods
+     (learned depthwise convolution over a spatial patch for row context).
+   - ``PatchStateExpert``: inductive bias for gated nonlinear state transitions
+     (pointwise gated MLP for patch-level state).
 
    In the paper, describe these as "three experts with distinct structural
    inductive biases that the router learns to select among" rather than
@@ -122,8 +122,11 @@ class AddAuxiliaryLoss(torch.autograd.Function):
 # ===========================================================================
 
 
-class GASFExpert(nn.Module):
-    """Sparse row/column structural expert for Gramian-like symmetric patterns.
+class LocalTrendExpert(nn.Module):
+    """Sparse row/column structural expert for local trend patterns.
+
+    Captures symmetric row/column context from the 2D spatial grid,
+    suitable for detecting local trends and smooth transitions.
 
     .. note::
        Named for its inductive bias, not its input.  Receives tokens from
@@ -159,7 +162,7 @@ class GASFExpert(nn.Module):
 
         B, L, C = x.shape
         if L != H * W:
-            raise ValueError(f"GASFExpert expects L == H*W, got L={L}, H*W={H * W}.")
+            raise ValueError(f"LocalTrendExpert expects L == H*W, got L={L}, H*W={H * W}.")
 
         x2d = rearrange(x, "b (h w) c -> b h w c", h=H, w=W)
 
@@ -184,18 +187,20 @@ class GASFExpert(nn.Module):
         return y.view(B, L, C)
 
 
-class STFTExpert(nn.Module):
-    """Sparse local frequency-time expert with depthwise convolution.
+class RowContextExpert(nn.Module):
+    """Sparse row-context expert with depthwise convolution.
+
+    Captures local spatial patterns via depthwise convolution over a patch,
+    suitable for row-major temporal neighborhoods.
 
     .. note::
-       Inductive bias for local spectral patterns, not STFT-channel-only.
-       Router selects tokens benefiting from patch-level frequency analysis
-       regardless of source channel.
+       Inductive bias for local row/column context in the rasterized time grid.
+       Router selects tokens benefiting from neighborhood aggregation.
     """
 
     def __init__(self, dim: int, ks: int = 3):
         super().__init__()
-        assert ks % 2 == 1, "STFTExpert kernel size should be odd."
+        assert ks % 2 == 1, "RowContextExpert kernel size should be odd."
 
         self.ks = ks
         self.dw = nn.Conv2d(dim, dim, ks, padding=ks // 2, groups=dim)
@@ -218,7 +223,7 @@ class STFTExpert(nn.Module):
 
         B, L, C = x.shape
         if L != H * W:
-            raise ValueError(f"STFTExpert expects L == H*W, got L={L}, H*W={H * W}.")
+            raise ValueError(f"RowContextExpert expects L == H*W, got L={L}, H*W={H * W}.")
 
         ks = self.ks
         pad = ks // 2
@@ -254,11 +259,14 @@ class STFTExpert(nn.Module):
         return y.view(B, L, C)
 
 
-class RPExpert(nn.Module):
-    """Sparse token-wise gated MLP expert for recurrence/state-transition patterns.
+class PatchStateExpert(nn.Module):
+    """Sparse token-wise gated MLP expert for patch-level state patterns.
+
+    Applies pointwise gated nonlinear transformations without spatial context,
+    suitable for capturing per-token state transitions.
 
     .. note::
-       Inductive bias for gated nonlinear transformations, not RP-channel-only.
+       Inductive bias for gated nonlinear transformations on patch states.
        Router selects tokens where a pointwise gated MLP is most effective.
     """
 
@@ -364,14 +372,14 @@ class CSAMoELayer(nn.Module):
                 UserWarning, stacklevel=2,
             )
 
-        self.gasf = GASFExpert(dim)
-        self.stft = STFTExpert(dim)
-        self.rp = RPExpert(dim)
+        self.local_trend = LocalTrendExpert(dim)
+        self.row_context = RowContextExpert(dim)
+        self.patch_state = PatchStateExpert(dim)
 
         self.experts = nn.ModuleList([
-            self.gasf,
-            self.stft,
-            self.rp,
+            self.local_trend,
+            self.row_context,
+            self.patch_state,
         ])
 
         self.gate = MoEGate(dim=dim, n_exp=3, k=k, alpha=alpha)
@@ -486,9 +494,9 @@ class StructuralConsistencyCrossAttention(nn.Module):
     """Geometric alignment + ring cross-attention for structural consistency.
 
     Input streams:
-        gf: GASF-aware stream
-        sf: STFT-aware stream
-        rf: RP-aware stream
+        gf: local-trend stream
+        sf: row-context stream
+        rf: patch-state stream
     """
 
     def __init__(self, dim: int, nh: int = 4):
@@ -534,9 +542,9 @@ class StructuralConsistencyCrossAttention(nn.Module):
 
         g2_aligned = g2.clone()
         for i in range(n):
-            # Replace diagonal with STFT-aligned version (NOT add to original).
-            # aligned_diag already carries GASF diagonal content; double-adding
-            # g2[:, i, i, :] would amplify diagonal values.
+            # Replace the temporal anchor tokens with row-context aligned tokens.
+            # aligned_diag already carries the local-trend content; double-adding
+            # g2[:, i, i, :] would over-amplify these anchor positions.
             g2_aligned[:, i, i, :] = self.dp(aligned_diag[:, i, :])
 
         gfa = rearrange(g2_aligned, "b h w c -> b (h w) c")

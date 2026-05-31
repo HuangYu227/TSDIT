@@ -74,7 +74,7 @@ def get_default_config() -> dict:
             "base_patch": 4,
             "patch_scale": 2,
             "diffusion_embedding_dim": 64,
-            "in_channels": 3,
+            "in_channels": 1,
             "condition_type": "adaLN",
             "attention_mask_type": "parallel",
             "lambda_cticd": 0.1,
@@ -131,23 +131,33 @@ def get_default_config() -> dict:
         "cticd": {
             "enabled": True,
             "d_model": 64,
-            "n_channels": 3,
+            "n_channels": 1,
             "n_mechanisms_per_channel": 4,
             "n_segments": 8,
             "max_lag": 2,
-            "patch_size": 4,
+            "patch_size": 2,
             "num_heads": 4,
             "edge_bias": -4.0,
             "lag_edge_bias": -2.5,
             "branch_grad_scale": 0.2,
             "lambda_causal": 1.0,
-            "lambda_notears": 1e-3,
+            "lambda_notears": 0.05,
             "lambda_sparsity": 1e-2,
             "lambda_smooth": 1e-3,
+            "lambda_prior": 0.1,
+            "use_lag_prior": True,
+            "lag_prior_method": "acf",
+            "lag_prior_mode": "bias_gate",
+            "lag_prior_strength": 1.0,
+            "lag_prior_significance": True,
+            "lag_prior_bins": 16,
         },
 
         "data": {
             "dataset_type": "weather_npy",
+            "representation": "row_raster",
+            "patch_size": 8,
+            "decode_mode": "row_raster",
             "image_size": 64,
             "n_fft": 64,
             "hop_length": 8,
@@ -248,6 +258,50 @@ def denormalize_ts_batch(
     return ts_norm * (ts_max - ts_min) + ts_min
 
 
+def _scalar_float(value):
+    """Return a Python float for scalar tensor/numpy/number values."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        return float(value.detach().cpu().item())
+    if isinstance(value, np.ndarray):
+        if value.size != 1:
+            return None
+        return float(value.reshape(-1)[0])
+    if isinstance(value, np.generic):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _json_safe(value):
+    """Convert tensors/numpy scalars/arrays in metric dicts to JSON-safe values."""
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu()
+        return value.item() if value.numel() == 1 else value.tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _ensure_btd(array: np.ndarray) -> np.ndarray:
+    """Normalize saved/evaluated time-series arrays to (B, T, D)."""
+    if array.ndim == 2:
+        return array[:, :, None]
+    if array.ndim == 3:
+        return array
+    raise ValueError(f"Expected array with shape (B,T) or (B,T,D), got {array.shape}")
+
+
 # ---------------------------------------------------------------------------
 # Learning rate schedule with linear warmup + cosine decay
 # ---------------------------------------------------------------------------
@@ -338,12 +392,17 @@ class TIGERTrainer:
         self._init_logging()
 
         dc = self.config["data"]
-        decode_mode = dc.get("decode_mode", "gasf")
-        if decode_mode not in ("gasf", "fused"):
-            raise ValueError(f"decode_mode must be 'gasf' or 'fused', got '{decode_mode}'")
-        self.decoder = ImageToTSDecoder(
-            mode=decode_mode, n_fft=dc["n_fft"], hop_length=dc["hop_length"]
-        ).to(self.device)
+        representation = dc.get("representation", "gasf")
+        if representation == "row_raster":
+            from .image_to_ts import RowRasterDecoder
+            self.decoder = RowRasterDecoder().to(self.device)
+        else:
+            decode_mode = dc.get("decode_mode", "gasf")
+            if decode_mode not in ("gasf", "fused"):
+                raise ValueError(f"decode_mode must be 'gasf' or 'fused', got '{decode_mode}'")
+            self.decoder = ImageToTSDecoder(
+                mode=decode_mode, n_fft=dc["n_fft"], hop_length=dc["hop_length"]
+            ).to(self.device)
 
         self.best_val_loss = float("inf")
         self.global_step = 0
@@ -365,6 +424,8 @@ class TIGERTrainer:
             epsilon_quantile=dc["epsilon_quantile"],
             datasets=dc.get("datasets"),
             time_interval=dc.get("time_interval", 24),
+            representation=dc.get("representation", "gasf"),
+            patch_size=dc.get("patch_size", 8),
         )
         # ── split naming ──────────────────────────────────────────────────
         # Weather   .npy files: train / valid / test
@@ -407,17 +468,26 @@ class TIGERTrainer:
     def _init_model(self):
         model_config = {
             "device": self.device,
-            "diffusion": self.config["diffusion"],
+            "diffusion": dict(self.config["diffusion"]),
             "condition": self.config["condition"],
         }
         # Pass top-level csa_moe / cticd configs so dit_model can read them
         if "csa_moe" in self.config:
             model_config["diffusion"]["csa_moe"] = self.config["csa_moe"]
         if "cticd" in self.config:
-            model_config["diffusion"]["cticd"] = self.config["cticd"]
+            model_config["diffusion"]["cticd"] = dict(self.config["cticd"])
         # Pass image_size for MoE grid computation
         if "data" in self.config and "image_size" in self.config["data"]:
             model_config["diffusion"]["image_size"] = self.config["data"]["image_size"]
+        # For row-raster: pass separate H/W
+        if "data" in self.config and self.config["data"].get("representation") == "row_raster":
+            from .ts_to_image import RowRasterEncoder
+            T = self.config["data"].get("time_interval", 24)
+            H, W = RowRasterEncoder._optimal_hw(T, self.config["data"].get("patch_size", 8))
+            model_config["diffusion"]["image_size_h"] = H
+            model_config["diffusion"]["image_size_w"] = W
+            if "cticd" in model_config["diffusion"]:
+                model_config["diffusion"]["cticd"]["signal_length"] = int(T)
         self.model = TIGERGenerator(model_config)
 
         if self.config.get("model_path"):
@@ -498,6 +568,7 @@ class TIGERTrainer:
                 break
 
             epoch_metrics = {"epoch": epoch + 1, "train_loss": train_loss}
+            epoch_metrics.update(getattr(self, "_last_train_epoch_metrics", {}))
 
             # Append BEFORE _validate so gen_metrics merge targets the current epoch.
             self.metrics_history.append(epoch_metrics)
@@ -505,13 +576,14 @@ class TIGERTrainer:
             if (epoch + 1) % self.val_interval == 0:
                 val_loss = self._validate(epoch)
                 epoch_metrics["val_loss"] = val_loss
+                epoch_metrics.update(getattr(self, "_last_val_epoch_metrics", {}))
                 self._save_checkpoint(epoch, val_loss)
 
             if (epoch + 1) % self.save_interval == 0:
                 self._save_checkpoint(epoch, tag=f"epoch_{epoch+1}")
 
             with open(self.metrics_path, "w") as f:
-                json.dump(self.metrics_history, f, indent=2)
+                json.dump(_json_safe(self.metrics_history), f, indent=2)
 
         self.writer.close()
         print("Training complete.")
@@ -535,6 +607,7 @@ class TIGERTrainer:
         self.model.eval()
         total_loss = 0.0
         num_batches = 0
+        loss_sums = {}
 
         for batch in tqdm(self.test_loader, desc="Evaluating on test"):
             loss_dict = self.model(batch, is_train=False)
@@ -543,9 +616,16 @@ class TIGERTrainer:
                 continue
             total_loss += loss_dict["all"].item()
             num_batches += 1
+            for k, v in loss_dict.items():
+                scalar = _scalar_float(v)
+                if scalar is not None and np.isfinite(scalar):
+                    loss_sums[k] = loss_sums.get(k, 0.0) + scalar
 
         avg_loss = total_loss / num_batches if num_batches else float("inf")
         self.writer.add_scalar("test/loss", avg_loss, 0)
+        loss_avgs = {k: v / max(1, num_batches) for k, v in loss_sums.items()}
+        for k, v in loss_avgs.items():
+            self.writer.add_scalar(f"test_epoch/{k}", v, 0)
         print(f"Test loss = {avg_loss:.6f}")
 
         # Compute full gen metrics on test set
@@ -555,27 +635,35 @@ class TIGERTrainer:
             prefix="test",
         )
         for k, v in gen_metrics.items():
-            self.writer.add_scalar(f"test/{k}", v, 0)
+            scalar = _scalar_float(v)
+            if scalar is not None and np.isfinite(scalar):
+                self.writer.add_scalar(f"test/{k}", scalar, 0)
 
         self.writer.close()
         print(f"Eval complete. test_loss={avg_loss:.6f}")
 
         # Save results
-        results = {"test_loss": avg_loss, **gen_metrics}
+        results = {
+            "test_loss": avg_loss,
+            **{f"test_{k}": v for k, v in loss_avgs.items() if k != "all"},
+            **gen_metrics,
+        }
         results_path = os.path.join(
             self.config.get("log_dir", "."), "test_results.json",
         )
         with open(results_path, "w") as f:
-            json.dump(results, f, indent=2)
+            json.dump(_json_safe(results), f, indent=2)
         print(f"Test results saved to {results_path}")
         return results
 
     def _train_epoch(self, epoch: int) -> float:
         self.model.train()
+        self._last_train_epoch_metrics = {}
         total_loss = 0.0
         num_updates = 0
         num_skipped = 0
         t0 = time.time()
+        loss_sums = {}
 
         # Early stopping config
         early_stop_lr = self.config.get("early_stop_lr", 1e-6)
@@ -625,6 +713,10 @@ class TIGERTrainer:
 
             total_loss += loss_dict["all"].item()
             num_updates += 1
+            for k, v in loss_dict.items():
+                scalar = _scalar_float(v)
+                if scalar is not None and np.isfinite(scalar):
+                    loss_sums[k] = loss_sums.get(k, 0.0) + scalar
 
             # Build compact postfix: total loss + key sub-losses if present
             postfix = {"loss": f"{loss_dict['all'].item():.4f}"}
@@ -634,13 +726,24 @@ class TIGERTrainer:
                 postfix["cticd"] = f"{loss_dict['cticd_weighted'].item():.4f}"
             if "moe_aux" in loss_dict:
                 postfix["moe"] = f"{loss_dict['moe_aux'].item():.4f}"
+            # Additional CTICD diagnostic fields
+            if "cticd_total" in loss_dict:
+                postfix["cticd_t"] = f"{loss_dict['cticd_total'].item():.4f}"
+            if "cticd_prior" in loss_dict:
+                postfix["prior"] = f"{loss_dict['cticd_prior'].item():.4f}"
+            if "cticd_lag_edge_density" in loss_dict:
+                postfix["lag_e"] = f"{loss_dict['cticd_lag_edge_density'].item():.3f}"
+            if "cticd_lag_prior_mean" in loss_dict:
+                postfix["lag_p"] = f"{loss_dict['cticd_lag_prior_mean'].item():.3f}"
             postfix["grad"] = f"{grad_norm:.2f}"
             postfix["lr"] = f"{self.scheduler.get_lr():.2e}"
             pbar.set_postfix(postfix)
 
             # Log per-step
             for k, v in loss_dict.items():
-                self.writer.add_scalar(f"train_step/{k}", v.item(), self.global_step)
+                scalar = _scalar_float(v)
+                if scalar is not None and np.isfinite(scalar):
+                    self.writer.add_scalar(f"train_step/{k}", scalar, self.global_step)
             self.writer.add_scalar("train_step/lr", self.scheduler.get_lr(), self.global_step)
 
         # Check skip ratio at end of epoch
@@ -656,20 +759,40 @@ class TIGERTrainer:
 
         avg_loss = total_loss / max(1, num_updates)
         dt = time.time() - t0
-        # Build compact loss breakdown from the last batch's loss_dict
+        loss_avgs = {k: v / max(1, num_updates) for k, v in loss_sums.items()}
+        self._last_train_epoch_metrics = {
+            f"train_{k}": v for k, v in loss_avgs.items() if k != "all"
+        }
+        self._last_train_epoch_metrics.update({
+            "train_num_updates": num_updates,
+            "train_num_skipped": num_skipped,
+            "train_skip_ratio": skip_ratio,
+        })
+
+        # Build compact loss breakdown from epoch means, not the last batch.
         loss_parts = [f"train_loss={avg_loss:.6f}"]
         if num_updates > 0:
-            # We sample the last batch's sub-losses for a snapshot
-            sub = {}
-            for k in ["noise_loss", "cticd_weighted", "moe_aux"]:
-                if k in loss_dict:
-                    sub[k] = loss_dict[k].item()
+            sub = {
+                k: loss_avgs[k]
+                for k in ["noise_loss", "cticd_weighted", "moe_aux",
+                          "cticd_total", "cticd_prior",
+                          "cticd_lag_edge_density", "cticd_lag_prior_mean"]
+                if k in loss_avgs
+            }
             if "noise_loss" in sub:
                 loss_parts.append(f"noise={sub['noise_loss']:.4f}")
             if "cticd_weighted" in sub:
                 loss_parts.append(f"cticd={sub['cticd_weighted']:.4f}")
             if "moe_aux" in sub:
                 loss_parts.append(f"moe={sub['moe_aux']:.4f}")
+            if "cticd_total" in sub:
+                loss_parts.append(f"cticd_t={sub['cticd_total']:.4f}")
+            if "cticd_prior" in sub:
+                loss_parts.append(f"prior={sub['cticd_prior']:.4f}")
+            if "cticd_lag_edge_density" in sub:
+                loss_parts.append(f"lag_e={sub['cticd_lag_edge_density']:.3f}")
+            if "cticd_lag_prior_mean" in sub:
+                loss_parts.append(f"lag_p={sub['cticd_lag_prior_mean']:.3f}")
         loss_parts.append(f"lr={self.scheduler.get_lr():.2e}")
         loss_parts.append(f"{dt:.1f}s")
         loss_parts.append(f"skip={num_skipped}/{total_batches}")
@@ -677,6 +800,8 @@ class TIGERTrainer:
 
         self.writer.add_scalar("train_epoch/loss", avg_loss, epoch)
         self.writer.add_scalar("train_epoch/skip_ratio", skip_ratio, epoch)
+        for k, v in loss_avgs.items():
+            self.writer.add_scalar(f"train_epoch/{k}", v, epoch)
         return avg_loss
 
     @torch.no_grad()
@@ -701,8 +826,10 @@ class TIGERTrainer:
             loader = self.val_loader
 
         self.model.eval()
+        self._last_val_epoch_metrics = {}
         total_loss = 0.0
         num_batches = 0
+        loss_sums = {}
 
         for batch in tqdm(loader, desc=f"Evaluating ({prefix})"):
             loss_dict = self.model(batch, is_train=False)
@@ -711,9 +838,22 @@ class TIGERTrainer:
                 continue
             total_loss += loss_dict["all"].item()
             num_batches += 1
+            for k, v in loss_dict.items():
+                scalar = _scalar_float(v)
+                if scalar is not None and np.isfinite(scalar):
+                    loss_sums[k] = loss_sums.get(k, 0.0) + scalar
 
         avg_loss = total_loss / num_batches if num_batches else float("inf")
         self.writer.add_scalar(f"{prefix}/loss", avg_loss, epoch)
+        loss_avgs = {k: v / max(1, num_batches) for k, v in loss_sums.items()}
+        self._last_val_epoch_metrics = {
+            f"{prefix}_{k}": v for k, v in loss_avgs.items() if k != "all"
+        }
+        self._last_val_epoch_metrics.update({
+            f"{prefix}_num_batches": num_batches,
+        })
+        for k, v in loss_avgs.items():
+            self.writer.add_scalar(f"{prefix}_epoch/{k}", v, epoch)
         print(f"         | {prefix}_loss  ={avg_loss:.6f}")
 
         # MSE_01/WAPE_01 every eval_gen_interval.
@@ -724,10 +864,12 @@ class TIGERTrainer:
             gen_metrics = self._compute_gen_metrics(epoch, loader=loader, prefix=prefix)
 
         # Merge gen metrics into the latest metrics_history entry
-        if self.metrics_history and gen_metrics:
-            self.metrics_history[-1].update(gen_metrics)
+        if self.metrics_history:
+            self.metrics_history[-1].update(self._last_val_epoch_metrics)
+            if gen_metrics:
+                self.metrics_history[-1].update(gen_metrics)
             with open(self.metrics_path, "w") as f:
-                json.dump(self.metrics_history, f, indent=2)
+                json.dump(_json_safe(self.metrics_history), f, indent=2)
 
         if save_best and avg_loss < self.best_val_loss:
             self.best_val_loss = avg_loss
@@ -755,8 +897,15 @@ class TIGERTrainer:
         self.model.eval()
         dc = self.config["data"]
         ts_len = dc.get("time_interval", 24)
-        image_size = dc["image_size"]
-        image_shape = (3, image_size, image_size)
+        representation = dc.get("representation", "gasf")
+        if representation == "row_raster":
+            from .ts_to_image import RowRasterEncoder
+            H, W = RowRasterEncoder._optimal_hw(ts_len, dc.get("patch_size", 8))
+            in_channels = self.config.get("diffusion", {}).get("in_channels", 1)
+            image_shape = (in_channels, H, W)
+        else:
+            image_size = dc["image_size"]
+            image_shape = (3, image_size, image_size)
 
         # Global min/max for T2S [0,1]-scale metric normalization.
         ds = loader.dataset
@@ -821,6 +970,22 @@ class TIGERTrainer:
         gen_01 = np.concatenate(all_gen_01, axis=0)
         real_orig = np.concatenate(all_real_orig, axis=0)
         gen_orig = np.concatenate(all_gen_orig, axis=0)
+        real_01_btd = _ensure_btd(real_01)
+        gen_01_btd = _ensure_btd(gen_01)
+        real_orig_btd = _ensure_btd(real_orig)
+        gen_orig_btd = _ensure_btd(gen_orig)
+
+        if self.config.get("save_eval_arrays", True):
+            array_dir = os.path.join(self.config.get("log_dir", "."), "eval_arrays")
+            os.makedirs(array_dir, exist_ok=True)
+            tag = f"{prefix}_epoch{epoch + 1:04d}" if epoch >= 0 else prefix
+            np.save(os.path.join(array_dir, f"{tag}_real_raw.npy"), real_orig_btd)
+            np.save(os.path.join(array_dir, f"{tag}_gen_raw.npy"), gen_orig_btd)
+            np.save(os.path.join(array_dir, f"{tag}_real_01.npy"), real_01_btd)
+            np.save(os.path.join(array_dir, f"{tag}_gen_01.npy"), gen_01_btd)
+            result["eval_array_dir"] = array_dir
+            result["eval_array_tag"] = tag
+            result["eval_array_shape"] = list(real_orig_btd.shape)
 
         # Encode text embeddings for J-FTSD
         cond_np = None
@@ -834,8 +999,8 @@ class TIGERTrainer:
                 cond_np = None
 
         # T2S metrics on global [0,1] scale
-        mse_01 = calc_mse(real_01, gen_01)
-        wape_01 = calc_wape(real_01, gen_01)
+        mse_01 = calc_mse(real_01_btd, gen_01_btd)
+        wape_01 = calc_wape(real_01_btd, gen_01_btd)
         self.writer.add_scalar(f"{prefix}/MSE_01", mse_01, epoch)
         self.writer.add_scalar(f"{prefix}/WAPE_01", wape_01, epoch)
         result.update({"MSE_01": mse_01, "WAPE_01_macro": wape_01})
@@ -846,8 +1011,8 @@ class TIGERTrainer:
         try:
             from .evaluation.unified_metrics import compute_all_unified_metrics
             um = compute_all_unified_metrics(
-                real_raw=real_orig,
-                gen_raw=gen_orig,
+                real_raw=real_orig_btd,
+                gen_raw=gen_orig_btd,
                 condition=cond_np,
                 global_min=g_min,
                 global_max=g_max,

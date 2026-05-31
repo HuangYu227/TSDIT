@@ -395,3 +395,75 @@ class TSToImageEncoder:
             n_vars=n_vars, original_length=T,
         )
         return ch, norm_params
+
+
+# ---------------------------------------------------------------------------
+# Row-Raster Encoder (bijective, rectangular)
+# ---------------------------------------------------------------------------
+
+class RowRasterEncoder:
+    """Encode a univariate time series as a single-channel row-raster image.
+
+    Values are written in row-major temporal order:
+    ``image[:, 0].reshape(B, -1)[:, :T] == x_norm``.
+    The representation is bijective through Channel 0 alone; padding pixels are
+    set to 0.5 and ignored by the decoder via ``original_length``.
+    """
+
+    def __init__(self, patch_size: int = 8, n_channels: int = 1):
+        self.patch_size = patch_size
+        self.n_channels = n_channels
+        if self.n_channels != 1:
+            raise ValueError("RowRasterEncoder is a single-channel representation; use n_channels=1.")
+
+    @staticmethod
+    def _optimal_hw(T: int, patch_size: int):
+        """Compute optimal rectangular H x W >= T, both multiples of patch_size."""
+        import math
+        sqrt_T = int(math.sqrt(T))
+        H = max(patch_size, (sqrt_T // patch_size) * patch_size)
+        W = int(math.ceil(T / H / patch_size)) * patch_size
+        if H * W < T:
+            W += patch_size
+        return H, W
+
+    def encode(self, ts: torch.Tensor) -> Tuple[torch.Tensor, NormParams]:
+        """Encode a batch of time series into row-raster images.
+
+        Args:
+            ts: (B, T) univariate time series (raw scale, not yet normalized).
+        Returns:
+            image: (B, 1, H, W) values in [0, 1].
+            norm_params: NormParams for decoder.
+        """
+        if ts.dim() == 1:
+            ts = ts.unsqueeze(0)
+        if ts.dim() != 2:
+            raise ValueError(f"RowRasterEncoder expects univariate (B,T) input, got {tuple(ts.shape)}")
+        B, T = ts.shape
+        device, dtype = ts.device, ts.dtype
+
+        # Normalize to [0, 1] without the GASF-specific arccos clamp so the
+        # row-raster channel remains exactly invertible after denormalization.
+        min_val, max_val = _safe_min_max(ts)
+        ts_norm = (ts - min_val.unsqueeze(-1)) / (max_val - min_val).unsqueeze(-1)
+        ts_norm = ts_norm.clamp(0.0, 1.0)
+        ts_norm = torch.nan_to_num(ts_norm, nan=0.0, posinf=1.0, neginf=0.0)
+
+        H, W = self._optimal_hw(T, self.patch_size)
+        N = H * W
+
+        image = torch.full((B, 1, H, W), 0.5, device=device, dtype=dtype)
+
+        # Single channel: raw normalized signal in row-major temporal order.
+        x_pad = torch.full((B, N), 0.5, device=device, dtype=dtype)
+        x_pad[:, :T] = ts_norm
+        image[:, 0] = x_pad.reshape(B, H, W)
+
+        norm_params = NormParams(
+            min_val=min_val.squeeze(-1),
+            max_val=max_val.squeeze(-1),
+            n_vars=1,
+            original_length=T,
+        )
+        return image.clamp(0.0, 1.0), norm_params

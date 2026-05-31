@@ -87,7 +87,11 @@ class TIGERGenerator(nn.Module):
         if self.cond_mode in {"text_image", "multimodal", "image_text"}:
             image_cfg = dict(cond_config.get("image", {}))
             image_cfg.setdefault("device", self.device)
-            image_cfg.setdefault("img_size", diff_config.get("image_size", self.config.get("image_size", 64)))
+            if "image_size_h" in diff_config and "image_size_w" in diff_config:
+                image_cfg.setdefault("img_size", (diff_config["image_size_h"], diff_config["image_size_w"]))
+            else:
+                image_cfg.setdefault("img_size", diff_config.get("image_size", self.config.get("image_size", 64)))
+            image_cfg.setdefault("in_channels", diff_config.get("in_channels", 3))
             image_cfg.setdefault("image_emb", cond_config.get("joint_emb", diff_config["channels"]))
             self.cond_projector = MultiModalConditioner(
                 n_var=n_var,
@@ -166,14 +170,27 @@ class TIGERGenerator(nn.Module):
         noise_std = float(cfg.get("noise_std", 0.02 if is_train else 0.0))
         fill = float(cfg.get("fill", 0.5))
         mask = torch.ones(B, 1, H, W, device=ref.device, dtype=ref.dtype)
-        width = max(1, int(round(W * mask_ratio)))
-        for b in range(B):
-            if is_train:
-                start = torch.randint(0, max(1, W - width + 1), (1,), device=ref.device).item()
-            else:
-                start = max(0, (W - width) // 2)
-            end = min(W, start + width)
-            mask[b, :, :, start:end] = 0.0
+        mask_layout = str(cfg.get("mask_layout", "row_major" if ref.shape[1] == 1 else "columns")).lower()
+        if mask_layout == "row_major":
+            flat_mask = mask.reshape(B, 1, H * W)
+            width = max(1, int(round(H * W * mask_ratio)))
+            for b in range(B):
+                if is_train:
+                    start = torch.randint(0, max(1, H * W - width + 1), (1,), device=ref.device).item()
+                else:
+                    start = max(0, (H * W - width) // 2)
+                end = min(H * W, start + width)
+                flat_mask[b, :, start:end] = 0.0
+            mask = flat_mask.reshape(B, 1, H, W)
+        else:
+            width = max(1, int(round(W * mask_ratio)))
+            for b in range(B):
+                if is_train:
+                    start = torch.randint(0, max(1, W - width + 1), (1,), device=ref.device).item()
+                else:
+                    start = max(0, (W - width) // 2)
+                end = min(W, start + width)
+                mask[b, :, :, start:end] = 0.0
         ref = ref * mask + fill * (1.0 - mask)
         if noise_std > 0:
             ref = ref + noise_std * torch.randn_like(ref)
@@ -327,6 +344,7 @@ class TIGERGenerator(nn.Module):
         image_guidance_scale: Optional[float] = None,
         interaction_guidance_scale: float = 0.0,
         intervention: Optional[dict] = None,
+        cticd_enable_threshold: float = 0.5,
     ):
         """Generate TS-images.
 
@@ -334,6 +352,11 @@ class TIGERGenerator(nn.Module):
         ``image_guidance_scale`` controls image guidance, and
         ``interaction_guidance_scale`` controls the extra text-image interaction
         term.  Setting all three to 1/1/0 gives standard conditional sampling.
+
+        CTICD noise-level gating: CTICD is disabled when the normalised timestep
+        exceeds ``cticd_enable_threshold`` (high noise) and enabled otherwise
+        (mid/low noise).  When ``ref_images`` is available, it is passed as the
+        clean source for CTICD mechanism encoding.
         """
         B = len(texts) if texts is not None else (ref_images.shape[0] if ref_images is not None else 1)
         sample_shape = (B, *image_shape)
@@ -350,12 +373,19 @@ class TIGERGenerator(nn.Module):
                 noise = torch.randn_like(x)
                 t = torch.full((B,), step, device=self.device, dtype=torch.long)
 
+                # CTICD noise-level gating: disable at high noise
+                t_norm = step / max(self.num_steps - 1, 1)
+                enable_cticd = (t_norm <= cticd_enable_threshold)
+                # Use ref_images as clean source for CTICD when available
+                cticd_clean = ref_images if (enable_cticd and ref_images is not None) else None
+
                 if self.is_multimodal:
                     keep = torch.zeros(B, dtype=torch.bool, device=self.device)
                     drop = torch.ones(B, dtype=torch.bool, device=self.device)
 
                     attr_both = self.compute_condition_from_emb(text_emb, t, ref_images, keep, keep)
-                    pred_both = self.dit(x, t, attr_both, intervention=intervention)
+                    pred_both = self.dit(x, t, attr_both, intervention=intervention,
+                                         enable_cticd=enable_cticd, clean_image=cticd_clean)
 
                     use_mm_cfg = (
                         guidance_scale != 1.0
@@ -366,9 +396,12 @@ class TIGERGenerator(nn.Module):
                         attr_uncond = self.compute_condition_from_emb(text_emb, t, ref_images, drop, drop)
                         attr_text = self.compute_condition_from_emb(text_emb, t, ref_images, keep, drop)
                         attr_image = self.compute_condition_from_emb(text_emb, t, ref_images, drop, keep)
-                        pred_uncond = self.dit(x, t, attr_uncond, intervention=intervention)
-                        pred_text = self.dit(x, t, attr_text, intervention=intervention)
-                        pred_image = self.dit(x, t, attr_image, intervention=intervention)
+                        pred_uncond = self.dit(x, t, attr_uncond, intervention=intervention,
+                                               enable_cticd=enable_cticd, clean_image=cticd_clean)
+                        pred_text = self.dit(x, t, attr_text, intervention=intervention,
+                                             enable_cticd=enable_cticd, clean_image=cticd_clean)
+                        pred_image = self.dit(x, t, attr_image, intervention=intervention,
+                                              enable_cticd=enable_cticd, clean_image=cticd_clean)
                         pred_noise = (
                             pred_uncond
                             + guidance_scale * (pred_text - pred_uncond)
@@ -379,10 +412,12 @@ class TIGERGenerator(nn.Module):
                         pred_noise = pred_both
                 else:
                     attr_emb = self.compute_condition_from_emb(text_emb, t)
-                    pred_noise = self.dit(x, t, attr_emb, intervention=intervention)
+                    pred_noise = self.dit(x, t, attr_emb, intervention=intervention,
+                                          enable_cticd=enable_cticd, clean_image=cticd_clean)
                     if guidance_scale > 1.0 and texts is not None:
                         attr_uncond = self.compute_condition_from_emb(empty_text_emb, t)
-                        pred_uncond = self.dit(x, t, attr_uncond, intervention=intervention)
+                        pred_uncond = self.dit(x, t, attr_uncond, intervention=intervention,
+                                               enable_cticd=enable_cticd, clean_image=cticd_clean)
                         pred_noise = pred_uncond + guidance_scale * (pred_noise - pred_uncond)
 
                 if sampler == "ddpm":

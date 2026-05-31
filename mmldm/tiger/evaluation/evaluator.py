@@ -60,6 +60,14 @@ class TIGEREvaluator:
             "diffusion": config["diffusion"],
             "condition": config["condition"],
         }
+        # Propagate image_size_h/w for rectangular images (same as train.py _init_model)
+        dc = config["data"]
+        if dc.get("representation") == "row_raster":
+            from ..ts_to_image import RowRasterEncoder
+            T = dc.get("time_interval", 24)
+            H, W = RowRasterEncoder._optimal_hw(T, dc.get("patch_size", 8))
+            model_config["diffusion"]["image_size_h"] = H
+            model_config["diffusion"]["image_size_w"] = W
         self.model = TIGERGenerator(model_config)
         ckpt = torch.load(checkpoint_path, map_location=self.device)
         # Support both old (state_dict only) and new (dict) checkpoint formats
@@ -71,11 +79,16 @@ class TIGEREvaluator:
 
         # Image -> TS decoder
         dc = config["data"]
-        self.ts_decoder = ImageToTSDecoder(
-            mode="fused",
-            n_fft=dc.get("n_fft", 64),
-            hop_length=dc.get("hop_length", 8),
-        )
+        representation = dc.get("representation", "gasf")
+        if representation == "row_raster":
+            from ..image_to_ts import RowRasterDecoder
+            self.ts_decoder = RowRasterDecoder()
+        else:
+            self.ts_decoder = ImageToTSDecoder(
+                mode="fused",
+                n_fft=dc.get("n_fft", 64),
+                hop_length=dc.get("hop_length", 8),
+            )
 
         # Test data
         self.dataset = TIGERDataset(
@@ -86,6 +99,8 @@ class TIGEREvaluator:
             n_fft=dc.get("n_fft", 64),
             hop_length=dc.get("hop_length", 8),
             epsilon_quantile=dc.get("epsilon_quantile", 0.1),
+            representation=dc.get("representation", "gasf"),
+            patch_size=dc.get("patch_size", 8),
         )
         self.loader = DataLoader(
             self.dataset,
@@ -110,8 +125,15 @@ class TIGEREvaluator:
         all_real_images = []
 
         dc = self.config["data"]
-        image_size = dc.get("image_size", 64)
-        image_shape = (3, image_size, image_size)
+        representation = dc.get("representation", "gasf")
+        if representation == "row_raster":
+            from ..ts_to_image import RowRasterEncoder
+            ts_len = dc.get("time_interval", 24)
+            H, W = RowRasterEncoder._optimal_hw(ts_len, dc.get("patch_size", 8))
+            image_shape = (self.config.get("diffusion", {}).get("in_channels", 1), H, W)
+        else:
+            image_size = dc.get("image_size", 64)
+            image_shape = (3, image_size, image_size)
 
         for batch_idx, batch in enumerate(self.loader):
             images = batch["image"].to(self.device).float()
@@ -183,13 +205,18 @@ class TIGEREvaluator:
         Uses original-scale ts_min/ts_max for NormParams so the decoder
         correctly denormalizes back to the original scale.
         """
-        from ..ts_to_image import TSToImageEncoder, NormParams
+        from ..ts_to_image import TSToImageEncoder, RowRasterEncoder, NormParams
 
-        encoder = TSToImageEncoder(
-            image_size=self.config["data"].get("image_size", 64),
-            n_fft=self.config["data"].get("n_fft", 64),
-            hop_length=self.config["data"].get("hop_length", 8),
-        )
+        dc = self.config["data"]
+        representation = dc.get("representation", "gasf")
+        if representation == "row_raster":
+            encoder = RowRasterEncoder(patch_size=dc.get("patch_size", 8))
+        else:
+            encoder = TSToImageEncoder(
+                image_size=dc.get("image_size", 64),
+                n_fft=dc.get("n_fft", 64),
+                hop_length=dc.get("hop_length", 8),
+            )
         ts_tensor = torch.tensor(ts_np, dtype=torch.float32)
 
         images, _ = encoder.encode(ts_tensor)

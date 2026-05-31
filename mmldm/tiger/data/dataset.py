@@ -5,12 +5,12 @@ import random
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from ..ts_to_image import TSToImageEncoder
+from ..ts_to_image import TSToImageEncoder, RowRasterEncoder
 
 
 class TIGERDataset(Dataset):
     """Dataset for TIGER: Text+Image Guided TS Generation.
-    
+
     Supports two data formats:
     1. Weather .npy format (VerbalTS style): train_ts.npy, train_text_caps.npy, etc.
     2. CSV format (T2S style): embedding_cleaned_{dataset}_{length}.csv
@@ -21,7 +21,9 @@ class TIGERDataset(Dataset):
                  image_size=64, n_fft=64, hop_length=8, epsilon_quantile=0.1,
                  seed=123, split_ratio=(0.8, 0.1, 0.1),
                  ref_image_mode: str | None = None,
-                 ref_image_size: int = 32):
+                 ref_image_size: int = 32,
+                 representation: str = "gasf",
+                 patch_size: int = 8):
         super().__init__()
         self.data_dir = data_dir
         self.split = split
@@ -32,12 +34,16 @@ class TIGERDataset(Dataset):
         self.split_ratio = split_ratio  # (train, val, test) for CSV without 'split' column
         self.ref_image_mode = ref_image_mode
         self.ref_image_size = ref_image_size
+        self.representation = representation
 
         # TS→Image encoder
-        self.ts_to_image = TSToImageEncoder(
-            image_size=image_size, n_fft=n_fft, hop_length=hop_length,
-            epsilon_quantile=epsilon_quantile
-        )
+        if representation == "row_raster":
+            self.ts_to_image = RowRasterEncoder(patch_size=patch_size)
+        else:
+            self.ts_to_image = TSToImageEncoder(
+                image_size=image_size, n_fft=n_fft, hop_length=hop_length,
+                epsilon_quantile=epsilon_quantile
+            )
 
         if dataset_type == "weather_npy":
             self._load_weather_npy()
@@ -189,12 +195,16 @@ class TIGERDataset(Dataset):
             print(f"Ref images (self): {self.ref_images.shape}")
 
         elif self.ref_image_mode == "different_encoding":
-            ref_encoder = TSToImageEncoder(
-                image_size=self.ref_image_size,
-                n_fft=self.ts_to_image.n_fft,
-                hop_length=self.ts_to_image.hop_length,
-                epsilon_quantile=self.ts_to_image.epsilon_quantile,
-            )
+            if isinstance(self.ts_to_image, RowRasterEncoder):
+                # row_raster: use same encoder with different patch_size for ref
+                ref_encoder = RowRasterEncoder(patch_size=self.ref_image_size)
+            else:
+                ref_encoder = TSToImageEncoder(
+                    image_size=self.ref_image_size,
+                    n_fft=self.ts_to_image.n_fft,
+                    hop_length=self.ts_to_image.hop_length,
+                    epsilon_quantile=self.ts_to_image.epsilon_quantile,
+                )
             ts_tensor = torch.tensor(self.ts_data[:self.n_samples], dtype=torch.float32)
             if ts_tensor.ndim == 1:
                 ts_tensor = ts_tensor.unsqueeze(0)
@@ -218,7 +228,7 @@ class TIGERDataset(Dataset):
             cap = caps
 
         sample = {
-            "image": self.images[idx],           # (3, H, W)
+            "image": self.images[idx],           # (C, H, W) where C=3 for gasf, C=1 for row_raster
             "ts": self.ts_norm[idx],              # (T,) normalized
             "ts_min": self.ts_min[idx],           # scalar
             "ts_max": self.ts_max[idx],           # scalar

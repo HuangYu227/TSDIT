@@ -83,12 +83,97 @@ def _pool_attr(attr_emb: Optional[torch.Tensor], batch: int, attr_dim: int, devi
     return pooled
 
 
+def _safe_corr_abs(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return absolute Pearson correlation and sample count per batch item."""
+    n = x.shape[-1]
+    if n <= 2:
+        return x.new_zeros(x.shape[0]), x.new_full((x.shape[0],), float(n))
+    x = x - x.mean(dim=-1, keepdim=True)
+    y = y - y.mean(dim=-1, keepdim=True)
+    num = (x * y).sum(dim=-1)
+    den = x.square().sum(dim=-1).sqrt() * y.square().sum(dim=-1).sqrt()
+    corr = num / den.clamp_min(eps)
+    corr = torch.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1.0, 1.0)
+    return corr.abs(), x.new_full((x.shape[0],), float(n))
+
+
+def _histogram_mi(x: torch.Tensor, y: torch.Tensor, bins: int = 16, eps: float = 1e-8) -> torch.Tensor:
+    """Small batched histogram MI estimator for normalized row-raster signals."""
+    B, N = x.shape
+    out = x.new_zeros(B)
+    x_bin = torch.clamp((x.clamp(0.0, 1.0) * bins).long(), 0, bins - 1)
+    y_bin = torch.clamp((y.clamp(0.0, 1.0) * bins).long(), 0, bins - 1)
+    for b in range(B):
+        idx = x_bin[b] * bins + y_bin[b]
+        hist = torch.bincount(idx, minlength=bins * bins).to(dtype=x.dtype).reshape(bins, bins)
+        pxy = hist / hist.sum().clamp_min(eps)
+        px = pxy.sum(dim=1, keepdim=True)
+        py = pxy.sum(dim=0, keepdim=True)
+        ratio = pxy / (px * py).clamp_min(eps)
+        mi = torch.where(pxy > 0, pxy * torch.log(ratio.clamp_min(eps)), torch.zeros_like(pxy))
+        out[b] = mi.sum()
+    return out
+
+
+def compute_lag_dependency_prior(
+    image: torch.Tensor,
+    max_lag: int,
+    n_segments: int,
+    method: str = "acf",
+    significance: bool = True,
+    bins: int = 16,
+    valid_length: Optional[int] = None,
+) -> torch.Tensor:
+    """Compute statistically grounded lag dependency prior from row-raster data.
+
+    The row-raster channel is flattened back to temporal order.  Lag ``p`` in
+    CTICD corresponds to approximately ``p * (T / n_segments)`` raw time steps,
+    because CTICD lagged graphs operate between temporal segments.
+
+    Returns:
+        ``(B, max_lag)`` values in ``[0, 1]``.
+    """
+    if image.dim() != 4:
+        raise ValueError(f"image must be (B,C,H,W), got {tuple(image.shape)}")
+    signal = image[:, 0].flatten(1).float().clamp(0.0, 1.0)
+    if valid_length is not None:
+        valid_length = int(valid_length)
+        if valid_length <= 0:
+            raise ValueError(f"valid_length must be positive, got {valid_length}")
+        signal = signal[:, : min(valid_length, signal.shape[1])]
+    B, T = signal.shape
+    prior = signal.new_zeros(B, max_lag)
+    seg_width = max(1, int(round(T / max(1, n_segments))))
+    method = method.lower()
+
+    for lag_idx in range(max_lag):
+        raw_lag = (lag_idx + 1) * seg_width
+        if raw_lag <= 0 or raw_lag >= T or T - raw_lag < 4:
+            continue
+        past = signal[:, :-raw_lag]
+        future = signal[:, raw_lag:]
+        if method == "mi":
+            dep = _histogram_mi(past, future, bins=bins)
+        else:
+            dep, n = _safe_corr_abs(past, future)
+            if significance:
+                # Large-sample 95% two-sided correlation significance proxy.
+                # This avoids a SciPy dependency inside the training loop.
+                threshold = 1.96 / torch.sqrt(n.clamp_min(3.0))
+                dep = torch.where(dep > threshold, dep, torch.zeros_like(dep))
+        prior[:, lag_idx] = dep
+
+    scale = prior.amax(dim=1, keepdim=True).clamp_min(1e-8)
+    prior = torch.where(scale > 1e-8, prior / scale, prior)
+    return prior.clamp(0.0, 1.0)
+
+
 class ChannelTemporalMechanismEncoder(nn.Module):
     """Encode one transform channel into temporal mechanism states.
 
-    The TS-image width axis is treated as the ordered time axis.  The encoder
-    patches the channel image, splits patch columns into ``n_segments`` temporal
-    bins, and lets K learnable mechanism queries attend to each bin.
+    For row-raster images, patch tokens are ordered in row-major temporal order.
+    The encoder splits that token sequence into ``n_segments`` temporal bins and
+    lets K learnable mechanism queries attend to each bin.
     """
 
     def __init__(
@@ -105,6 +190,7 @@ class ChannelTemporalMechanismEncoder(nn.Module):
         self.d_model = d_model
         self.n_mechanisms = n_mechanisms
         self.n_segments = n_segments
+        self.patch_size = patch_size
         self.patch_embed = nn.Sequential(
             nn.Conv2d(1, d_model, kernel_size=patch_size, stride=patch_size),
             nn.GroupNorm(1, d_model),
@@ -122,14 +208,27 @@ class ChannelTemporalMechanismEncoder(nn.Module):
         nn.init.zeros_(self.ffn[-1].weight)
         nn.init.zeros_(self.ffn[-1].bias)
 
-    def forward(self, channel: torch.Tensor) -> torch.Tensor:
+    def forward(self, channel: torch.Tensor, valid_length: Optional[int] = None) -> torch.Tensor:
         if channel.dim() != 4 or channel.shape[1] != 1:
             raise ValueError(f"channel must be (B,1,H,W), got {tuple(channel.shape)}")
         B = channel.shape[0]
         feat = self.patch_embed(channel)  # (B,D,h,w)
         _, D, h, w = feat.shape
-        segments = min(self.n_segments, max(1, w))
-        edges = torch.linspace(0, w, steps=segments + 1, device=feat.device)
+        tokens = feat.flatten(2).transpose(1, 2).contiguous()  # (B,h*w,D), row-major
+
+        if valid_length is not None:
+            image_w = channel.shape[-1]
+            rows = torch.arange(h, device=feat.device)
+            cols = torch.arange(w, device=feat.device)
+            rr, cc = torch.meshgrid(rows, cols, indexing="ij")
+            patch_start = (rr * self.patch_size) * image_w + cc * self.patch_size
+            valid_mask = patch_start.flatten() < int(valid_length)
+            if valid_mask.any():
+                tokens = tokens[:, valid_mask, :]
+
+        L = max(1, tokens.shape[1])
+        segments = min(self.n_segments, L)
+        edges = torch.linspace(0, L, steps=segments + 1, device=feat.device)
         edges = edges.round().long()
         states = []
         queries = self.mechanism_queries.unsqueeze(0).expand(B, -1, -1)
@@ -137,8 +236,8 @@ class ChannelTemporalMechanismEncoder(nn.Module):
             start = int(edges[s].item())
             end = int(edges[s + 1].item())
             if end <= start:
-                end = min(w, start + 1)
-            spatial = feat[:, :, :, start:end].flatten(2).transpose(1, 2).contiguous()
+                end = min(L, start + 1)
+            spatial = tokens[:, start:end, :]
             attended, _ = self.attn(query=queries, key=spatial, value=spatial, need_weights=False)
             state = self.norm(attended)
             state = state + self.ffn(state)
@@ -179,10 +278,14 @@ class DynamicCausalGraphLearner(nn.Module):
         edge_bias: float = -4.0,
         lag_edge_bias: float = -2.5,
         init_tau: float = 1.0,
+        prior_mode: str = "bias_gate",
+        prior_strength: float = 1.0,
     ):
         super().__init__()
         self.n_nodes = n_nodes
         self.max_lag = max_lag
+        self.prior_mode = str(prior_mode)
+        self.prior_strength = float(prior_strength)
         self.base_dag_logits = nn.Parameter(torch.full((n_nodes, n_nodes), float(edge_bias)))
         self.lag_logits = nn.Parameter(torch.full((max_lag, n_nodes, n_nodes), float(lag_edge_bias)))
         self.q_child = nn.Linear(d_model, d_model, bias=False)
@@ -192,11 +295,16 @@ class DynamicCausalGraphLearner(nn.Module):
     @staticmethod
     def _acyclicity_loss(A: torch.Tensor) -> torch.Tensor:
         B, M, _ = A.shape
-        W_sq = (A * A).clamp(max=2.0)  # prevent matrix_exp overflow (e^24 → Inf)
+        # NOTEARS: h(A) = tr(exp(A o A)) - d.  Since A is a sigmoid adjacency
+        # probability in [0, 1], A o A is already bounded; do not clamp h itself,
+        # because that would zero the gradient exactly when the graph is too cyclic.
+        W_sq = A * A
         expm = torch.linalg.matrix_exp(W_sq)
         h = expm.diagonal(dim1=-2, dim2=-1).sum(dim=-1) - M
-        h = h.clamp(max=100.0)  # prevent h² gradient explosion
-        return (h * h).mean()
+        # h is non-negative for non-negative A.  Minimizing h directly gives a
+        # stronger soft constraint than h² near feasible DAGs, where h² can make
+        # the gradient vanish too early under small lambda_notears.
+        return h.clamp_min(0.0).mean()
 
     def _asym_score(self, parent_states: torch.Tensor, child_states: torch.Tensor) -> torch.Tensor:
         # Returns score[j,i] = parent_j -> child_i.
@@ -208,7 +316,11 @@ class DynamicCausalGraphLearner(nn.Module):
         # Clamp to prevent extreme logits → sigmoid saturation → matrix_exp overflow
         return score.clamp(-20.0, 20.0)
 
-    def forward(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        states: torch.Tensor,
+        lag_prior: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if states.dim() != 4:
             raise ValueError(f"states must be (B,S,M,D), got {tuple(states.shape)}")
         B, S, M, _ = states.shape
@@ -230,12 +342,23 @@ class DynamicCausalGraphLearner(nn.Module):
                 score_lag = self._asym_score(parent_states, child_states)
             else:
                 score_lag = torch.zeros(B, M, M, device=states.device, dtype=states.dtype)
-            Al = torch.sigmoid(self.lag_logits[lag - 1].unsqueeze(0) + score_lag)
+            lag_logits = self.lag_logits[lag - 1].unsqueeze(0) + score_lag
+            if lag_prior is not None and self.prior_mode in {"bias", "bias_gate"}:
+                p = lag_prior[:, lag - 1].clamp(1e-4, 1.0 - 1e-4).view(B, 1, 1)
+                lag_logits = lag_logits + self.prior_strength * torch.logit(p)
+            Al = torch.sigmoid(lag_logits)
+            if lag_prior is not None and self.prior_mode in {"gate", "bias_gate"}:
+                Al = Al * lag_prior[:, lag - 1].view(B, 1, 1)
             lag_graphs.append(Al)
         Alags = torch.stack(lag_graphs, dim=1)  # (B,P,M,M)
 
         sparsity_loss = 0.5 * A0.mean() + 0.5 * Alags.mean()
-        return A0, Alags, notears_loss, sparsity_loss
+        if lag_prior is None:
+            prior_loss = states.new_zeros(())
+        else:
+            learned_lag_strength = Alags.mean(dim=(-1, -2))
+            prior_loss = F.mse_loss(learned_lag_strength, lag_prior.detach())
+        return A0, Alags, notears_loss, sparsity_loss, prior_loss
 
 
 class LaggedMechanismPredictor(nn.Module):
@@ -392,6 +515,14 @@ class CTICD(nn.Module):
         lambda_notears: float = 1e-3,
         lambda_sparsity: float = 1e-2,
         lambda_smooth: float = 1e-3,
+        lambda_prior: float = 1e-1,
+        use_lag_prior: bool = True,
+        lag_prior_method: str = "acf",
+        lag_prior_mode: str = "bias_gate",
+        lag_prior_strength: float = 1.0,
+        lag_prior_significance: bool = True,
+        lag_prior_bins: int = 16,
+        signal_length: Optional[int] = None,
         injection_init: float = -4.0,
     ):
         super().__init__()
@@ -408,6 +539,12 @@ class CTICD(nn.Module):
         self.lambda_notears = float(lambda_notears)
         self.lambda_sparsity = float(lambda_sparsity)
         self.lambda_smooth = float(lambda_smooth)
+        self.lambda_prior = float(lambda_prior)
+        self.use_lag_prior = bool(use_lag_prior)
+        self.lag_prior_method = str(lag_prior_method)
+        self.lag_prior_significance = bool(lag_prior_significance)
+        self.lag_prior_bins = int(lag_prior_bins)
+        self.signal_length = int(signal_length) if signal_length is not None else None
 
         self.channel_encoders = nn.ModuleList([
             ChannelTemporalMechanismEncoder(
@@ -426,6 +563,8 @@ class CTICD(nn.Module):
             max_lag=max_lag,
             edge_bias=edge_bias,
             lag_edge_bias=lag_edge_bias,
+            prior_mode=lag_prior_mode,
+            prior_strength=lag_prior_strength,
         )
         # Validate temporal constraint: need more segments than lags for
         # meaningful lagged prediction.  Without this, _aggregate_lagged
@@ -447,7 +586,7 @@ class CTICD(nn.Module):
             raise ValueError(f"image has {image.shape[1]} channels, expected at least {self.n_channels}")
         states = []
         for c in range(self.n_channels):
-            states.append(self.channel_encoders[c](image[:, c:c + 1]))
+            states.append(self.channel_encoders[c](image[:, c:c + 1], valid_length=self.signal_length))
         return torch.cat(states, dim=2)  # (B,S,M,D)
 
     def forward(
@@ -479,13 +618,26 @@ class CTICD(nn.Module):
                         "cticd_smooth": torch.tensor(0.0, device=device)},
             )
         stable = self.splitter(raw)
-        A0, Alags, notears_loss, sparsity_loss = self.graph_learner(stable)
+        if self.use_lag_prior:
+            lag_prior = compute_lag_dependency_prior(
+                source_image.float(),
+                max_lag=self.max_lag,
+                n_segments=self.n_segments,
+                method=self.lag_prior_method,
+                significance=self.lag_prior_significance,
+                bins=self.lag_prior_bins,
+                valid_length=self.signal_length,
+            ).to(device=device, dtype=stable.dtype)
+        else:
+            lag_prior = None
+        A0, Alags, notears_loss, sparsity_loss, prior_loss = self.graph_learner(stable, lag_prior=lag_prior)
         # NaN guard: if graph produces NaN/Inf, use zero graph
         if not torch.isfinite(A0).all():
             A0 = torch.zeros(B, self.n_nodes, self.n_nodes, device=device)
             Alags = torch.zeros(B, self.max_lag, self.n_nodes, self.n_nodes, device=device)
             notears_loss = torch.tensor(0.0, device=device)
             sparsity_loss = torch.tensor(0.0, device=device)
+            prior_loss = torch.tensor(0.0, device=device)
         attr_pooled = _pool_attr(attr_emb, B, self.attr_dim, device)
 
         pred, target, causal_state = self.predictor(stable, Alags, attr_pooled, intervention=intervention)
@@ -506,6 +658,7 @@ class CTICD(nn.Module):
             + self.lambda_notears * notears_loss
             + self.lambda_sparsity * sparsity_loss
             + self.lambda_smooth * smooth_loss
+            + self.lambda_prior * prior_loss
         )
         losses = {
             "cticd_total": total,
@@ -514,9 +667,12 @@ class CTICD(nn.Module):
             "cticd_notears": notears_loss.detach(),
             "cticd_sparsity": sparsity_loss.detach(),
             "cticd_smooth": smooth_loss.detach(),
+            "cticd_prior": prior_loss.detach(),
             "cticd_edge_density": A0.detach().mean(),
             "cticd_lag_edge_density": Alags.detach().mean(),
         }
+        if lag_prior is not None:
+            losses["cticd_lag_prior_mean"] = lag_prior.detach().mean()
         return CTICDOutput(
             causal_features=causal_features,
             causal_graph=A0,

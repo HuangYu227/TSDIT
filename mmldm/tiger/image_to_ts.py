@@ -359,3 +359,45 @@ class ImageToTSDecoder(nn.Module):
 
         x = x_norm * (max_val - min_val) + min_val
         return x
+
+
+# ---------------------------------------------------------------------------
+# Row-Raster Decoder (bijective)
+# ---------------------------------------------------------------------------
+
+class RowRasterDecoder(nn.Module):
+    """Decode row-raster images back to time series.
+
+    Reads the single row-major signal channel directly — perfectly bijective.
+    Same interface as ImageToTSDecoder.decode().
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def decode(
+        self,
+        image: torch.Tensor,
+        ts_length: int,
+        norm_params: NormParams,
+    ) -> torch.Tensor:
+        """Decode a batch of row-raster images into time series.
+
+        Args:
+            image: (B, 1, H, W) with values in [0, 1].
+            ts_length: target output length T.
+            norm_params: stored by RowRasterEncoder.encode().
+        Returns:
+            (B, T) time series in the original scale.
+        """
+        if image.dim() != 4 or image.shape[1] != 1:
+            raise ValueError(f"Expected row-raster image (B,1,H,W), got {tuple(image.shape)}")
+        B = image.shape[0]
+
+        # Read the single row-major channel and take the valid time range.
+        flat = image[:, 0].reshape(B, -1)  # (B, H*W)
+        x_norm = flat[:, :ts_length].clamp(0.0, 1.0)  # (B, T)
+
+        # Denormalize to original scale
+        x = ImageToTSDecoder._denormalize(x_norm, norm_params)
+        return x
