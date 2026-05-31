@@ -1,7 +1,7 @@
 {
     "data": {
         "representation": "row_raster",
-        "patch_size": 2,
+        "patch_size": 8,
         "dataset_type": "csv",
         "datasets": ["ETTh1"],
         "time_interval": 24,
@@ -12,10 +12,11 @@
     },
     "diffusion": {
         "in_channels": 1,
-        "channels": 64,
+        "channels": 128,
         "nheads": 8,
         "layers": 8,
-        "base_patch": 8,
+        "diffusion_embedding_dim": 256,
+        "base_patch": 2,
         "condition_type": "adaLN"
     },
     "condition": {
@@ -31,22 +32,22 @@
         "image": {
             "encoder": "vit",
             "in_channels": 1,
-            "patch_size": 8,
-            "embed_dim": 192,
+            "patch_size": 2,
+            "embed_dim": 256,
             "depth": 4,
-            "num_heads": 6
+            "num_heads": 8
         }
     },
     "csa_moe": { "enabled": true, "k": 1, "alpha": 0.01, "inject_aux": false },
     "cticd": {
         "enabled": true,
-        "d_model": 64,
+        "d_model": 128,
         "n_channels": 1,
         "n_mechanisms_per_channel": 4,
         "n_segments": 8,
         "max_lag": 2,
-        "patch_size": 8,
-        "num_heads": 4,
+        "patch_size": 2,
+        "num_heads": 8,
         "edge_bias": -4.0,
         "lag_edge_bias": -2.5,
         "branch_grad_scale": 0.2,
