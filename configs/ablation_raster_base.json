@@ -1,0 +1,42 @@
+{
+    "data": {
+        "representation": "row_raster",
+        "patch_size": 2,
+        "dataset_type": "csv",
+        "datasets": ["ETTh1"],
+        "time_interval": 24,
+        "image_size": 64,
+        "n_fft": 64,
+        "hop_length": 16,
+        "decode_mode": "row_raster"
+    },
+    "diffusion": {
+        "in_channels": 1,
+        "channels": 64,
+        "nheads": 8,
+        "layers": 8,
+        "base_patch": 8,
+        "condition_type": "adaLN"
+    },
+    "condition": {
+        "cond_mode": "text_image",
+        "decode_scale_mode": "global",
+        "reference": {
+            "mode": "masked_self",
+            "mask_layout": "row_major",
+            "mask_ratio": 0.5,
+            "noise_std": 0.02,
+            "fill": 0.5
+        },
+        "image": {
+            "encoder": "vit",
+            "in_channels": 1,
+            "patch_size": 8,
+            "embed_dim": 192,
+            "depth": 4,
+            "num_heads": 6
+        }
+    },
+    "csa_moe": { "enabled": false },
+    "cticd": { "enabled": false }
+}
