@@ -137,8 +137,12 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x):
         # (B, C, H, W) -> pad if needed -> (B, embed_dim, H/P, W/P) -> (B, num_patches, embed_dim)
-        if self.pad_h > 0 or self.pad_w > 0:
-            x = F.pad(x, (0, self.pad_w, 0, self.pad_h))
+        # Dynamically compute padding from actual tensor shape (may differ from __init__ img_size)
+        _, _, h, w = x.shape
+        pad_h = (self.patch_size - h % self.patch_size) % self.patch_size
+        pad_w = (self.patch_size - w % self.patch_size) % self.patch_size
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
         return self.proj(x).flatten(2).transpose(1, 2)
 
 

@@ -88,7 +88,7 @@ class TIGERGenerator(nn.Module):
             image_cfg = dict(cond_config.get("image", {}))
             image_cfg.setdefault("device", self.device)
             if "image_size_h" in diff_config and "image_size_w" in diff_config:
-                image_cfg.setdefault("img_size", (diff_config["image_size_h"], diff_config["image_size_w"]))
+                image_cfg["img_size"] = (diff_config["image_size_h"], diff_config["image_size_w"])
             else:
                 image_cfg.setdefault("img_size", diff_config.get("image_size", self.config.get("image_size", 64)))
             image_cfg.setdefault("in_channels", diff_config.get("in_channels", 3))
