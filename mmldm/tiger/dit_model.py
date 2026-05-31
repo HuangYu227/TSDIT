@@ -120,7 +120,7 @@ class ImagePatchEmbedding(nn.Module):
         pad_h = (ps - H % ps) % ps
         pad_w = (ps - W % ps) % ps
         if pad_h or pad_w:
-            x = F.pad(x, (0, pad_w, 0, pad_h))  # (left, right, top, bottom)
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='replicate')  # (left, right, top, bottom)
 
         # Unfold: (B, C*ps*ps, n_h*n_w)
         x = F.unfold(x, kernel_size=ps, stride=ps)

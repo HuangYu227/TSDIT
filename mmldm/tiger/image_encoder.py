@@ -142,7 +142,7 @@ class PatchEmbed(nn.Module):
         pad_h = (self.patch_size - h % self.patch_size) % self.patch_size
         pad_w = (self.patch_size - w % self.patch_size) % self.patch_size
         if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, (0, pad_w, 0, pad_h))
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='replicate')
         return self.proj(x).flatten(2).transpose(1, 2)
 
 
