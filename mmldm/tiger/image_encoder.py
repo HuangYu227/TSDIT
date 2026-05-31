@@ -1,4 +1,4 @@
-"""Image Encoder for TIGER — encode 3-channel images (GAF+STFT+RP) into embeddings.
+"""Image Encoder for TIGER — encode TS-images into embeddings.
 
 Provides three encoder variants:
   - ImageEncoder:  CLIP ViT (frozen) + learned projection MLP
@@ -118,12 +118,16 @@ class PatchEmbed(nn.Module):
 
     def __init__(self, img_size=64, patch_size=8, in_chans=3, embed_dim=192):
         super().__init__()
-        self.num_patches = (img_size // patch_size) ** 2
+        if isinstance(img_size, (tuple, list)):
+            img_h, img_w = int(img_size[0]), int(img_size[1])
+        else:
+            img_h = img_w = int(img_size)
+        self.num_patches = (img_h // patch_size) * (img_w // patch_size)
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size,
                               stride=patch_size)
 
     def forward(self, x):
-        # (B, 3, H, W) -> (B, embed_dim, H/P, W/P) -> (B, num_patches, embed_dim)
+        # (B, C, H, W) -> (B, embed_dim, H/P, W/P) -> (B, num_patches, embed_dim)
         return self.proj(x).flatten(2).transpose(1, 2)
 
 
@@ -153,7 +157,7 @@ class TransformerBlock(nn.Module):
 
 
 class ViTEncoder(nn.Module):
-    """Lightweight Vision Transformer for 3-channel images.
+    """Lightweight Vision Transformer for TS-images.
 
     Designed for 64×64 spectrogram images. Splits into 8×8 patches
     (64 tokens), applies Transformer self-attention, and outputs a
@@ -166,8 +170,9 @@ class ViTEncoder(nn.Module):
             image_emb : int
                 Output embedding dimension per token.
         Optional keys:
-            img_size  : int, default 64
+            img_size  : int or (height, width), default 64
             patch_size: int, default 8
+            in_channels: int, default 3
             embed_dim : int, default 192
             depth     : int, default 4  (number of Transformer layers)
             num_heads : int, default 6
@@ -179,6 +184,7 @@ class ViTEncoder(nn.Module):
         super().__init__()
         img_size = configs.get("img_size", 64)
         patch_size = configs.get("patch_size", 8)
+        in_channels = configs.get("in_channels", configs.get("in_chans", 3))
         embed_dim = configs.get("embed_dim", 192)
         depth = configs.get("depth", 4)
         num_heads = configs.get("num_heads", 6)
@@ -186,7 +192,7 @@ class ViTEncoder(nn.Module):
         drop = configs.get("drop", 0.1)
         out_dim = configs["image_emb"]
 
-        self.patch_embed = PatchEmbed(img_size, patch_size, 3, embed_dim)
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_channels, embed_dim)
         num_patches = self.patch_embed.num_patches
 
         # CLS token + positional embedding
@@ -216,7 +222,7 @@ class ViTEncoder(nn.Module):
         Parameters
         ----------
         images : torch.Tensor
-            Float tensor of shape ``(B, 3, H, W)``.
+            Float tensor of shape ``(B, C, H, W)``.
 
         Returns
         -------
@@ -238,7 +244,7 @@ class ViTEncoder(nn.Module):
 
 
 class CNNEncoder(nn.Module):
-    """Lightweight CNN encoder for 3-channel images.
+    """Lightweight CNN encoder for TS-images.
 
     A simple 4-layer convolutional network that can serve as a drop-in
     replacement for :class:`ImageEncoder` when CLIP is unavailable.
@@ -256,10 +262,11 @@ class CNNEncoder(nn.Module):
     def __init__(self, configs: dict):
         super().__init__()
         out_dim = configs["image_emb"]
+        in_channels = configs.get("in_channels", configs.get("in_chans", 3))
 
         self.features = nn.Sequential(
-            # Block 1: 3 -> 16
-            nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1),
+            # Block 1: C -> 16
+            nn.Conv2d(in_channels, 16, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(4, 16),
             nn.ReLU(inplace=True),
             # Block 2: 16 -> 32
@@ -286,7 +293,7 @@ class CNNEncoder(nn.Module):
         Parameters
         ----------
         images : torch.Tensor
-            Float tensor of shape ``(B, 3, H, W)``.
+            Float tensor of shape ``(B, C, H, W)``.
 
         Returns
         -------
