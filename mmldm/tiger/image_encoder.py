@@ -114,7 +114,10 @@ class ImageEncoder(nn.Module):
 
 
 class PatchEmbed(nn.Module):
-    """Split image into patches and project to embedding dimension."""
+    """Split image into patches and project to embedding dimension.
+
+    Automatically pads images smaller than patch_size.
+    """
 
     def __init__(self, img_size=64, patch_size=8, in_chans=3, embed_dim=192):
         super().__init__()
@@ -122,12 +125,20 @@ class PatchEmbed(nn.Module):
             img_h, img_w = int(img_size[0]), int(img_size[1])
         else:
             img_h = img_w = int(img_size)
-        self.num_patches = (img_h // patch_size) * (img_w // patch_size)
+        self.patch_size = patch_size
+        # Compute padded dimensions
+        pad_h = (patch_size - img_h % patch_size) % patch_size
+        pad_w = (patch_size - img_w % patch_size) % patch_size
+        self.pad_h = pad_h
+        self.pad_w = pad_w
+        self.num_patches = ((img_h + pad_h) // patch_size) * ((img_w + pad_w) // patch_size)
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size,
                               stride=patch_size)
 
     def forward(self, x):
-        # (B, C, H, W) -> (B, embed_dim, H/P, W/P) -> (B, num_patches, embed_dim)
+        # (B, C, H, W) -> pad if needed -> (B, embed_dim, H/P, W/P) -> (B, num_patches, embed_dim)
+        if self.pad_h > 0 or self.pad_w > 0:
+            x = F.pad(x, (0, self.pad_w, 0, self.pad_h))
         return self.proj(x).flatten(2).transpose(1, 2)
 
 
