@@ -295,8 +295,17 @@ def calc_mse(real: np.ndarray, gen: np.ndarray) -> float:
 
 
 def calc_wape(real: np.ndarray, gen: np.ndarray) -> float:
-    """WAPE: sum(|real - gen|) / sum(|real|). T2S style."""
-    return float(np.sum(np.abs(real - gen)) / (np.sum(np.abs(real)) + 1e-8))
+    """WAPE macro: per-sample WAPE then nanmean. Matches T2S calculate_wape."""
+    real = real.reshape(real.shape[0], -1)
+    gen = gen.reshape(gen.shape[0], -1)
+    values = []
+    for i in range(real.shape[0]):
+        denom = np.sum(np.abs(real[i]))
+        if denom != 0:
+            values.append(np.sum(np.abs(real[i] - gen[i])) / denom)
+        else:
+            values.append(np.nan)
+    return float(np.nanmean(values))
 
 
 # ---------------------------------------------------------------------------
@@ -833,24 +842,37 @@ class TIGERTrainer:
 
         msg = f"         | MSE_01={mse_01:.6f} | WAPE_01={wape_01:.4f}"
 
-        # CaTSG metrics on original scale (matches CaTSG paper evaluation)
+        # Unified metrics on original scale + [0,1] diagnostics
         try:
-            from .evaluation.catsg_metrics import compute_all_catsg_metrics
-            catsg = compute_all_catsg_metrics(real_orig, gen_orig, cond=cond_np, device=self.device)
-            for k, v in catsg.items():
-                self.writer.add_scalar(f"{prefix}/{k}", v, epoch)
-                result[k] = v
-            msg += f" | MDD={catsg['MDD']:.4f} KL={catsg['KL']:.4f} MMD={catsg['MMD']:.6f}"
-            if "J-FTSD" in catsg:
-                msg += f" J-FTSD={catsg['J-FTSD']:.4f}"
+            from .evaluation.unified_metrics import compute_all_unified_metrics
+            um = compute_all_unified_metrics(
+                real_raw=real_orig,
+                gen_raw=gen_orig,
+                condition=cond_np,
+                global_min=g_min,
+                global_max=g_max,
+                device=self.device,
+                compute_01=True,
+                compute_cfid=False,
+                compute_jftsd=cond_np is not None,
+            )
+            # Log raw-scale metrics
+            for key in ["MDD_raw_20", "KL_raw_flat", "out_of_range_rate_raw", "MMD_raw_rbf"]:
+                if key in um:
+                    self.writer.add_scalar(f"{prefix}/{key}", um[key], epoch)
+                    result[key] = um[key]
+            if um.get("J_FTSD") is not None:
+                self.writer.add_scalar(f"{prefix}/J_FTSD", um["J_FTSD"], epoch)
+                result["J_FTSD"] = um["J_FTSD"]
+            msg += f" | MDD_raw={um['MDD_raw_20']:.4f} KL_raw={um['KL_raw_flat']:.4f} MMD_raw={um['MMD_raw_rbf']:.6f}"
+            if um.get("J_FTSD") is not None:
+                msg += f" J-FTSD={um['J_FTSD']:.4f}"
 
-            # Also compute CaTSG on global [0,1] scale (no per-sample leakage).
-            # Namespaced with "_01" suffix to distinguish from original-scale.
-            catsg_01 = compute_all_catsg_metrics(real_01, gen_01, cond=cond_np, device=self.device)
-            for k, v in catsg_01.items():
-                key_01 = f"{k}_01"
-                self.writer.add_scalar(f"{prefix}/{key_01}", v, epoch)
-                result[key_01] = v
+            # Log [0,1] diagnostics
+            for key in ["MDD_01_20", "KL_01_flat", "MMD_01_rbf"]:
+                if key in um:
+                    self.writer.add_scalar(f"{prefix}/{key}", um[key], epoch)
+                    result[key] = um[key]
         except Exception as e:
             print(f"         | CaTSG metrics skipped: {e}")
 

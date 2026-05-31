@@ -143,6 +143,11 @@ def calculate_mdd_baseline(
         for t in range(T):
             real_col = real[:, t, d]
             gen_col = gen[:, t, d]
+            mask = ~np.isnan(real_col) & ~np.isnan(gen_col)
+            real_col = real_col[mask]
+            gen_col = gen_col[mask]
+            if len(real_col) == 0 or len(gen_col) == 0:
+                continue
 
             # Build histogram from real
             a, b = real_col.min(), real_col.max()
