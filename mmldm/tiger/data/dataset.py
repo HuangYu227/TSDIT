@@ -19,7 +19,9 @@ class TIGERDataset(Dataset):
     def __init__(self, data_dir, split="train", dataset_type="weather_npy",
                  datasets=None, time_interval=24, max_samples=None,
                  image_size=64, n_fft=64, hop_length=8, epsilon_quantile=0.1,
-                 seed=123, split_ratio=(0.8, 0.1, 0.1)):
+                 seed=123, split_ratio=(0.8, 0.1, 0.1),
+                 ref_image_mode: str | None = None,
+                 ref_image_size: int = 32):
         super().__init__()
         self.data_dir = data_dir
         self.split = split
@@ -28,6 +30,8 @@ class TIGERDataset(Dataset):
         self.max_samples = max_samples
         self.seed = seed
         self.split_ratio = split_ratio  # (train, val, test) for CSV without 'split' column
+        self.ref_image_mode = ref_image_mode
+        self.ref_image_size = ref_image_size
 
         # TS→Image encoder
         self.ts_to_image = TSToImageEncoder(
@@ -47,6 +51,9 @@ class TIGERDataset(Dataset):
 
         # Pre-compute images for all samples
         self._precompute_images()
+
+        # Pre-compute reference images (for multi-modal conditioning)
+        self._precompute_ref_images()
 
     def _load_weather_npy(self):
         """Load Weather dataset in VerbalTS .npy format."""
@@ -162,6 +169,42 @@ class TIGERDataset(Dataset):
         self.ts_max = self.norm_params.max_val
         print(f"Images computed: {self.images.shape}")
 
+    def _precompute_ref_images(self):
+        """Pre-compute reference images for multi-modal conditioning.
+
+        ``ref_image_mode=None`` → no reference images (backward compatible).
+        ``ref_image_mode="self"`` → ref_image = same as target image
+            (self-conditioning; the DiT sees the clean image as condition).
+        ``ref_image_mode="different_encoding"`` → encodes the same TS with
+            a different image_size (e.g. 32 vs 64), providing a multi-scale
+            conditioning signal.
+        """
+        if self.ref_image_mode is None:
+            self.ref_images = None
+            return
+
+        if self.ref_image_mode == "self":
+            # Reference image = target image (self-conditioning)
+            self.ref_images = self.images.clone()
+            print(f"Ref images (self): {self.ref_images.shape}")
+
+        elif self.ref_image_mode == "different_encoding":
+            ref_encoder = TSToImageEncoder(
+                image_size=self.ref_image_size,
+                n_fft=self.ts_to_image.n_fft,
+                hop_length=self.ts_to_image.hop_length,
+                epsilon_quantile=self.ts_to_image.epsilon_quantile,
+            )
+            ts_tensor = torch.tensor(self.ts_data[:self.n_samples], dtype=torch.float32)
+            if ts_tensor.ndim == 1:
+                ts_tensor = ts_tensor.unsqueeze(0)
+            self.ref_images, _ = ref_encoder.encode(ts_tensor)
+            print(f"Ref images (different_encoding, size={self.ref_image_size}): {self.ref_images.shape}")
+
+        else:
+            raise ValueError(f"Unknown ref_image_mode: '{self.ref_image_mode}'. "
+                             f"Use None, 'self', or 'different_encoding'.")
+
     def __len__(self):
         return self.n_samples
 
@@ -183,10 +226,13 @@ class TIGERDataset(Dataset):
             "tp": self.time_points,               # (T,)
             "ts_len": self.n_steps,
         }
-        
+
+        if self.ref_images is not None:
+            sample["ref_image"] = self.ref_images[idx]
+
         if self.attrs is not None:
             sample["attrs"] = self.attrs[idx]
-        
+
         return sample
 
 
@@ -220,6 +266,9 @@ class TIGERCollateFn:
             "tp": tp,
             "ts_len": ts_len,
         }
+
+        if "ref_image" in batch[0] and batch[0]["ref_image"] is not None:
+            result["ref_image"] = torch.stack([b["ref_image"] for b in batch])
 
         if "attrs" in batch[0]:
             result["attrs"] = torch.stack([torch.tensor(b["attrs"]) for b in batch])

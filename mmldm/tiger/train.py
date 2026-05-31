@@ -77,18 +77,73 @@ def get_default_config() -> dict:
             "in_channels": 3,
             "condition_type": "adaLN",
             "attention_mask_type": "parallel",
+            "lambda_cticd": 0.1,
+            "lambda_moe": 0.05,
         },
 
         "condition": {
-            "cond_mode": "text_only",
+            # Paper-ready default: true text+image conditioning.
+            # Use "text_only" only for baseline ablations.
+            "cond_mode": "text_image",
             "num_stages": 4,
-            "cfg_dropout": 0.3,          # 30% prob to drop text for CFG training
+            "cfg_dropout": 0.10,
+            "drop_text_prob": 0.10,
+            "drop_image_prob": 0.10,
+            "drop_both_prob": 0.10,
+            "joint_emb": 128,
+            "fusion_heads": 8,
+            "fusion_layers": 2,
+            "reference": {
+                "mode": "masked_self",
+                "mask_ratio": 0.50,
+                "noise_std": 0.02,
+                "fill": 0.5,
+            },
+            "decode_scale_mode": "global",  # avoids oracle per-sample min/max at test time
+            "text_guidance_scale": 1.0,
+            "image_guidance_scale": 1.0,
+            "interaction_guidance_scale": 0.0,
             "text": {
                 "pretrain_model_path": "openai/clip-vit-base-patch32",
                 "pretrain_model_dim": 512,
                 "textemb_hidden_dim": 256,
                 "text_emb": 128,
             },
+            "image": {
+                "encoder": "vit",
+                "img_size": 64,
+                "patch_size": 8,
+                "embed_dim": 192,
+                "depth": 4,
+                "num_heads": 6,
+                "image_emb": 128,
+            },
+        },
+
+        "csa_moe": {
+            "enabled": True,
+            "k": 1,
+            "alpha": 0.01,
+            "inject_aux": False,
+            "scca_heads": 8,
+        },
+
+        "cticd": {
+            "enabled": True,
+            "d_model": 64,
+            "n_channels": 3,
+            "n_mechanisms_per_channel": 4,
+            "n_segments": 8,
+            "max_lag": 2,
+            "patch_size": 4,
+            "num_heads": 4,
+            "edge_bias": -4.0,
+            "lag_edge_bias": -2.5,
+            "branch_grad_scale": 0.2,
+            "lambda_causal": 1.0,
+            "lambda_notears": 1e-3,
+            "lambda_sparsity": 1e-2,
+            "lambda_smooth": 1e-3,
         },
 
         "data": {
@@ -263,7 +318,7 @@ class TIGERTrainer:
         self.val_interval = config["val_interval"]
         self.display_interval = config["display_interval"]
         self.save_interval = config["save_interval"]
-        self.eval_gen_interval = config.get("eval_gen_interval", 5)
+        self.eval_gen_interval = config.get("eval_gen_interval", 3)  # gen metrics every 3 epochs
 
         if not config.get("eval_only", False):
             os.makedirs(config["save_dir"], exist_ok=True)
@@ -279,8 +334,11 @@ class TIGERTrainer:
         self._init_logging()
 
         dc = self.config["data"]
+        decode_mode = dc.get("decode_mode", "gasf")
+        if decode_mode not in ("gasf", "fused"):
+            raise ValueError(f"decode_mode must be 'gasf' or 'fused', got '{decode_mode}'")
         self.decoder = ImageToTSDecoder(
-            mode="gasf", n_fft=dc["n_fft"], hop_length=dc["hop_length"]
+            mode=decode_mode, n_fft=dc["n_fft"], hop_length=dc["hop_length"]
         ).to(self.device)
 
         self.best_val_loss = float("inf")
@@ -359,7 +417,7 @@ class TIGERTrainer:
         self.model = TIGERGenerator(model_config)
 
         if self.config.get("model_path"):
-            print(f"Loading pretrained model from {self.config['model_path']}")
+            print(f"Loading checkpoint from {self.config['model_path']}")
             ckpt = torch.load(self.config["model_path"], map_location=self.device)
             # Support both old (state_dict only) and new (dict) checkpoint formats
             if isinstance(ckpt, dict) and "model" in ckpt:
@@ -368,6 +426,20 @@ class TIGERTrainer:
                     print(f"WARNING: Checkpoint missing keys ({len(missing)}): {missing[:5]}...")
                 if unexpected:
                     print(f"WARNING: Checkpoint unexpected keys ({len(unexpected)}): {unexpected[:5]}...")
+                # Resume optimizer/scheduler state for continued training
+                if not self.config.get("eval_only", False) and self.optimizer is not None:
+                    if ckpt.get("optimizer") is not None:
+                        self.optimizer.load_state_dict(ckpt["optimizer"])
+                        print("  Restored optimizer state")
+                    if ckpt.get("scheduler") is not None and self.scheduler is not None:
+                        self.scheduler.load_state_dict(ckpt["scheduler"])
+                        print("  Restored scheduler state")
+                    if ckpt.get("global_step") is not None:
+                        self.global_step = ckpt["global_step"]
+                        print(f"  Restored global_step={self.global_step}")
+                    if ckpt.get("val_loss") is not None:
+                        self.best_val_loss = ckpt["val_loss"]
+                        print(f"  Restored best_val_loss={self.best_val_loss:.6f}")
             else:
                 missing, unexpected = self.model.load_state_dict(ckpt, strict=False)
                 if missing:
@@ -549,7 +621,18 @@ class TIGERTrainer:
 
             total_loss += loss_dict["all"].item()
             num_updates += 1
-            pbar.set_postfix(loss=f"{loss_dict['all'].item():.4f}", grad=f"{grad_norm:.2f}", lr=f"{self.scheduler.get_lr():.2e}")
+
+            # Build compact postfix: total loss + key sub-losses if present
+            postfix = {"loss": f"{loss_dict['all'].item():.4f}"}
+            if "noise_loss" in loss_dict:
+                postfix["noise"] = f"{loss_dict['noise_loss'].item():.4f}"
+            if "cticd_weighted" in loss_dict:
+                postfix["cticd"] = f"{loss_dict['cticd_weighted'].item():.4f}"
+            if "moe_aux" in loss_dict:
+                postfix["moe"] = f"{loss_dict['moe_aux'].item():.4f}"
+            postfix["grad"] = f"{grad_norm:.2f}"
+            postfix["lr"] = f"{self.scheduler.get_lr():.2e}"
+            pbar.set_postfix(postfix)
 
             # Log per-step
             for k, v in loss_dict.items():
@@ -562,9 +645,31 @@ class TIGERTrainer:
         if skip_ratio > max_skip_ratio:
             print(f"\nWARNING: High skip ratio {skip_ratio:.1%} ({num_skipped}/{total_batches}) at epoch {epoch+1}")
 
+        # If no batches produced valid gradients, stop early
+        if num_updates == 0:
+            print(f"\nEpoch {epoch+1:>4d} | ALL BATCHES SKIPPED ({num_skipped} skipped) — stopping early")
+            return float("inf")
+
         avg_loss = total_loss / max(1, num_updates)
         dt = time.time() - t0
-        print(f"Epoch {epoch+1:>4d} | train_loss={avg_loss:.6f} | lr={self.scheduler.get_lr():.2e} | {dt:.1f}s | skipped={num_skipped}/{total_batches}")
+        # Build compact loss breakdown from the last batch's loss_dict
+        loss_parts = [f"train_loss={avg_loss:.6f}"]
+        if num_updates > 0:
+            # We sample the last batch's sub-losses for a snapshot
+            sub = {}
+            for k in ["noise_loss", "cticd_weighted", "moe_aux"]:
+                if k in loss_dict:
+                    sub[k] = loss_dict[k].item()
+            if "noise_loss" in sub:
+                loss_parts.append(f"noise={sub['noise_loss']:.4f}")
+            if "cticd_weighted" in sub:
+                loss_parts.append(f"cticd={sub['cticd_weighted']:.4f}")
+            if "moe_aux" in sub:
+                loss_parts.append(f"moe={sub['moe_aux']:.4f}")
+        loss_parts.append(f"lr={self.scheduler.get_lr():.2e}")
+        loss_parts.append(f"{dt:.1f}s")
+        loss_parts.append(f"skip={num_skipped}/{total_batches}")
+        print(f"Epoch {epoch+1:>4d} | {' | '.join(loss_parts)}")
 
         self.writer.add_scalar("train_epoch/loss", avg_loss, epoch)
         self.writer.add_scalar("train_epoch/skip_ratio", skip_ratio, epoch)
@@ -622,7 +727,7 @@ class TIGERTrainer:
 
         if save_best and avg_loss < self.best_val_loss:
             self.best_val_loss = avg_loss
-            self._save_checkpoint(epoch, tag="best")
+            self._save_checkpoint(epoch, val_loss=avg_loss, tag="best")
             print(f"         *** New best val loss: {avg_loss:.6f}")
 
         return avg_loss
@@ -662,13 +767,35 @@ class TIGERTrainer:
 
         for batch in loader:
             texts = batch.get("cap", None)
+            images = batch["image"].to(self.device).float()
             ts_real = batch["ts"].to(self.device).float()
             ts_min = _squeeze_trailing_singletons(batch["ts_min"].to(self.device).float())
             ts_max = _squeeze_trailing_singletons(batch["ts_max"].to(self.device).float())
 
-            gen_imgs = self.model.generate(image_shape, texts, n_samples=1)
+            ref_images = None
+            if getattr(self.model, "is_multimodal", False):
+                ref_images = self.model._batch_reference(batch, images, is_train=False)
+
+            ccfg = self.config.get("condition", {})
+            gen_imgs = self.model.generate(
+                image_shape,
+                texts,
+                n_samples=1,
+                ref_images=ref_images,
+                guidance_scale=ccfg.get("text_guidance_scale", 1.0),
+                image_guidance_scale=ccfg.get("image_guidance_scale", 1.0),
+                interaction_guidance_scale=ccfg.get("interaction_guidance_scale", 0.0),
+            )
             gen_img = gen_imgs[0]
-            norm_params = NormParams(min_val=ts_min, max_val=ts_max, n_vars=1, original_length=ts_len)
+
+            decode_scale_mode = ccfg.get("decode_scale_mode", "global")
+            if decode_scale_mode == "per_sample_oracle":
+                dec_min, dec_max = ts_min, ts_max
+            else:
+                dec_min = torch.full_like(ts_min, float(g_min))
+                dec_max = torch.full_like(ts_max, float(g_max))
+
+            norm_params = NormParams(min_val=dec_min, max_val=dec_max, n_vars=1, original_length=ts_len)
             gen_ts = self.decoder.decode(gen_img, ts_len, norm_params)
             real_ts = denormalize_ts_batch(ts_real, ts_min, ts_max)
 
@@ -723,6 +850,14 @@ class TIGERTrainer:
             msg += f" | MDD={catsg['MDD']:.4f} KL={catsg['KL']:.4f} MMD={catsg['MMD']:.6f}"
             if "J-FTSD" in catsg:
                 msg += f" J-FTSD={catsg['J-FTSD']:.4f}"
+
+            # Also compute CaTSG on global [0,1] scale (no per-sample leakage).
+            # Namespaced with "_01" suffix to distinguish from original-scale.
+            catsg_01 = compute_all_catsg_metrics(real_01, gen_01, cond=cond_np, device=self.device)
+            for k, v in catsg_01.items():
+                key_01 = f"{k}_01"
+                self.writer.add_scalar(f"{prefix}/{key_01}", v, epoch)
+                result[key_01] = v
         except Exception as e:
             print(f"         | CaTSG metrics skipped: {e}")
 

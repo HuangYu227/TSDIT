@@ -158,8 +158,11 @@ def ts_to_recurrence(
     dist = diff.abs()
 
     # Threshold at the given quantile.
-    # Flatten the spatial dims to compute quantile.
-    flat = dist.reshape(*dist.shape[:-2], -1)
+    # Exclude self-distances (diagonal, always 0) to prevent degenerate
+    # threshold=0 for small epsilon_quantile values.
+    T = dist.shape[-1]
+    mask = ~torch.eye(T, dtype=torch.bool, device=dist.device)
+    flat = dist[..., mask].reshape(*dist.shape[:-2], -1)
     k = max(1, int(math.ceil(flat.shape[-1] * epsilon_quantile)))
     # topk on the *smallest* values
     threshold = flat.topk(k, dim=-1, largest=False).values[..., -1:]
@@ -209,7 +212,18 @@ class TSToImageEncoder:
 
     @staticmethod
     def _to_2d(ts: torch.Tensor) -> Tuple[torch.Tensor, bool, int]:
-        """Ensure input is (B, T).  Returns (ts_2d, was_multivariate, n_vars)."""
+        """Ensure input is (B, T).  Returns (ts_2d, was_multivariate, n_vars).
+
+        .. warning::
+           Multivariate (B, T, C) input is flattened to (B*C, T) by merging
+           the variable dimension into the batch.  This treats each variable
+           as an independent sample — joint distribution, synchronous
+           relationships, and cross-variable causality are **not** preserved.
+           The decoder returns (B*C, T) flat and does NOT reassemble into
+           (B, T, C).  For true multivariate generation, consider a joint
+           3D image encoding (C_var × channels × H × W) or cross-variable
+           attention coupling instead.
+        """
         if ts.dim() == 1:
             # (T,) -> (1, T)
             return ts.unsqueeze(0), False, 1

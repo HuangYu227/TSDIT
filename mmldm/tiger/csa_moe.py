@@ -5,6 +5,24 @@ consistency cross-attention, and auxiliary load-balancing loss.
 
 Reference: Diff-MoE (ICML 2025), TIGER dit_model.py
 
+.. important::
+   **Expert Naming Convention.**  ``GASFExpert``, ``STFTExpert``, and
+   ``RPExpert`` are named after the *inductive bias* each expert carries,
+   NOT after the image channel they process.  All three experts receive
+   tokens from all channels mixed together; the :class:`MoEGate` router
+   learns per-token routing based on token content, not channel identity.
+
+   - ``GASFExpert``: inductive bias for symmetric row/column structure
+     (computes row-mean and column-mean context).
+   - ``STFTExpert``: inductive bias for local frequency-time patterns
+     (learned depthwise convolution over a spatial patch).
+   - ``RPExpert``: inductive bias for gated nonlinear state transitions
+     (pointwise gated MLP, no spatial context).
+
+   In the paper, describe these as "three experts with distinct structural
+   inductive biases that the router learns to select among" rather than
+   "channel-bound experts."
+
 Usage:
     1. Wrap each ResidualBlock with ``ChannelAwareResidualBlock``.
     2. Pass ``grids: list[tuple[int,int]]`` so it can split the flat
@@ -107,7 +125,10 @@ class AddAuxiliaryLoss(torch.autograd.Function):
 class GASFExpert(nn.Module):
     """Sparse row/column structural expert for Gramian-like symmetric patterns.
 
-    Computes row/column context once, but only projects and mixes routed tokens.
+    .. note::
+       Named for its inductive bias, not its input.  Receives tokens from
+       **all** image channels; the router selects tokens whose structure
+       benefits from row/column context.
     """
 
     def __init__(self, dim: int):
@@ -164,10 +185,12 @@ class GASFExpert(nn.Module):
 
 
 class STFTExpert(nn.Module):
-    """Sparse local frequency-time expert.
+    """Sparse local frequency-time expert with depthwise convolution.
 
-    Extracts local patches only at routed token positions and applies
-    the depthwise kernel there, instead of convolving every token.
+    .. note::
+       Inductive bias for local spectral patterns, not STFT-channel-only.
+       Router selects tokens benefiting from patch-level frequency analysis
+       regardless of source channel.
     """
 
     def __init__(self, dim: int, ks: int = 3):
@@ -232,7 +255,12 @@ class STFTExpert(nn.Module):
 
 
 class RPExpert(nn.Module):
-    """Sparse token-wise gated MLP expert for recurrence/state-transition patterns."""
+    """Sparse token-wise gated MLP expert for recurrence/state-transition patterns.
+
+    .. note::
+       Inductive bias for gated nonlinear transformations, not RP-channel-only.
+       Router selects tokens where a pointwise gated MLP is most effective.
+    """
 
     def __init__(self, dim: int):
         super().__init__()
@@ -319,6 +347,22 @@ class CSAMoELayer(nn.Module):
         self.dim = dim
         self.use_cc = use_cc
         self.inject_aux = inject_aux
+
+        # SAFEGUARD: inject_aux and external _csa_moe_losses must NOT both be
+        # active on the same layer.  If both fire the aux loss contributes
+        # 1.0 (autograd) + lambda_moe/(scales*layers) (external) ≈ 321× the
+        # intended weight with default settings.  The external path (collected
+        # in dit_model.py → generator.py) is the primary mechanism; inject_aux
+        # is an alternative for standalone use.
+        if inject_aux:
+            import warnings
+            warnings.warn(
+                "CSAMoELayer: inject_aux=True adds aux loss via autograd trick "
+                "(weight 1.0).  If the trainer also reads _csa_moe_losses and "
+                "adds lambda_moe * aux, the aux loss will be double-counted.  "
+                "Use inject_aux=True ONLY when the external path is disabled.",
+                UserWarning, stacklevel=2,
+            )
 
         self.gasf = GASFExpert(dim)
         self.stft = STFTExpert(dim)
@@ -490,7 +534,10 @@ class StructuralConsistencyCrossAttention(nn.Module):
 
         g2_aligned = g2.clone()
         for i in range(n):
-            g2_aligned[:, i, i, :] = g2[:, i, i, :] + self.dp(aligned_diag[:, i, :])
+            # Replace diagonal with STFT-aligned version (NOT add to original).
+            # aligned_diag already carries GASF diagonal content; double-adding
+            # g2[:, i, i, :] would amplify diagonal values.
+            g2_aligned[:, i, i, :] = self.dp(aligned_diag[:, i, :])
 
         gfa = rearrange(g2_aligned, "b h w c -> b (h w) c")
 

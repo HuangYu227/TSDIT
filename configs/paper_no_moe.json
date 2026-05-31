@@ -1,0 +1,26 @@
+{
+    "data": {
+        "dataset_type": "csv",
+        "datasets": ["ETTh1"],
+        "time_interval": 24
+    },
+    "condition": {
+        "cond_mode": "text_image",
+        "drop_text_prob": 0.10,
+        "drop_image_prob": 0.10,
+        "drop_both_prob": 0.10,
+        "decode_scale_mode": "global",
+        "reference": {
+            "mode": "masked_self",
+            "mask_ratio": 0.50,
+            "noise_std": 0.02,
+            "fill": 0.5
+        }
+    },
+    "cticd": {
+        "enabled": true
+    },
+    "csa_moe": {
+        "enabled": false
+    }
+}

@@ -158,13 +158,16 @@ def compute_jftsd(real, gen, cond, emb_dim=64, train_steps=200, device="cpu"):
 
     for _ in range(train_steps):
         idx = torch.randperm(B)
-        z_t = F.normalize(x_enc(real[idx]), dim=-1)
-        z_m = F.normalize(c_enc(cond[idx]), dim=-1)
+        z_t = F.normalize(x_enc(real[idx]), dim=-1, eps=1e-8)
+        z_m = F.normalize(c_enc(cond[idx]), dim=-1, eps=1e-8)
         logits = (z_t @ z_m.T) / np.sqrt(emb_dim)
         labels = torch.arange(B, device=device)
         loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
         if not loss.requires_grad:
-            break
+            raise RuntimeError(
+                "J-FTSD training loss has no gradient — encoder parameters "
+                "may be frozen. Ensure the call is not inside torch.no_grad()."
+            )
         opt.zero_grad()
         loss.backward()
         opt.step()

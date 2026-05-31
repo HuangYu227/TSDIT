@@ -585,9 +585,13 @@ class TIGERDiT(nn.Module):
                 num_heads=cticd_cfg.get("num_heads", self.nheads),
                 edge_bias=cticd_cfg.get("edge_bias", -4.0),
                 branch_grad_scale=cticd_cfg.get("branch_grad_scale", 0.2),
-                lambda_causal=cticd_cfg.get("lambda_causal", 0.1),
+                n_segments=cticd_cfg.get("n_segments", 8),
+                max_lag=cticd_cfg.get("max_lag", 2),
+                lag_edge_bias=cticd_cfg.get("lag_edge_bias", -2.5),
+                lambda_causal=cticd_cfg.get("lambda_causal", 1.0),
                 lambda_notears=cticd_cfg.get("lambda_notears", 1e-3),
                 lambda_sparsity=cticd_cfg.get("lambda_sparsity", 1e-2),
+                lambda_smooth=cticd_cfg.get("lambda_smooth", 1e-3),
             )
 
     # -- mask builder -----------------------------------------------------------
@@ -615,13 +619,18 @@ class TIGERDiT(nn.Module):
         image: torch.Tensor,                    # (B, 3, H, W)
         diffusion_step: torch.Tensor,           # (B,)
         attr_emb: torch.Tensor | None = None,   # (B, attr_dim, n_h, n_w) or None
+        clean_image: torch.Tensor | None = None, # clean target image for CTICD during training
+        intervention: dict | None = None,        # optional do-intervention for causal sampling
     ) -> torch.Tensor:
         """
         Args:
             image:          ``(B, in_channels, H, W)`` noisy image.
             diffusion_step: ``(B,)`` integer timestep indices.
-            attr_emb:       ``(B, attr_dim, n_h, n_w)`` from TextOnlyProjector,
-                            or ``None`` for unconditional generation.
+            attr_emb:       ``(B, attr_dim, n_h, n_w)`` from TextOnlyProjector or
+                            MultiModalConditioner, or ``None`` for unconditional generation.
+            clean_image:    optional clean image used by CTICD to avoid learning
+                            graphs purely from noisy diffusion states.
+            intervention:   optional causal intervention dictionary passed to CTICD.
 
         Returns:
             noise_pred: ``(B, in_channels, H, W)`` predicted noise.
@@ -711,8 +720,11 @@ class TIGERDiT(nn.Module):
         if self.cticd is not None:
             cticd_out = self.cticd(
                 image=image,
+                clean_image=clean_image,
                 x_in=x_in,
                 attr_emb=attr_in,
+                diffusion_emb=diffusion_emb,
+                intervention=intervention,
             )
 
             self._cticd_losses = cticd_out.losses

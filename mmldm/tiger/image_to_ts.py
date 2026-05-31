@@ -57,7 +57,7 @@ def gasf_to_ts(gasf: torch.Tensor, ts_length: int) -> torch.Tensor:
     # Interpolate diagonal to target ts_length if needed.
     if n != ts_length:
         diag = F.interpolate(
-            diag.unsqueeze(1), size=ts_length, mode="linear", align_corners=True
+            diag.unsqueeze(1), size=ts_length, mode="linear", align_corners=False
         ).squeeze(1)
 
     # Recover x from diag = cos(2*arccos(x)) = 2*x^2 - 1
@@ -129,6 +129,13 @@ def griffin_lim(
             return_complex=True,
         )
         # Replace magnitude with the target, keep the estimated phase.
+        # Guard against istft→stft shape drift (common with center=True + short signals).
+        if complex_spec.shape[-1] != magnitude.shape[-1]:
+            diff = magnitude.shape[-1] - complex_spec.shape[-1]
+            if diff > 0:
+                complex_spec = F.pad(complex_spec, (0, diff))
+            else:
+                complex_spec = complex_spec[..., :magnitude.shape[-1]]
         complex_spec = magnitude * torch.exp(1j * complex_spec.angle())
 
     # Final inverse STFT.

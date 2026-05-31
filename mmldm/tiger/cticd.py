@@ -1,17 +1,12 @@
-"""CTICD: Channel-Transform-informed Causal Dynamics for TIGER (Simplified).
+"""Dynamic CTICD for TIGER.
 
-Simplified production-oriented plug-and-play causal mechanism module.
-Based on CTICD-v3 with the following reductions:
-  - Removed: CrossChannelSinkhornCCIP, ChannelAdversary, route_regularization
-  - Removed: GradientReverse, log_sinkhorn, _make_channel_labels
-  - DynamicCausalGraphLearner returns only A, A_dag, notears_loss, sparsity_loss
-  - Only 3 losses: L_causal, L_notears, L_sparsity (L_diffusion external)
+CTICD = Channel-Transform-informed Causal Dynamics.
 
-Key properties:
-  - DDP-safe: all parameters created in __init__, none in forward().
-  - Resolution-agnostic: cross-attention from x_in queries to mechanism states.
-  - Safe injection: sigmoid(-4) ~ 0.018 scale + zero-init out_proj.
-  - GradientScale: prevents diffusion gradients from overwhelming causal losses.
+This paper-ready version fixes the earlier static reconstruction bottleneck by
+learning lagged mechanism graphs and predicting future mechanism states.  It is
+still a neural causal-inductive-bias module rather than a fully identifiable
+causal discovery algorithm; the point is that graph direction is now grounded in
+ordered temporal segments instead of symmetric same-frame similarity.
 """
 
 from __future__ import annotations
@@ -25,33 +20,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-__all__ = [
-    "CTICD",
-    "CTICDOutput",
-    "GradientScale",
-]
+__all__ = ["CTICD", "CTICDOutput", "GradientScale"]
 
-
-# ---------------------------------------------------------------------------
-# Return container
-# ---------------------------------------------------------------------------
 
 @dataclass
 class CTICDOutput:
-    """Return value of CTICD.forward()."""
+    """Return value of ``CTICD.forward``.
 
-    causal_features: torch.Tensor      # (B, C, 1, L)  -- ready to add to x_in
-    causal_graph: torch.Tensor         # (B, M, M)     -- learned DAG adjacency
-    mechanism_states: torch.Tensor     # (B, M, D)     -- transitioned stable states
+    causal_features:
+        ``(B, C, 1, L)`` tensor ready to add to DiT tokens.
+    causal_graph:
+        ``(B, M, M)`` instantaneous DAG adjacency ``A0``.
+    lagged_graphs:
+        ``(B, P, M, M)`` lagged dynamic graphs where ``A[:,p,j,i]`` means
+        mechanism ``j`` at time ``t-p-1`` influences mechanism ``i`` at time
+        ``t``.
+    mechanism_states:
+        ``(B, S, M, D)`` stable temporal mechanism states.
+    losses:
+        Auxiliary losses used by the diffusion trainer.
+    """
+
+    causal_features: torch.Tensor
+    causal_graph: torch.Tensor
+    lagged_graphs: torch.Tensor
+    mechanism_states: torch.Tensor
     losses: dict[str, torch.Tensor]
 
 
-# ---------------------------------------------------------------------------
-# Gradient utilities
-# ---------------------------------------------------------------------------
-
 class GradientScale(torch.autograd.Function):
-    """Identity in forward; scales incoming gradient by *scale* in backward."""
+    """Identity in forward; scales incoming gradient by ``scale`` in backward."""
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, scale: float):
@@ -63,27 +61,15 @@ class GradientScale(torch.autograd.Function):
         return grad_output * ctx.scale, None
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _zero_module(module: nn.Module) -> nn.Module:
-    """Zero-initialize every parameter of *module*."""
     for p in module.parameters():
         nn.init.zeros_(p)
     return module
 
 
-def _pool_attr(
-    attr_emb: Optional[torch.Tensor],
-    batch: int,
-    attr_dim: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Pool TIGER attr embedding to (B, attr_dim)."""
+def _pool_attr(attr_emb: Optional[torch.Tensor], batch: int, attr_dim: int, device: torch.device) -> torch.Tensor:
     if attr_emb is None:
         return torch.zeros(batch, attr_dim, device=device)
-
     if attr_emb.dim() == 4:
         pooled = attr_emb.mean(dim=(2, 3))
     elif attr_emb.dim() == 3:
@@ -91,58 +77,42 @@ def _pool_attr(
     elif attr_emb.dim() == 2:
         pooled = attr_emb
     else:
-        raise ValueError(
-            f"attr_emb must be 2D/3D/4D or None, got shape {tuple(attr_emb.shape)}."
-        )
-
+        raise ValueError(f"attr_emb must be 2D/3D/4D or None, got {tuple(attr_emb.shape)}")
     if pooled.shape[-1] != attr_dim:
-        raise ValueError(
-            f"attr_emb pooled dim={pooled.shape[-1]} but CTICD attr_dim={attr_dim}."
-        )
-
+        raise ValueError(f"pooled attr dim={pooled.shape[-1]} but expected {attr_dim}")
     return pooled
 
-# ---------------------------------------------------------------------------
-# Component A: Channel Mechanism Encoder
-# ---------------------------------------------------------------------------
 
-class ChannelMechanismEncoder(nn.Module):
-    """Encode one image channel into K mechanism states via cross-attention."""
+class ChannelTemporalMechanismEncoder(nn.Module):
+    """Encode one transform channel into temporal mechanism states.
+
+    The TS-image width axis is treated as the ordered time axis.  The encoder
+    patches the channel image, splits patch columns into ``n_segments`` temporal
+    bins, and lets K learnable mechanism queries attend to each bin.
+    """
 
     def __init__(
         self,
         d_model: int,
         n_mechanisms: int,
+        n_segments: int,
         patch_size: int = 4,
         num_heads: int = 4,
     ):
         super().__init__()
-
         if d_model % num_heads != 0:
-            raise ValueError(
-                f"d_model={d_model} must be divisible by num_heads={num_heads}."
-            )
-
+            raise ValueError(f"d_model={d_model} must be divisible by num_heads={num_heads}")
         self.d_model = d_model
         self.n_mechanisms = n_mechanisms
-
+        self.n_segments = n_segments
         self.patch_embed = nn.Sequential(
             nn.Conv2d(1, d_model, kernel_size=patch_size, stride=patch_size),
             nn.GroupNorm(1, d_model),
             nn.GELU(approximate="tanh"),
         )
-
-        self.mechanism_queries = nn.Parameter(
-            torch.empty(n_mechanisms, d_model)
-        )
+        self.mechanism_queries = nn.Parameter(torch.empty(n_mechanisms, d_model))
         nn.init.normal_(self.mechanism_queries, std=1.0 / math.sqrt(d_model))
-
-        self.attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=num_heads,
-            batch_first=True,
-        )
-
+        self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
         self.norm = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, 2 * d_model),
@@ -153,27 +123,35 @@ class ChannelMechanismEncoder(nn.Module):
         nn.init.zeros_(self.ffn[-1].bias)
 
     def forward(self, channel: torch.Tensor) -> torch.Tensor:
+        if channel.dim() != 4 or channel.shape[1] != 1:
+            raise ValueError(f"channel must be (B,1,H,W), got {tuple(channel.shape)}")
         B = channel.shape[0]
-        feat = self.patch_embed(channel)                       # (B, D, h, w)
-        spatial = feat.flatten(2).transpose(1, 2).contiguous() # (B, hw, D)
+        feat = self.patch_embed(channel)  # (B,D,h,w)
+        _, D, h, w = feat.shape
+        segments = min(self.n_segments, max(1, w))
+        edges = torch.linspace(0, w, steps=segments + 1, device=feat.device)
+        edges = edges.round().long()
+        states = []
         queries = self.mechanism_queries.unsqueeze(0).expand(B, -1, -1)
-        attended, _ = self.attn(
-            query=queries, key=spatial, value=spatial, need_weights=False,
-        )
-        states = self.norm(attended)
-        states = states + self.ffn(states)  # (B, K, d_model)
-        return states
+        for s in range(segments):
+            start = int(edges[s].item())
+            end = int(edges[s + 1].item())
+            if end <= start:
+                end = min(w, start + 1)
+            spatial = feat[:, :, :, start:end].flatten(2).transpose(1, 2).contiguous()
+            attended, _ = self.attn(query=queries, key=spatial, value=spatial, need_weights=False)
+            state = self.norm(attended)
+            state = state + self.ffn(state)
+            states.append(state)
+        # If n_segments > patch width, repeat the last state to keep a fixed shape.
+        # Detach to prevent gradient duplication (Nx gradient on the last real segment).
+        while len(states) < self.n_segments:
+            states.append(states[-1].detach())
+        return torch.stack(states, dim=1)  # (B,S,K,D)
 
-# ---------------------------------------------------------------------------
-# Component B: Mechanism Splitter
-# ---------------------------------------------------------------------------
 
 class MechanismSplitter(nn.Module):
-    """Project raw mechanism states into stable (causal) representations.
-
-    Simplified from CTICD-v3: nuisance branch removed to avoid DDP deadlock
-    (unused parameters have grad=None). Only stable projection retained.
-    """
+    """Stable mechanism representation with zero-init residual projection."""
 
     def __init__(self, d_model: int):
         super().__init__()
@@ -189,56 +167,85 @@ class MechanismSplitter(nn.Module):
     def forward(self, states: torch.Tensor) -> torch.Tensor:
         return self.stable_norm(states + self.stable_proj(states))
 
-# ---------------------------------------------------------------------------
-# Component C: Dynamic Causal Graph Learner
-# ---------------------------------------------------------------------------
 
 class DynamicCausalGraphLearner(nn.Module):
-    """Learn a DAG adjacency over mechanism nodes.
-    NOTEARS acyclicity constraint applied to the instantaneous DAG.
-    Returns A, notears_loss, and sparsity_loss.
-    """
+    """Learn instantaneous DAG and directed lagged graphs over mechanisms."""
 
-    def __init__(self, n_nodes: int, edge_bias: float = -4.0, init_tau: float = 1.0):
+    def __init__(
+        self,
+        n_nodes: int,
+        d_model: int,
+        max_lag: int = 2,
+        edge_bias: float = -4.0,
+        lag_edge_bias: float = -2.5,
+        init_tau: float = 1.0,
+    ):
         super().__init__()
         self.n_nodes = n_nodes
-        self.base_dag_logits = nn.Parameter(
-            torch.full((n_nodes, n_nodes), float(edge_bias))
-        )
+        self.max_lag = max_lag
+        self.base_dag_logits = nn.Parameter(torch.full((n_nodes, n_nodes), float(edge_bias)))
+        self.lag_logits = nn.Parameter(torch.full((max_lag, n_nodes, n_nodes), float(lag_edge_bias)))
+        self.q_child = nn.Linear(d_model, d_model, bias=False)
+        self.k_parent = nn.Linear(d_model, d_model, bias=False)
         self.log_tau = nn.Parameter(torch.tensor(math.log(init_tau)))
 
-    def forward(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        B, M, _ = states.shape
-        if M != self.n_nodes:
-            raise ValueError(f'Expected {self.n_nodes} nodes, got {M}.')
-        normed = F.normalize(states, dim=-1)
-        sim = torch.bmm(normed, normed.transpose(1, 2))
+    @staticmethod
+    def _acyclicity_loss(A: torch.Tensor) -> torch.Tensor:
+        B, M, _ = A.shape
+        W_sq = (A * A).clamp(max=2.0)  # prevent matrix_exp overflow (e^24 → Inf)
+        expm = torch.linalg.matrix_exp(W_sq)
+        h = expm.diagonal(dim1=-2, dim2=-1).sum(dim=-1) - M
+        h = h.clamp(max=100.0)  # prevent h² gradient explosion
+        return (h * h).mean()
+
+    def _asym_score(self, parent_states: torch.Tensor, child_states: torch.Tensor) -> torch.Tensor:
+        # Returns score[j,i] = parent_j -> child_i.
+        # eps=1e-8 prevents NaN when mechanism states degenerate to near-zero.
+        parent = F.normalize(self.k_parent(parent_states), dim=-1, eps=1e-8)
+        child = F.normalize(self.q_child(child_states), dim=-1, eps=1e-8)
         tau = self.log_tau.exp().clamp(min=0.1, max=5.0)
-        dag_logits = self.base_dag_logits.unsqueeze(0) + sim / tau
-        A = torch.sigmoid(dag_logits)
+        score = torch.bmm(parent, child.transpose(1, 2)) / tau
+        # Clamp to prevent extreme logits → sigmoid saturation → matrix_exp overflow
+        return score.clamp(-20.0, 20.0)
+
+    def forward(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if states.dim() != 4:
+            raise ValueError(f"states must be (B,S,M,D), got {tuple(states.shape)}")
+        B, S, M, _ = states.shape
+        if M != self.n_nodes:
+            raise ValueError(f"Expected {self.n_nodes} nodes, got {M}")
+
+        mean_states = states.mean(dim=1)
+        score0 = self._asym_score(mean_states, mean_states)
+        A0 = torch.sigmoid(self.base_dag_logits.unsqueeze(0) + score0)
         eye = torch.eye(M, device=states.device, dtype=states.dtype).unsqueeze(0)
-        A = A * (1.0 - eye)
-        W_sq = A * A
-        # NOTEARS: tr(exp(A∘A)) - M = 0 guarantees DAG
-        # We use mean(h²) for smoother gradient flow.  Using max(h²) would
-        # enforce per-sample DAG more strictly but produces sparser gradients.
-        expm = torch.linalg.matrix_exp(W_sq)  # (B, M, M) batched
-        h = expm.diagonal(dim1=-2, dim2=-1).sum(dim=-1) - M  # (B,)
-        notears_loss = (h * h).mean()  # mean for smoother gradient flow
-        sparsity_loss = A.mean()
-        return A, notears_loss, sparsity_loss
+        A0 = A0 * (1.0 - eye)
+        notears_loss = self._acyclicity_loss(A0)
 
-# ---------------------------------------------------------------------------
-# Component D: Mechanism Transition
-# ---------------------------------------------------------------------------
+        lag_graphs = []
+        for lag in range(1, self.max_lag + 1):
+            if S > lag:
+                parent_states = states[:, :-lag].mean(dim=1)
+                child_states = states[:, lag:].mean(dim=1)
+                score_lag = self._asym_score(parent_states, child_states)
+            else:
+                score_lag = torch.zeros(B, M, M, device=states.device, dtype=states.dtype)
+            Al = torch.sigmoid(self.lag_logits[lag - 1].unsqueeze(0) + score_lag)
+            lag_graphs.append(Al)
+        Alags = torch.stack(lag_graphs, dim=1)  # (B,P,M,M)
 
-class MechanismTransition(nn.Module):
-    """Per-mechanism MLP with graph parent aggregation + FiLM conditioning."""
+        sparsity_loss = 0.5 * A0.mean() + 0.5 * Alags.mean()
+        return A0, Alags, notears_loss, sparsity_loss
 
-    def __init__(self, d_model: int, n_nodes: int, attr_dim: int, hidden_mult: int = 2):
+
+class LaggedMechanismPredictor(nn.Module):
+    """Predict future mechanism states from lagged graph parents."""
+
+    def __init__(self, d_model: int, n_nodes: int, attr_dim: int, max_lag: int = 2, hidden_mult: int = 2):
         super().__init__()
-        self.n_nodes = n_nodes
         self.d_model = d_model
+        self.n_nodes = n_nodes
+        self.max_lag = max_lag
         hidden = hidden_mult * d_model
         self.mlps = nn.ModuleList([
             nn.Sequential(
@@ -249,32 +256,49 @@ class MechanismTransition(nn.Module):
             for _ in range(n_nodes)
         ])
         self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_nodes)])
-        self.film = nn.Linear(attr_dim, 2 * n_nodes * d_model)
-        _zero_module(self.film)
+        self.film = _zero_module(nn.Linear(attr_dim, 2 * n_nodes * d_model))
         for mlp in self.mlps:
             nn.init.zeros_(mlp[-1].weight)
             nn.init.zeros_(mlp[-1].bias)
 
+    def _aggregate_lagged(self, states: torch.Tensor, lagged_graphs: torch.Tensor) -> torch.Tensor:
+        B, S, M, D = states.shape
+        P = lagged_graphs.shape[1]
+        start = min(max(1, P), S - 1)
+        if S <= start:
+            return states[:, -1:]  # keep grad; constructor validates S > P
+        target_len = S - start
+        parent = torch.zeros(B, target_len, M, D, device=states.device, dtype=states.dtype)
+        for lag in range(1, P + 1):
+            graph = lagged_graphs[:, lag - 1]  # (B,M,M), j -> i
+            past = states[:, start - lag:S - lag]
+            parent = parent + torch.einsum("bji,btjd->btid", graph, past)
+        return parent / float(max(1, P))
+
     def forward(
-        self, states: torch.Tensor, graph: torch.Tensor,
-        attr_pooled: torch.Tensor, intervention: Optional[dict[str, Any]] = None,
-    ) -> torch.Tensor:
-        B, M, D = states.shape
-        graph_used = graph
+        self,
+        states: torch.Tensor,
+        lagged_graphs: torch.Tensor,
+        attr_pooled: torch.Tensor,
+        intervention: Optional[dict[str, Any]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, S, M, D = states.shape
+        P = lagged_graphs.shape[1]
+        start = min(max(1, P), S - 1)
+
+        graph_used = lagged_graphs
         node = None
         value = None
         strength = 1.0
-        cut_incoming = True
         if intervention is not None:
             node = int(intervention["node"])
             if not (0 <= node < M):
-                raise ValueError(f'intervention node {node} out of range for M={M}.')
+                raise ValueError(f"intervention node {node} out of range for M={M}")
             strength = float(intervention.get("strength", 1.0))
-            cut_incoming = bool(intervention.get("cut_incoming", True))
+            if bool(intervention.get("cut_incoming", True)):
+                graph_used = lagged_graphs.clone()
+                graph_used[:, :, :, node] = 0.0
             value = intervention.get("value", None)
-            if cut_incoming:
-                graph_used = graph.clone()
-                graph_used[:, :, node] = 0.0
             if value is not None:
                 value = value.to(device=states.device, dtype=states.dtype)
                 if value.dim() == 1:
@@ -282,212 +306,237 @@ class MechanismTransition(nn.Module):
                 elif value.dim() == 3 and value.shape[1] == 1:
                     value = value[:, 0, :]
                 if value.shape != (B, D):
-                    raise ValueError(
-                        f"intervention value must broadcast to (B,D)={(B,D)}, got {tuple(value.shape)}."
-                    )
-        # Graph convention: A[j,k] means j→k (j is parent of k)
-        # parent[b, k] = Σ_j A[j,k] · states[b, j] = sum of all parents of k
-        parent = torch.bmm(graph_used.transpose(1, 2), states)
+                    raise ValueError(f"intervention value must broadcast to {(B,D)}, got {tuple(value.shape)}")
+
+        parent = self._aggregate_lagged(states, graph_used)  # (B,T,M,D)
+        target = states[:, start:] if S > start else states[:, -1:]
+
         gamma_beta = self.film(attr_pooled).view(B, M, 2, D)
         gamma = gamma_beta[:, :, 0, :]
         beta = gamma_beta[:, :, 1, :]
-        updated_parts = []
-        for k in range(M):
-            delta = self.mlps[k](parent[:, k, :])
-            delta = self.norms[k](delta)
-            delta = delta * (1.0 + gamma[:, k, :]) + beta[:, k, :]
-            updated_parts.append(states[:, k, :] + delta)
-        updated = torch.stack(updated_parts, dim=1)
-        if intervention is not None and value is not None:
-            old = updated[:, node, :]
-            updated[:, node, :] = (1.0 - strength) * old + strength * value
-        return updated
 
-# ---------------------------------------------------------------------------
-# Component E: Mechanism Recomposer
-# ---------------------------------------------------------------------------
+        pred_parts = []
+        for k in range(M):
+            x = parent[:, :, k, :]
+            delta = self.mlps[k](x)
+            delta = self.norms[k](delta)
+            delta = delta * (1.0 + gamma[:, None, k, :]) + beta[:, None, k, :]
+            pred_parts.append(parent[:, :, k, :] + delta)
+        pred = torch.stack(pred_parts, dim=2)
+
+        if intervention is not None and value is not None:
+            # Out-of-place to avoid autograd inplace-modification errors.
+            last_frame = pred[:, -1:]
+            last_frame_modified = last_frame.clone()
+            last_frame_modified[:, 0, node, :] = (
+                (1.0 - strength) * last_frame[:, 0, node, :] + strength * value
+            )
+            pred = torch.cat([pred[:, :-1], last_frame_modified], dim=1)
+
+        # Last predicted state is used for causal feature injection.
+        causal_state = pred[:, -1]
+        return pred, target, causal_state
+
 
 class MechanismRecomposer(nn.Module):
-    """Cross-attention from x_in queries to mechanism state key/values."""
+    """Cross-attention from DiT token queries to mechanism state key/values."""
 
     def __init__(self, d_model: int, output_channels: int, num_heads: int = 4):
         super().__init__()
         if d_model % num_heads != 0:
-            raise ValueError(
-                f"d_model={d_model} must be divisible by num_heads={num_heads}."
-            )
+            raise ValueError(f"d_model={d_model} must be divisible by num_heads={num_heads}")
         self.in_proj = nn.Linear(output_channels, d_model)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=d_model, num_heads=num_heads, batch_first=True,
-        )
+        self.cross_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
         self.norm = nn.LayerNorm(d_model)
         self.out_proj = _zero_module(nn.Linear(d_model, output_channels))
 
     def forward(self, mechanism_states: torch.Tensor, x_in: torch.Tensor) -> torch.Tensor:
         q = x_in.squeeze(2).transpose(1, 2).contiguous()
         q = self.in_proj(q)
-        attended, _ = self.cross_attn(
-            query=q, key=mechanism_states, value=mechanism_states, need_weights=False,
-        )
+        attended, _ = self.cross_attn(query=q, key=mechanism_states, value=mechanism_states, need_weights=False)
         attended = self.norm(attended + q)
         out = self.out_proj(attended)
         return out.transpose(1, 2).unsqueeze(2).contiguous()
 
-# ---------------------------------------------------------------------------
-# Main CTICD Module (Simplified)
-# ---------------------------------------------------------------------------
 
 class CTICD(nn.Module):
-    """Simplified CTICD module with 3 losses.
+    """Dynamic causal mechanism module for TIGER-DiT.
 
-    Components:
-        A) ChannelMechanismEncoder -- per-channel encoding to K states
-        B) MechanismSplitter       -- stable vs nuisance separation
-        C) DynamicCausalGraphLearner -- DAG + NOTEARS constraint
-        D) MechanismTransition     -- per-mechanism MLP with graph parents
-        E) MechanismRecomposer     -- cross-attention from x_in to states
-        F) Safe Injection          -- sigmoid(-4) + GradientScale
-
-    Losses:
-        L_causal:    MSE(transitioned, raw) -- how well mechanisms predict each other
-        L_notears:   [tr(exp(A^2)) - M]^2  -- acyclicity constraint
-        L_sparsity:  ||A||_1 / M^2         -- L1 graph sparsity
+    Losses
+    ------
+    ``cticd_pred``
+        Future mechanism prediction loss from lagged graph parents.
+    ``cticd_notears``
+        NOTEARS acyclicity penalty on the instantaneous graph ``A0``.
+    ``cticd_sparsity``
+        L1-style sparsity pressure on both instantaneous and lagged graphs.
+    ``cticd_smooth``
+        Small temporal smoothness regularizer on mechanism states.
     """
 
     def __init__(
-        self, d_model: int, output_channels: int, attr_dim: Optional[int] = None,
-        n_channels: int = 3, n_mechanisms_per_channel: int = 4,
-        patch_size: int = 4, num_heads: int = 4, edge_bias: float = -4.0,
+        self,
+        d_model: int,
+        output_channels: int,
+        attr_dim: Optional[int] = None,
+        n_channels: int = 3,
+        n_mechanisms_per_channel: int = 4,
+        n_segments: int = 8,
+        max_lag: int = 2,
+        patch_size: int = 4,
+        num_heads: int = 4,
+        edge_bias: float = -4.0,
+        lag_edge_bias: float = -2.5,
         branch_grad_scale: float = 0.2,
-        lambda_causal: float = 1.0, lambda_notears: float = 1e-3,
+        lambda_causal: float = 1.0,
+        lambda_notears: float = 1e-3,
         lambda_sparsity: float = 1e-2,
+        lambda_smooth: float = 1e-3,
+        injection_init: float = -4.0,
     ):
         super().__init__()
         self.d_model = d_model
         self.output_channels = output_channels
-        self.attr_dim = output_channels if attr_dim is None else attr_dim
+        self.attr_dim = attr_dim or output_channels
         self.n_channels = n_channels
-        self.K = n_mechanisms_per_channel
+        self.n_mechanisms_per_channel = n_mechanisms_per_channel
         self.n_nodes = n_channels * n_mechanisms_per_channel
+        self.n_segments = n_segments
+        self.max_lag = max_lag
         self.branch_grad_scale = float(branch_grad_scale)
         self.lambda_causal = float(lambda_causal)
         self.lambda_notears = float(lambda_notears)
         self.lambda_sparsity = float(lambda_sparsity)
+        self.lambda_smooth = float(lambda_smooth)
 
-        # A) Per-channel encoders
-        self.encoders = nn.ModuleList([
-            ChannelMechanismEncoder(
-                d_model=d_model, n_mechanisms=n_mechanisms_per_channel,
-                patch_size=patch_size, num_heads=num_heads,
+        self.channel_encoders = nn.ModuleList([
+            ChannelTemporalMechanismEncoder(
+                d_model=d_model,
+                n_mechanisms=n_mechanisms_per_channel,
+                n_segments=n_segments,
+                patch_size=patch_size,
+                num_heads=num_heads,
             )
             for _ in range(n_channels)
         ])
-        # B) Stable / nuisance splitter
         self.splitter = MechanismSplitter(d_model)
-        # C) Dynamic causal graph learner
-        self.graph = DynamicCausalGraphLearner(self.n_nodes, edge_bias=edge_bias)
-        # D) Mechanism transition
-        self.transition = MechanismTransition(d_model, self.n_nodes, self.attr_dim)
-        # E) Mechanism recomposer
+        self.graph_learner = DynamicCausalGraphLearner(
+            n_nodes=self.n_nodes,
+            d_model=d_model,
+            max_lag=max_lag,
+            edge_bias=edge_bias,
+            lag_edge_bias=lag_edge_bias,
+        )
+        # Validate temporal constraint: need more segments than lags for
+        # meaningful lagged prediction.  Without this, _aggregate_lagged
+        # produces empty slices and crashes with shape mismatches.
+        if n_segments <= max_lag:
+            raise ValueError(
+                f"n_segments ({n_segments}) must be > max_lag ({max_lag}) "
+                f"to have enough temporal bins for lagged parent aggregation."
+            )
+
+        self.predictor = LaggedMechanismPredictor(d_model, self.n_nodes, self.attr_dim, max_lag=max_lag)
         self.recomposer = MechanismRecomposer(d_model, output_channels, num_heads=num_heads)
-        # F) Safe injection logit (sigmoid(-4) ~ 0.018)
-        self.injection_logit = nn.Parameter(torch.tensor(-4.0))
+        self.injection_logit = nn.Parameter(torch.tensor(float(injection_init)))
+
+    def encode_mechanisms(self, image: torch.Tensor) -> torch.Tensor:
+        if image.dim() != 4:
+            raise ValueError(f"image must be (B,C,H,W), got {tuple(image.shape)}")
+        if image.shape[1] < self.n_channels:
+            raise ValueError(f"image has {image.shape[1]} channels, expected at least {self.n_channels}")
+        states = []
+        for c in range(self.n_channels):
+            states.append(self.channel_encoders[c](image[:, c:c + 1]))
+        return torch.cat(states, dim=2)  # (B,S,M,D)
 
     def forward(
-        self, image: torch.Tensor, x_in: torch.Tensor,
+        self,
+        image: torch.Tensor,
+        x_in: torch.Tensor,
         attr_emb: Optional[torch.Tensor] = None,
+        clean_image: Optional[torch.Tensor] = None,
+        diffusion_emb: Optional[torch.Tensor] = None,
         intervention: Optional[dict[str, Any]] = None,
     ) -> CTICDOutput:
-        B, C_img, _, _ = image.shape
-        attr_pooled = _pool_attr(attr_emb, B, self.attr_dim, image.device)
+        del diffusion_emb  # kept for a stable public signature
+        B = image.shape[0]
+        device = image.device
+        source_image = clean_image if clean_image is not None else image
 
-        # A. Per-channel encoding
-        raw_states = []
-        for c in range(self.n_channels):
-            states_c = self.encoders[c](image[:, c : c + 1])
-            raw_states.append(states_c)
-        raw = torch.cat(raw_states, dim=1)  # (B, M, D)
-
-        # B. Project to stable (causal) representations
+        raw = self.encode_mechanisms(source_image.float())
+        # NaN guard: if encoder produces NaN, return zero features + zero losses
+        if not torch.isfinite(raw).all():
+            return CTICDOutput(
+                causal_features=torch.zeros_like(x_in),
+                causal_graph=torch.zeros(B, self.n_nodes, self.n_nodes, device=device),
+                lagged_graphs=torch.zeros(B, self.max_lag, self.n_nodes, self.n_nodes, device=device),
+                mechanism_states=torch.zeros(B, self.n_segments, self.n_nodes, self.d_model, device=device),
+                losses={"cticd_total": torch.tensor(0.0, device=device),
+                        "cticd_pred": torch.tensor(0.0, device=device),
+                        "cticd_notears": torch.tensor(0.0, device=device),
+                        "cticd_sparsity": torch.tensor(0.0, device=device),
+                        "cticd_smooth": torch.tensor(0.0, device=device)},
+            )
         stable = self.splitter(raw)
+        A0, Alags, notears_loss, sparsity_loss = self.graph_learner(stable)
+        # NaN guard: if graph produces NaN/Inf, use zero graph
+        if not torch.isfinite(A0).all():
+            A0 = torch.zeros(B, self.n_nodes, self.n_nodes, device=device)
+            Alags = torch.zeros(B, self.max_lag, self.n_nodes, self.n_nodes, device=device)
+            notears_loss = torch.tensor(0.0, device=device)
+            sparsity_loss = torch.tensor(0.0, device=device)
+        attr_pooled = _pool_attr(attr_emb, B, self.attr_dim, device)
 
-        # C. Causal graph
-        A, notears_loss, sparsity_loss = self.graph(stable)
+        pred, target, causal_state = self.predictor(stable, Alags, attr_pooled, intervention=intervention)
+        pred_loss = F.mse_loss(pred, target.detach())
+        if stable.shape[1] > 1:
+            smooth_loss = (stable[:, 1:] - stable[:, :-1]).pow(2).mean()
+        else:
+            smooth_loss = stable.new_zeros(())
 
-        # D. Mechanism transition
-        updated = self.transition(
-            states=stable, graph=A, attr_pooled=attr_pooled, intervention=intervention,
-        )
-
-        # E. Recompose
-        causal_features = self.recomposer(updated, x_in)
-
-        # F. Safe injection
+        causal_features = self.recomposer(causal_state, x_in)
         injection_scale = torch.sigmoid(self.injection_logit)
         causal_features = injection_scale * causal_features
         if self.branch_grad_scale != 1.0:
             causal_features = GradientScale.apply(causal_features, self.branch_grad_scale)
 
-        # Losses
-        # ──────────────────────────────────────────────────────────────────
-        # DESIGN NOTE (M3 in code audit):
-        #   L_causal = MSE(updated, raw.detach()) is an information-preservation
-        #   regularizer, NOT a true causal prediction loss.  A trivial solution
-        #   (A = 0, transition = identity) minimizes ALL three CTICD losses
-        #   simultaneously.  The ONLY signal preventing this collapse is the
-        #   diffusion gradient backpropagating through GradientScale(0.2).
-        #
-        #   For true causal semantics, paired states (e.g., t and t+1) or a
-        #   contrastive/counterfactual formulation would be needed.  In the
-        #   single-image setting, the module functions as a structured
-        #   regularizer with a DAG bottleneck, not a causal discovery module.
-        # ──────────────────────────────────────────────────────────────────
-        # NOTE: raw.detach() prevents degeneration where model moves both
-        # raw and updated to reduce loss without learning real causal mechanisms.
-        causal_loss = F.mse_loss(updated, raw.detach())
-
         total = (
-            self.lambda_causal * causal_loss
+            self.lambda_causal * pred_loss
             + self.lambda_notears * notears_loss
             + self.lambda_sparsity * sparsity_loss
+            + self.lambda_smooth * smooth_loss
         )
         losses = {
             "cticd_total": total,
-            "cticd_causal": causal_loss.detach(),
+            "cticd_pred": pred_loss.detach(),
+            "cticd_causal": pred_loss.detach(),  # backward-compatible log key
             "cticd_notears": notears_loss.detach(),
             "cticd_sparsity": sparsity_loss.detach(),
+            "cticd_smooth": smooth_loss.detach(),
+            "cticd_edge_density": A0.detach().mean(),
+            "cticd_lag_edge_density": Alags.detach().mean(),
         }
         return CTICDOutput(
-            causal_features=causal_features, causal_graph=A,
-            mechanism_states=updated, losses=losses,
+            causal_features=causal_features,
+            causal_graph=A0,
+            lagged_graphs=Alags,
+            mechanism_states=stable,
+            losses=losses,
         )
 
 
-# ---------------------------------------------------------------------------
-# Smoke test
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
-    torch.manual_seed(7)
-    B, C, H, W = 2, 64, 64, 64
-    L = 16 * 16 + 8 * 8
-    image = torch.randn(B, 3, H, W)
-    x_in = torch.randn(B, C, 1, L, requires_grad=True)
-    attr = torch.randn(B, C, 1, L)
-    model = CTICD(
-        d_model=64, output_channels=C, attr_dim=C,
-        n_mechanisms_per_channel=4, patch_size=4, num_heads=4,
-    )
-    out = model(image=image, x_in=x_in, attr_emb=attr)
-    assert out.causal_features.shape == x_in.shape, (
-        f"Shape mismatch: {out.causal_features.shape} != {x_in.shape}"
-    )
+    torch.manual_seed(0)
+    B, C, H, W = 2, 3, 64, 64
+    image = torch.rand(B, C, H, W)
+    x_in = torch.randn(B, 32, 1, 64)
+    attr = torch.randn(B, 32, 1, 64)
+    model = CTICD(d_model=32, output_channels=32, attr_dim=32, n_segments=4, max_lag=2)
+    out = model(image=image, clean_image=image, x_in=x_in, attr_emb=attr)
+    assert out.causal_features.shape == x_in.shape
     assert out.causal_graph.shape == (B, 12, 12)
-    assert out.mechanism_states.shape == (B, 12, 64)
+    assert out.lagged_graphs.shape == (B, 2, 12, 12)
     loss = out.causal_features.square().mean() + out.losses["cticd_total"]
     loss.backward()
-    print("CTICD simplified smoke test PASSED.")
-    print(f"  causal_features : {tuple(out.causal_features.shape)}")
-    print(f"  causal_graph    : {tuple(out.causal_graph.shape)}")
-    print(f"  mechanism_states: {tuple(out.mechanism_states.shape)}")
-    print(f"  losses          : {list(out.losses.keys())}")
+    print("CTICD dynamic smoke test passed")

@@ -54,6 +54,10 @@ class ImageEncoder(nn.Module):
 
         self.hidden_dim = self.model.config.hidden_size  # sanity-check alias
 
+        # Cache CLIP processor once (not per forward call)
+        from transformers import CLIPProcessor
+        self.processor = CLIPProcessor.from_pretrained(configs["pretrain_model_path"])
+
         # ------------------------------------------------------------------
         # Learned projection MLP  (mirrors VerbalTS text_enc)
         # ------------------------------------------------------------------
@@ -95,13 +99,8 @@ class ImageEncoder(nn.Module):
             x = (x - mean) / std
             outputs = self.model(pixel_values=x)
         else:
-            # List of PIL images — apply the CLIP image processor
-            from transformers import CLIPProcessor
-
-            processor = CLIPProcessor.from_pretrained(
-                self.configs["pretrain_model_path"]
-            )
-            inputs = processor(images=images, return_tensors="pt")
+            # List of PIL images — apply the CLIP image processor (cached)
+            inputs = self.processor(images=images, return_tensors="pt")
             outputs = self.model(**{k: v.to(self.device) for k, v in inputs.items()})
 
         # Use ALL hidden states (CLS + all patch tokens)
@@ -261,19 +260,19 @@ class CNNEncoder(nn.Module):
         self.features = nn.Sequential(
             # Block 1: 3 -> 16
             nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(16),
+            nn.GroupNorm(4, 16),
             nn.ReLU(inplace=True),
             # Block 2: 16 -> 32
             nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(32),
+            nn.GroupNorm(4, 32),
             nn.ReLU(inplace=True),
             # Block 3: 32 -> 64
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64),
             nn.ReLU(inplace=True),
             # Block 4: 64 -> 128
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(128),
+            nn.GroupNorm(8, 128),
             nn.ReLU(inplace=True),
         )
 
