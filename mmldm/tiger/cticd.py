@@ -212,6 +212,12 @@ class ChannelTemporalMechanismEncoder(nn.Module):
         if channel.dim() != 4 or channel.shape[1] != 1:
             raise ValueError(f"channel must be (B,1,H,W), got {tuple(channel.shape)}")
         B = channel.shape[0]
+        # Auto-pad if image smaller than patch_size
+        _, _, h, w = channel.shape
+        pad_h = (self.patch_size - h % self.patch_size) % self.patch_size
+        pad_w = (self.patch_size - w % self.patch_size) % self.patch_size
+        if pad_h > 0 or pad_w > 0:
+            channel = F.pad(channel, (0, pad_w, 0, pad_h))
         feat = self.patch_embed(channel)  # (B,D,h,w)
         _, D, h, w = feat.shape
         tokens = feat.flatten(2).transpose(1, 2).contiguous()  # (B,h*w,D), row-major
