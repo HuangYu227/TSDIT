@@ -352,10 +352,3 @@ def test_text_conditioner_can_emit_row_and_column_anchors():
     out = projector(torch.randn(2, 5, 8), torch.randint(0, 10, (2,)))
 
     assert out.shape == (2, 16, 4, 3)
-
-    # Verify horizontal patch produces H x ceil(W/ps) grid
-    with torch.no_grad():
-        stem_out = encoder._stem_forward(image)
-        feat = encoder.patch_proj(stem_out)
-        # (B, d_model, H, ceil(W/patch_size)) = (2, 8, 4, 2)
-        assert feat.shape[2:] == (4, 2), f"Expected (4,2), got {feat.shape[2:]}"

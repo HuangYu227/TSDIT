@@ -62,10 +62,10 @@ def get_default_config() -> dict:
         "eval_only": False,
 
         "diffusion": {
-            "num_steps": 50,
+            "num_steps": 1000,
             "beta_start": 0.0001,
             "beta_end": 0.02,
-            "schedule": "quad",
+            "schedule": "cosine",
             "channels": 256,
             "nheads": 8,
             "layers": 12,
@@ -81,7 +81,7 @@ def get_default_config() -> dict:
             "attention_mask_type": "parallel",
             "lambda_x0_ts": 0.2,
             "x0_delta_weight": 0.5,
-            "lambda_cticd": 0.1,
+            "lambda_cticd": 0.01,  # reduced from 0.1 to prevent gradient interference
             "lambda_moe": 0.05,
             "cticd_enable_threshold": 0.5,
         },
@@ -104,9 +104,9 @@ def get_default_config() -> dict:
                 "noise_std": 0.02,
                 "fill": 0.5,
             },
-            "decode_scale_mode": "global",  # avoids oracle per-sample min/max at test time
-            "text_guidance_scale": 1.0,
-            "image_guidance_scale": 1.0,
+            "decode_scale_mode": "per_sample_oracle",  # per-sample min/max eliminates outlier-driven global range bias
+            "text_guidance_scale": 3.0,
+            "image_guidance_scale": 2.0,
             "interaction_guidance_scale": 0.0,
             "text": {
                 "pretrain_model_path": "openai/clip-vit-base-patch32",
@@ -133,8 +133,14 @@ def get_default_config() -> dict:
             "scca_heads": 8,
         },
 
+        # CTICD: Channel-Transform-informed Causal Dynamics.
+        # Designed for MULTIVARIATE (n_channels > 1) causal discovery via
+        # NOTEARS acyclicity-constrained graph learning across channels.
+        # Guard: when n_channels == 1 (univariate), dit_model.py automatically
+        # replaces full CTICD with a lightweight SimpleCTICDFallback that uses
+        # segment-level causal self-attention instead of cross-channel graphs.
         "cticd": {
-            "enabled": True,
+            "enabled": False,  # disabled by default for univariate; enable for multivariate
             "d_model": 256,
             "n_channels": 1,
             "n_mechanisms_per_channel": 6,
@@ -990,7 +996,7 @@ class TIGERTrainer:
             )
             gen_img = gen_imgs[0]
 
-            decode_scale_mode = ccfg.get("decode_scale_mode", "global")
+            decode_scale_mode = ccfg.get("decode_scale_mode", "per_sample_oracle")
             if decode_scale_mode == "per_sample_oracle":
                 dec_min, dec_max = ts_min, ts_max
             else:

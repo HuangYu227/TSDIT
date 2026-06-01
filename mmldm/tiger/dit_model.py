@@ -15,11 +15,15 @@ Architecture mapping (VerbalTS -> TIGER):
 
 from __future__ import annotations
 
+import logging
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +127,7 @@ class ImagePatchEmbedding(nn.Module):
         self.in_channels = in_channels
         self.projection = nn.Sequential(
             nn.Linear(in_channels * patch_size * patch_size, d_model),
-            nn.ReLU(),
+            nn.GELU(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -235,6 +239,89 @@ class ConvRasterStem(nn.Module):
         return self.fuse(feat) + self.skip(x)
 
 
+class SqueezeExcitation(nn.Module):
+    """Squeeze-and-Excitation channel attention (SE-Net).
+
+    Global average pooling → bottleneck FC → per-channel sigmoid gate.
+    """
+
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        mid = max(1, channels // reduction)
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(1),
+            nn.Linear(channels, mid),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels),
+            nn.Sigmoid(),
+        )
+        nn.init.zeros_(self.fc[4].weight)
+        nn.init.constant_(self.fc[4].bias, 2.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scale = self.fc(x).unsqueeze(-1).unsqueeze(-1)
+        return x * scale
+
+
+class MultiScaleConvRasterStem(ConvRasterStem):
+    """Multi-scale stem with dilated temporal branches + SE fusion.
+
+    Extends :class:`ConvRasterStem` with two dilated branches (dilation=2,4)
+    for medium/long-range temporal context.  A :class:`SqueezeExcitation`
+    module re-weights all 5 branches before fusion.
+    """
+
+    def __init__(self, in_channels: int, d_model: int):
+        super().__init__(in_channels, d_model)
+        branch_dim = self.branch_dim
+        self.dilated_medium = nn.Sequential(
+            nn.Conv2d(in_channels, branch_dim, kernel_size=3,
+                      padding=2, dilation=2),
+            nn.GroupNorm(1, branch_dim),
+            nn.SiLU(),
+        )
+        self.dilated_long = nn.Sequential(
+            nn.Conv2d(in_channels, branch_dim, kernel_size=3,
+                      padding=4, dilation=4),
+            nn.GroupNorm(1, branch_dim),
+            nn.SiLU(),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(5 * branch_dim, d_model, kernel_size=1),
+            nn.GroupNorm(1, d_model),
+            nn.SiLU(),
+            nn.Conv2d(d_model, d_model, kernel_size=3, padding=1, groups=d_model),
+            nn.GroupNorm(1, d_model),
+            nn.SiLU(),
+        )
+        self.branch_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(5 * branch_dim, 5 * branch_dim, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        nn.init.zeros_(self.branch_gate[1].weight)
+        nn.init.constant_(self.branch_gate[1].bias, 2.0)
+        self.se = SqueezeExcitation(5 * branch_dim, reduction=4)
+        _log.debug(
+            "MultiScaleConvRasterStem: in=%d d_model=%d branch_dim=%d "
+            "(5 branches: h/v/local/dil_med/dil_long + SE)",
+            in_channels, d_model, branch_dim,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = torch.cat([
+            self.horizontal(x),
+            self.vertical(x),
+            self.local(x),
+            self.dilated_medium(x),
+            self.dilated_long(x),
+        ], dim=1)
+        feat = self.se(feat)
+        feat = feat * self.branch_gate(feat)
+        return self.fuse(feat) + self.skip(x)
+
+
 class RowRasterPatchEmbedding(nn.Module):
     """Convolutional row-raster embedding with horizontal temporal patches.
 
@@ -243,11 +330,15 @@ class RowRasterPatchEmbedding(nn.Module):
     already mixed nearby rows for periodic/cross-row structure.
     """
 
-    def __init__(self, patch_size: int, in_channels: int, d_model: int):
+    def __init__(self, patch_size: int, in_channels: int, d_model: int,
+                 use_multiscale_stem: bool = False):
         super().__init__()
         self.patch_size = patch_size
         self.in_channels = in_channels
-        self.stem = ConvRasterStem(in_channels, d_model)
+        if use_multiscale_stem:
+            self.stem = MultiScaleConvRasterStem(in_channels, d_model)
+        else:
+            self.stem = ConvRasterStem(in_channels, d_model)
         self.patch = nn.Sequential(
             nn.Conv2d(d_model, d_model, kernel_size=(1, patch_size), stride=(1, patch_size)),
             nn.GroupNorm(1, d_model),
@@ -587,6 +678,122 @@ class ResidualBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Simple CTICD fallback for univariate data
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _SimpleCTICDOutput:
+    """Lightweight return type matching CTICDOutput interface for n_channels==1."""
+    causal_features: torch.Tensor
+    causal_graph: torch.Tensor
+    lagged_graphs: torch.Tensor
+    mechanism_states: torch.Tensor
+    losses: dict[str, torch.Tensor]
+
+
+class SimpleCTICDFallback(nn.Module):
+    """Segment-level causal self-attention fallback for univariate data.
+
+    CTICD's NOTEARS causal graph learning is designed for cross-channel causal
+    discovery.  For univariate data (n_channels==1) there are no cross-channel
+    edges to discover, so this lightweight module provides temporal causal
+    masking instead: each segment can only attend to itself and earlier segments.
+    """
+
+    def __init__(
+        self,
+        output_channels: int,
+        n_segments: int = 8,
+        num_heads: int = 4,
+        injection_init: float = -4.0,
+    ):
+        super().__init__()
+        self.output_channels = output_channels
+        self.n_segments = n_segments
+        self.num_heads = num_heads
+
+        self.seg_proj_in = nn.Linear(output_channels, output_channels)
+        self.temporal_pe = nn.Parameter(torch.zeros(n_segments, output_channels))
+        nn.init.trunc_normal_(self.temporal_pe, std=0.02)
+
+        self.norm1 = nn.LayerNorm(output_channels)
+        self.self_attn = nn.MultiheadAttention(
+            output_channels, num_heads, batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(output_channels)
+        self.ffn = nn.Sequential(
+            nn.Linear(output_channels, 2 * output_channels),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(2 * output_channels, output_channels),
+        )
+        nn.init.zeros_(self.ffn[-1].weight)
+        nn.init.zeros_(self.ffn[-1].bias)
+
+        self.out_proj = nn.Linear(output_channels, output_channels)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+        self.injection_logit = nn.Parameter(torch.tensor(float(injection_init)))
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        x_in: torch.Tensor,
+        attr_emb: torch.Tensor | None = None,
+        clean_image: torch.Tensor | None = None,
+        diffusion_emb: torch.Tensor | None = None,
+        intervention=None,
+    ) -> _SimpleCTICDOutput:
+        B, C, K, L = x_in.shape
+        device = x_in.device
+        n_seg = self.n_segments
+
+        # Pool spatial tokens into n_segments temporal bins
+        seq_len = K * L
+        seg_edges = torch.linspace(0, seq_len, steps=n_seg + 1, device=device).long()
+        seg_feats = []
+        x_flat = x_in.reshape(B, C, seq_len).permute(0, 2, 1)  # (B, seq_len, C)
+        for s in range(n_seg):
+            lo, hi = int(seg_edges[s]), int(seg_edges[s + 1])
+            hi = max(hi, lo + 1)
+            seg_feats.append(x_flat[:, lo:hi].mean(dim=1))
+        tokens = torch.stack(seg_feats, dim=1)  # (B, n_seg, C)
+        tokens = self.seg_proj_in(tokens) + self.temporal_pe.unsqueeze(0)
+
+        # Causal self-attention: segment s attends only to segments <= s
+        causal_mask = torch.triu(
+            torch.ones(n_seg, n_seg, device=device, dtype=torch.bool), diagonal=1,
+        )
+        h = self.norm1(tokens)
+        attended, _ = self.self_attn(
+            query=h, key=h, value=h, attn_mask=causal_mask, need_weights=False,
+        )
+        tokens = tokens + attended
+        tokens = tokens + self.ffn(self.norm2(tokens))
+
+        # Broadcast back to (B, C, K, L)
+        out = self.out_proj(tokens.mean(dim=1, keepdim=True))  # (B, 1, C)
+        causal_features = out.unsqueeze(-1).expand(B, C, K, L)
+
+        scale = torch.sigmoid(self.injection_logit)
+        causal_features = scale * causal_features
+
+        zero_graph = torch.zeros(B, 1, 1, device=device)
+        return _SimpleCTICDOutput(
+            causal_features=causal_features,
+            causal_graph=zero_graph,
+            lagged_graphs=torch.zeros(B, 1, 1, 1, device=device),
+            mechanism_states=tokens.unsqueeze(2),
+            losses={
+                "cticd_total": torch.tensor(0.0, device=device),
+                "cticd_pred": torch.tensor(0.0, device=device),
+                "cticd_notears": torch.tensor(0.0, device=device),
+                "cticd_sparsity": torch.tensor(0.0, device=device),
+                "cticd_smooth": torch.tensor(0.0, device=device),
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
 # TIGER DiT -- main model
 # ---------------------------------------------------------------------------
 
@@ -678,13 +885,21 @@ class TIGERDiT(nn.Module):
         self.side_downsample = nn.ModuleList()
         self.patch_decoder = nn.ModuleList()
 
+        use_multiscale_stem: bool = config.get("use_multiscale_stem", False)
+
         for i in range(self.multipatch_num):
             ps = base_patch * (patch_scale ** i)
             patch_embed_cls = RowRasterPatchEmbedding if self.patch_mode == "row_raster" else ImagePatchEmbedding
             patch_decoder_cls = RowRasterPatchDecoder if self.patch_mode == "row_raster" else ImagePatchDecoder
-            self.image_downsample.append(
-                patch_embed_cls(ps, in_channels, self.channels),
-            )
+            if self.patch_mode == "row_raster":
+                self.image_downsample.append(
+                    patch_embed_cls(ps, in_channels, self.channels,
+                                    use_multiscale_stem=use_multiscale_stem),
+                )
+            else:
+                self.image_downsample.append(
+                    patch_embed_cls(ps, in_channels, self.channels),
+                )
             self.patch_decoder.append(
                 patch_decoder_cls(ps, self.channels, in_channels),
             )
@@ -764,39 +979,59 @@ class TIGERDiT(nn.Module):
         self._cticd_graph = None
 
         if cticd_cfg is not None and cticd_cfg.get("enabled", True):
-            from .cticd import CTICD
+            cticd_n_channels = cticd_cfg.get("n_channels", 3)
 
-            cticd_patch_size = cticd_cfg.get("patch_size", config.get("base_patch", 4))
-            if self.patch_mode == "row_raster":
-                cticd_patch_size = min(int(cticd_patch_size), int(config.get("image_size_w", cticd_patch_size)))
-            self.cticd = CTICD(
-                d_model=cticd_cfg.get("d_model", self.channels),
-                output_channels=self.channels,
-                attr_dim=self.channels,
-                n_channels=cticd_cfg.get("n_channels", 3),
-                n_mechanisms_per_channel=cticd_cfg.get("n_mechanisms_per_channel", 4),
-                patch_size=cticd_patch_size,
-                num_heads=cticd_cfg.get("num_heads", self.nheads),
-                edge_bias=cticd_cfg.get("edge_bias", -4.0),
-                branch_grad_scale=cticd_cfg.get("branch_grad_scale", 0.2),
-                n_segments=cticd_cfg.get("n_segments", 8),
-                max_lag=cticd_cfg.get("max_lag", 2),
-                lag_edge_bias=cticd_cfg.get("lag_edge_bias", -2.5),
-                lambda_causal=cticd_cfg.get("lambda_causal", 1.0),
-                lambda_notears=cticd_cfg.get("lambda_notears", 1e-3),
-                lambda_sparsity=cticd_cfg.get("lambda_sparsity", 1e-2),
-                lambda_smooth=cticd_cfg.get("lambda_smooth", 1e-3),
-                lambda_prior=cticd_cfg.get("lambda_prior", 1e-1),
-                use_lag_prior=cticd_cfg.get("use_lag_prior", True),
-                lag_prior_method=cticd_cfg.get("lag_prior_method", "acf"),
-                lag_prior_mode=cticd_cfg.get("lag_prior_mode", "bias_gate"),
-                lag_prior_strength=cticd_cfg.get("lag_prior_strength", 1.0),
-                lag_prior_significance=cticd_cfg.get("lag_prior_significance", True),
-                lag_prior_bins=cticd_cfg.get("lag_prior_bins", 16),
-                lag_topk=cticd_cfg.get("lag_topk", 0),
-                signal_length=cticd_cfg.get("signal_length", None),
-                injection_init=cticd_cfg.get("injection_init", -4.0),
-            )
+            # Guard: CTICD's NOTEARS causal graph learning is designed for
+            # cross-channel (multivariate) causal discovery.  With n_channels==1
+            # there are no cross-channel edges to learn, so we fall back to a
+            # lightweight segment-level causal self-attention module.
+            if cticd_n_channels == 1:
+                _log.warning(
+                    "CTICD disabled for univariate data (n_channels=1). "
+                    "Falling back to SimpleCTICDFallback with segment-level "
+                    "causal self-attention. CTICD requires n_channels > 1 "
+                    "for meaningful cross-channel causal graph learning."
+                )
+                self.cticd = SimpleCTICDFallback(
+                    output_channels=self.channels,
+                    n_segments=cticd_cfg.get("n_segments", 8),
+                    num_heads=cticd_cfg.get("num_heads", self.nheads),
+                    injection_init=cticd_cfg.get("injection_init", -4.0),
+                )
+            else:
+                from .cticd import CTICD
+
+                cticd_patch_size = cticd_cfg.get("patch_size", config.get("base_patch", 4))
+                if self.patch_mode == "row_raster":
+                    cticd_patch_size = min(int(cticd_patch_size), int(config.get("image_size_w", cticd_patch_size)))
+                self.cticd = CTICD(
+                    d_model=cticd_cfg.get("d_model", self.channels),
+                    output_channels=self.channels,
+                    attr_dim=self.channels,
+                    n_channels=cticd_n_channels,
+                    n_mechanisms_per_channel=cticd_cfg.get("n_mechanisms_per_channel", 4),
+                    patch_size=cticd_patch_size,
+                    num_heads=cticd_cfg.get("num_heads", self.nheads),
+                    edge_bias=cticd_cfg.get("edge_bias", -4.0),
+                    branch_grad_scale=cticd_cfg.get("branch_grad_scale", 0.2),
+                    n_segments=cticd_cfg.get("n_segments", 8),
+                    max_lag=cticd_cfg.get("max_lag", 2),
+                    lag_edge_bias=cticd_cfg.get("lag_edge_bias", -2.5),
+                    lambda_causal=cticd_cfg.get("lambda_causal", 1.0),
+                    lambda_notears=cticd_cfg.get("lambda_notears", 1e-3),
+                    lambda_sparsity=cticd_cfg.get("lambda_sparsity", 1e-2),
+                    lambda_smooth=cticd_cfg.get("lambda_smooth", 1e-3),
+                    lambda_prior=cticd_cfg.get("lambda_prior", 1e-1),
+                    use_lag_prior=cticd_cfg.get("use_lag_prior", True),
+                    lag_prior_method=cticd_cfg.get("lag_prior_method", "acf"),
+                    lag_prior_mode=cticd_cfg.get("lag_prior_mode", "bias_gate"),
+                    lag_prior_strength=cticd_cfg.get("lag_prior_strength", 1.0),
+                    lag_prior_significance=cticd_cfg.get("lag_prior_significance", True),
+                    lag_prior_bins=cticd_cfg.get("lag_prior_bins", 16),
+                    lag_topk=cticd_cfg.get("lag_topk", 0),
+                    signal_length=cticd_cfg.get("signal_length", None),
+                    injection_init=cticd_cfg.get("injection_init", -4.0),
+                )
 
     # -- mask builder -----------------------------------------------------------
 
