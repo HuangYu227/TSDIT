@@ -4,12 +4,12 @@ Adapted from VerbalTS (E:\\Research\\TSG\\VerbalTS\\models\\diffusion\\verbalts.
 for image+text conditioned generation.
 
 Architecture mapping (VerbalTS -> TIGER):
-    n_var (K)   -> n_patches_h   (H dimension patches)
-    L (time)    -> n_patches_w   (W dimension patches)
-    TsPatchEmbedding    -> ImagePatchEmbedding   (2D unfold)
+    n_var (K)   -> n_patches_h for square images; K=1 for row-raster
+    L (time)    -> n_patches_w / row-major temporal patch index
+    TsPatchEmbedding    -> ImagePatchEmbedding or RowRasterPatchEmbedding
     SideEncoder_Var     -> ImageSideEncoder      (2D sinusoidal PE + learnable)
-    PatchDecoder        -> ImagePatchDecoder      (2D fold)
-    ResidualBlock       -> ResidualBlock          (identical structure)
+    PatchDecoder        -> ImagePatchDecoder or RowRasterPatchDecoder
+    ResidualBlock       -> ResidualBlock          (dual-axis or temporal-only)
     multipatch_mixer    -> multipatch_mixer       (per-pixel scale mixing)
 """
 
@@ -26,22 +26,36 @@ import torch.nn.functional as F
 # Transformer helpers (copied from VerbalTS)
 # ---------------------------------------------------------------------------
 
-def get_torch_trans(heads: int = 8, layers: int = 1, channels: int = 64):
+def get_torch_trans(
+    heads: int = 8,
+    layers: int = 1,
+    channels: int = 64,
+    dim_feedforward: int | None = None,
+):
+    if dim_feedforward is None:
+        dim_feedforward = 4 * channels
     encoder_layer = nn.TransformerEncoderLayer(
         d_model=channels,
         nhead=heads,
-        dim_feedforward=64,
+        dim_feedforward=dim_feedforward,
         activation="gelu",
         batch_first=True,
     )
     return nn.TransformerEncoder(encoder_layer, num_layers=layers)
 
 
-def get_torch_cross_trans(heads: int = 8, layers: int = 1, channels: int = 64):
+def get_torch_cross_trans(
+    heads: int = 8,
+    layers: int = 1,
+    channels: int = 64,
+    dim_feedforward: int | None = None,
+):
+    if dim_feedforward is None:
+        dim_feedforward = 4 * channels
     decoder_layer = nn.TransformerDecoderLayer(
         d_model=channels,
         nhead=heads,
-        dim_feedforward=64,
+        dim_feedforward=dim_feedforward,
         activation="gelu",
         batch_first=True,
     )
@@ -171,26 +185,124 @@ class ImagePatchDecoder(nn.Module):
         return x
 
 
+class ConvRasterStem(nn.Module):
+    """Convolutional stem for row-raster images.
+
+    The horizontal branch learns adjacent-time patterns within a row, the
+    vertical branch learns cross-row/periodic offsets, and the local branch
+    captures joint 2D motifs before Transformer tokenization.
+    """
+
+    def __init__(self, in_channels: int, d_model: int):
+        super().__init__()
+        branch_dim = max(8, d_model // 2)
+        self.branch_dim = branch_dim
+        self.horizontal = nn.Sequential(
+            nn.Conv2d(in_channels, branch_dim, kernel_size=(1, 3), padding=(0, 1)),
+            nn.GroupNorm(1, branch_dim),
+            nn.SiLU(),
+        )
+        self.vertical = nn.Sequential(
+            nn.Conv2d(in_channels, branch_dim, kernel_size=(3, 1), padding=(1, 0)),
+            nn.GroupNorm(1, branch_dim),
+            nn.SiLU(),
+        )
+        self.local = nn.Sequential(
+            nn.Conv2d(in_channels, branch_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(1, branch_dim),
+            nn.SiLU(),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(3 * branch_dim, d_model, kernel_size=1),
+            nn.GroupNorm(1, d_model),
+            nn.SiLU(),
+            nn.Conv2d(d_model, d_model, kernel_size=3, padding=1, groups=d_model),
+            nn.GroupNorm(1, d_model),
+            nn.SiLU(),
+        )
+        self.branch_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(3 * branch_dim, 3 * branch_dim, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        nn.init.zeros_(self.branch_gate[1].weight)
+        nn.init.constant_(self.branch_gate[1].bias, 2.0)
+        self.skip = nn.Conv2d(in_channels, d_model, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = torch.cat([self.horizontal(x), self.vertical(x), self.local(x)], dim=1)
+        feat = feat * self.branch_gate(feat)
+        return self.fuse(feat) + self.skip(x)
+
+
+class RowRasterPatchEmbedding(nn.Module):
+    """Convolutional row-raster embedding with horizontal temporal patches.
+
+    Output preserves the raster row axis: ``(B, d_model, H, ceil(W / patch))``.
+    Each token sees a contiguous horizontal time span, while the stem has
+    already mixed nearby rows for periodic/cross-row structure.
+    """
+
+    def __init__(self, patch_size: int, in_channels: int, d_model: int):
+        super().__init__()
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.stem = ConvRasterStem(in_channels, d_model)
+        self.patch = nn.Sequential(
+            nn.Conv2d(d_model, d_model, kernel_size=(1, patch_size), stride=(1, patch_size)),
+            nn.GroupNorm(1, d_model),
+            nn.SiLU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        ps = self.patch_size
+        pad_w = (ps - W % ps) % ps
+        if pad_w:
+            x = F.pad(x, (0, pad_w, 0, 0), mode="replicate")
+        return self.patch(self.stem(x))
+
+
+class RowRasterPatchDecoder(nn.Module):
+    """Inverse projection for :class:`RowRasterPatchEmbedding`."""
+
+    def __init__(self, patch_size: int, d_model: int, out_channels: int):
+        super().__init__()
+        self.patch_size = patch_size
+        self.out_channels = out_channels
+        self.linear = nn.Linear(d_model, patch_size * out_channels)
+
+    def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        B, _D, n_h, n_t = x.shape
+        ps = self.patch_size
+        x = x.permute(0, 2, 3, 1).contiguous()  # (B, n_h, n_t, D)
+        x = self.linear(x).reshape(B, n_h, n_t, self.out_channels, ps)
+        x = x.permute(0, 3, 1, 2, 4).reshape(B, self.out_channels, n_h, n_t * ps)
+        return x[:, :, :H, :W]
+
+
 # ---------------------------------------------------------------------------
 # Image side encoder (position encoding for 2D patch grids)
 # ---------------------------------------------------------------------------
 
 class ImageSideEncoder(nn.Module):
-    """Encode 2D patch positions (row, col) as side information.
+    """Encode 2D patch positions as side information.
 
-    Combines sinusoidal position encoding (row + col) with an optional
+    Combines sinusoidal position encoding (row + col + flattened row-major
+    time index) with an optional
     learnable spatial embedding that captures dataset-specific positional
     patterns beyond what sinusoidal frequencies can represent.
 
-    Output: ``(1, row_dim + col_dim, n_h, n_w)``
+    Output: ``(1, row_dim + col_dim + time_dim, n_h, n_w)``
     """
 
-    def __init__(self, row_dim: int, col_dim: int,
+    def __init__(self, row_dim: int, col_dim: int, time_dim: int | None = None,
                  max_h: int = 128, max_w: int = 128):
         super().__init__()
         self.row_dim = row_dim
         self.col_dim = col_dim
-        self.total_emb_dim = row_dim + col_dim
+        self.time_dim = col_dim if time_dim is None else int(time_dim)
+        self.total_emb_dim = row_dim + col_dim + self.time_dim
         self.max_h = max_h
         self.max_w = max_w
 
@@ -219,7 +331,7 @@ class ImageSideEncoder(nn.Module):
             * -(math.log(10000.0) / d_model)
         )                                                             # (d_model/2,)
         pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div[: pe[:, 1::2].shape[1]])
         return pe
 
     def forward(self, n_h: int, n_w: int, device: torch.device) -> torch.Tensor:
@@ -230,21 +342,24 @@ class ImageSideEncoder(nn.Module):
             device: target device.
 
         Returns:
-            side_emb: ``(1, row_dim + col_dim, n_h, n_w)``
+            side_emb: ``(1, row_dim + col_dim + time_dim, n_h, n_w)``
         """
         row_ids = torch.arange(n_h, device=device)
         col_ids = torch.arange(n_w, device=device)
+        flat_ids = torch.arange(n_h * n_w, device=device)
 
         row_pe = self._sinusoidal_pe(row_ids, self.row_dim)  # (n_h, row_dim)
         col_pe = self._sinusoidal_pe(col_ids, self.col_dim)  # (n_w, col_dim)
+        time_pe = self._sinusoidal_pe(flat_ids, self.time_dim).reshape(n_h, n_w, self.time_dim)
 
         # Broadcast: rows vary along dim=2, cols along dim=3
         row_pe = row_pe.T.unsqueeze(0).unsqueeze(-1)         # (1, row_dim, n_h, 1)
         col_pe = col_pe.T.unsqueeze(0).unsqueeze(2)          # (1, col_dim, 1, n_w)
+        time_pe = time_pe.permute(2, 0, 1).unsqueeze(0)      # (1, time_dim, n_h, n_w)
         row_pe = row_pe.expand(-1, -1, -1, n_w)              # (1, row_dim, n_h, n_w)
         col_pe = col_pe.expand(-1, -1, n_h, -1)              # (1, col_dim, n_h, n_w)
 
-        sinusoidal = torch.cat([row_pe, col_pe], dim=1)      # (1, rd+cd, n_h, n_w)
+        sinusoidal = torch.cat([row_pe, col_pe, time_pe], dim=1)
 
         # Learnable spatial embedding (interpolate if grid exceeds max)
         spatial = self.spatial_emb.to(device)
@@ -281,22 +396,33 @@ class ResidualBlock(nn.Module):
 
     def __init__(self, side_dim: int, channels: int,
                  diffusion_embedding_dim: int, nheads: int,
-                 condition_type: str = "adaLN"):
+                 condition_type: str = "adaLN",
+                 dim_feedforward: int | None = None,
+                 use_feature_axis: bool = True):
         super().__init__()
         self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
         self.norm_mid = nn.GroupNorm(1, channels)      # normalize before mid_projection
+        self.side_pre_projection = Conv1d_with_init(side_dim, channels, 1)
         self.side_projection = Conv1d_with_init(side_dim, 2 * channels, 1)
         self.mid_projection = Conv1d_with_init(channels, 2 * channels, 1)
         self.norm_out = nn.GroupNorm(1, channels)      # normalize before output_projection
         self.output_projection = Conv1d_with_init(channels, 2 * channels, 1)
 
-        self.time_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
-        self.feature_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
+        self.time_layer = get_torch_trans(
+            heads=nheads, layers=1, channels=channels, dim_feedforward=dim_feedforward,
+        )
+        self.feature_layer = (
+            get_torch_trans(
+                heads=nheads, layers=1, channels=channels, dim_feedforward=dim_feedforward,
+            )
+            if use_feature_axis
+            else None
+        )
 
         self.condition_type = condition_type
         if condition_type == "cross_attention":
             self.condition_cross_attention = get_torch_cross_trans(
-                heads=nheads, layers=1, channels=channels,
+                heads=nheads, layers=1, channels=channels, dim_feedforward=dim_feedforward,
             )
         elif condition_type == "adaLN":
             self.adaLN_modulation = nn.Sequential(
@@ -310,7 +436,7 @@ class ResidualBlock(nn.Module):
     # -- axis attention ----------------------------------------------------------
 
     def forward_time(self, y: torch.Tensor, base_shape: tuple,
-                     attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+                     attention_mask: torch.Tensor | dict | None = None) -> torch.Tensor:
         """Transformer attention over L (column / W-patch) dimension.
 
         Reshapes ``(B, C, K, L)`` to ``(B*K, L, C)``, applies self-attention
@@ -319,34 +445,60 @@ class ResidualBlock(nn.Module):
         B, C, K, L = base_shape
         if L == 1:
             return y
+        attn_mask = attention_mask
+        key_padding_mask = None
+        if isinstance(attention_mask, dict):
+            attn_mask = attention_mask.get("time_attn_mask", None)
+            key_padding_mask = attention_mask.get("time_key_padding_mask", None)
         y = y.reshape(B, C, K, L).permute(0, 2, 1, 3).reshape(B * K, C, L)
-        y = self.time_layer(y.permute(0, 2, 1), mask=attention_mask).permute(0, 2, 1)
+        y = self.time_layer(
+            y.permute(0, 2, 1),
+            mask=attn_mask,
+            src_key_padding_mask=key_padding_mask,
+        ).permute(0, 2, 1)
         y = y.reshape(B, K, C, L).permute(0, 2, 1, 3).reshape(B, C, K * L)
         return y
 
     def forward_feature(self, y: torch.Tensor, base_shape: tuple,
-                        attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+                        attention_mask: torch.Tensor | dict | None = None) -> torch.Tensor:
         """Transformer attention over K (row / H-patch) dimension.
 
         Reshapes ``(B, C, K, L)`` to ``(B*L, K, C)``, applies self-attention
         along K, then reshapes back.
         """
         B, C, K, L = base_shape
-        if K == 1:
+        if K == 1 or self.feature_layer is None:
             return y
+        attn_mask = attention_mask
+        key_padding_mask = None
+        if isinstance(attention_mask, dict):
+            attn_mask = attention_mask.get("feature_attn_mask", None)
+            key_padding_mask = attention_mask.get("feature_key_padding_mask", None)
         y = y.reshape(B, C, K, L).permute(0, 3, 1, 2).reshape(B * L, C, K)
-        y = self.feature_layer(y.permute(0, 2, 1), mask=attention_mask).permute(0, 2, 1)
+        y = self.feature_layer(
+            y.permute(0, 2, 1),
+            mask=attn_mask,
+            src_key_padding_mask=key_padding_mask,
+        ).permute(0, 2, 1)
         y = y.reshape(B, L, C, K).permute(0, 2, 3, 1).reshape(B, C, K * L)
         return y
 
     def forward_cross_attention(self, y: torch.Tensor, cond: torch.Tensor,
-                                attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+                                attention_mask: torch.Tensor | dict | None = None) -> torch.Tensor:
         """Cross-attention from y to cond (both shaped (B, C, K, L))."""
         B, C, K, L = y.shape
+        memory_mask = attention_mask
+        memory_key_padding_mask = None
+        if isinstance(attention_mask, dict):
+            memory_mask = attention_mask.get("time_attn_mask", None)
+            memory_key_padding_mask = attention_mask.get("time_key_padding_mask", None)
         y = y.reshape(B, C, K, L).permute(0, 2, 3, 1).reshape(B * K, L, C)
         cond = cond.reshape(B, C, K, L).permute(0, 2, 3, 1).reshape(B * K, L, C)
         y = self.condition_cross_attention(
-            tgt=y, memory=cond, memory_mask=attention_mask,
+            tgt=y,
+            memory=cond,
+            memory_mask=memory_mask,
+            memory_key_padding_mask=memory_key_padding_mask,
         ).permute(0, 2, 1)
         y = y.reshape(B, K, C, L).permute(0, 2, 1, 3)
         return y
@@ -396,13 +548,15 @@ class ResidualBlock(nn.Module):
         diffusion_emb = self.diffusion_projection(diffusion_emb)   # (B, channels)
         diffusion_emb = diffusion_emb.unsqueeze(-1).unsqueeze(-1)  # (B, channels, 1, 1)
         y = x + diffusion_emb
+        side_pre = self.side_pre_projection(side_emb.reshape(B, side_emb.shape[1], K * L))
+        y = y + side_pre.reshape(B, channel, K, L)
 
         if ct == "adaLN":
             y = self.modulate(y, gamma, beta)
 
         # -- 3. dual-axis attention ----------------------------------------------
         y = self.forward_time(y, base_shape, attention_mask)     # over L (columns)
-        y = self.forward_feature(y, base_shape, None)            # over K (rows)
+        y = self.forward_feature(y, base_shape, attention_mask)  # over K (rows)
 
         if ct == "adaLN":
             y = y.reshape(B, channel, K, L)
@@ -439,14 +593,17 @@ class ResidualBlock(nn.Module):
 class TIGERDiT(nn.Module):
     """Text+Image Guided Encoding for Recomposition -- DiT backbone.
 
-    Takes a noisy 3-channel image (GAF + STFT + RP) and predicts the
-    added noise, conditioned on diffusion timestep and text/image
-    attributes via adaLN (or add / cross-attention).
+    Takes a noisy TS-image and predicts the added noise, conditioned on
+    diffusion timestep and text/image attributes via adaLN (or add /
+    cross-attention).  For row-raster inputs, ``patch_mode="row_raster"``
+    uses contiguous temporal patches instead of square image patches.
 
     Multi-patch support: multiple patch sizes produce grids that are
     **flattened and concatenated** along the sequence dimension with a
     block-diagonal parallel attention mask (same strategy as VerbalTS
-    ``multipatch_num``).
+    ``multipatch_num``).  In ``patch_mode="row_raster"`` the recommended
+    first-stage path uses a single horizontal patch scale and preserves the
+    raster row axis as the feature axis for dual-axis attention.
 
     Expected ``config`` keys::
 
@@ -474,6 +631,19 @@ class TIGERDiT(nn.Module):
         self.condition_type: str = config.get("condition_type", "adaLN")
         self.attention_mask_type: str = config.get("attention_mask_type", "parallel")
         self.multipatch_num: int = config.get("multipatch_num", 1)
+        self.patch_mode: str = str(config.get("patch_mode", "square")).lower()
+        if self.patch_mode == "row_raster" and self.multipatch_num > 1:
+            raise ValueError(
+                "row_raster currently requires multipatch_num=1. "
+                "Flattening multiple row-raster scales would collapse the row axis "
+                "back to K=1 and disable dual-axis attention."
+            )
+        self.signal_length: int | None = config.get("signal_length", None)
+        if self.signal_length is not None:
+            self.signal_length = int(self.signal_length)
+        ff_mult = int(config.get("ff_mult", 4))
+        dim_feedforward = int(config.get("dim_feedforward", ff_mult * self.channels))
+        use_feature_axis = bool(config.get("use_feature_axis", True))
 
         # -- diffusion timestep embedding ----------------------------------------
         self.diffusion_embedding = DiffusionEmbedding(
@@ -484,8 +654,8 @@ class TIGERDiT(nn.Module):
         # -- side encoder (shared across scales) ---------------------------------
         row_dim: int = config.get("row_dim", 32)
         col_dim: int = config.get("col_dim", 32)
-        self.side_encoder = ImageSideEncoder(row_dim=row_dim, col_dim=col_dim)
-        side_dim: int = self.side_encoder.total_emb_dim
+        time_dim: int = config.get("time_dim", col_dim)
+        side_dim: int = row_dim + col_dim + time_dim
 
         # -- attr_emb projection (if attr_dim != channels) -----------------------
         attr_dim: int = config.get("attr_dim", self.channels)
@@ -498,6 +668,11 @@ class TIGERDiT(nn.Module):
         base_patch: int = config["base_patch"]
         patch_scale: int = config.get("patch_scale", 2)
         in_channels: int = config.get("in_channels", 3)
+        if self.patch_mode == "row_raster" and "image_size_w" in config:
+            image_size_w = max(1, int(config["image_size_w"]))
+            if base_patch > image_size_w:
+                base_patch = image_size_w
+                self.config["base_patch"] = base_patch
 
         self.image_downsample = nn.ModuleList()
         self.side_downsample = nn.ModuleList()
@@ -505,19 +680,25 @@ class TIGERDiT(nn.Module):
 
         for i in range(self.multipatch_num):
             ps = base_patch * (patch_scale ** i)
+            patch_embed_cls = RowRasterPatchEmbedding if self.patch_mode == "row_raster" else ImagePatchEmbedding
+            patch_decoder_cls = RowRasterPatchDecoder if self.patch_mode == "row_raster" else ImagePatchDecoder
             self.image_downsample.append(
-                ImagePatchEmbedding(ps, in_channels, self.channels),
+                patch_embed_cls(ps, in_channels, self.channels),
             )
             self.patch_decoder.append(
-                ImagePatchDecoder(ps, self.channels, in_channels),
+                patch_decoder_cls(ps, self.channels, in_channels),
             )
             # Each scale gets its own side encoder instance
             # (ImageSideEncoder is stateless for sinusoidal + learnable spatial)
             self.side_downsample.append(
-                ImageSideEncoder(row_dim=row_dim, col_dim=col_dim),
+                ImageSideEncoder(row_dim=row_dim, col_dim=col_dim, time_dim=time_dim),
             )
 
         self.multipatch_mixer = nn.Linear(self.multipatch_num, 1)
+        if self.multipatch_num == 1:
+            with torch.no_grad():
+                self.multipatch_mixer.weight.fill_(1.0)
+                self.multipatch_mixer.bias.zero_()
 
         # -- output projection ---------------------------------------------------
         self.output_projection = Conv1d_with_init(self.channels, self.channels, 1)
@@ -530,6 +711,8 @@ class TIGERDiT(nn.Module):
                 diffusion_embedding_dim=config["diffusion_embedding_dim"],
                 nheads=self.nheads,
                 condition_type=self.condition_type,
+                dim_feedforward=dim_feedforward,
+                use_feature_axis=use_feature_axis,
             )
             for _ in range(config["layers"])
         ])
@@ -547,9 +730,16 @@ class TIGERDiT(nn.Module):
             moe_grids = []
             for i in range(self.multipatch_num):
                 ps = base_patch * (patch_scale ** i)
-                # Match ImagePatchEmbedding padding: ceil division
-                n_h = (image_size_h + ps - 1) // ps
-                n_w = (image_size_w + ps - 1) // ps
+                if self.patch_mode == "row_raster":
+                    # RowRasterPatchEmbedding keeps rows intact and only
+                    # patches along width, so CSA-MoE/SCCA must see the same
+                    # H x ceil(W / ps) token grid as the DiT backbone.
+                    n_h = image_size_h
+                    n_w = (image_size_w + ps - 1) // ps
+                else:
+                    # Match ImagePatchEmbedding padding: ceil division
+                    n_h = (image_size_h + ps - 1) // ps
+                    n_w = (image_size_w + ps - 1) // ps
                 moe_grids.append((n_h, n_w))
 
             self.residual_layers = nn.ModuleList()
@@ -576,13 +766,16 @@ class TIGERDiT(nn.Module):
         if cticd_cfg is not None and cticd_cfg.get("enabled", True):
             from .cticd import CTICD
 
+            cticd_patch_size = cticd_cfg.get("patch_size", config.get("base_patch", 4))
+            if self.patch_mode == "row_raster":
+                cticd_patch_size = min(int(cticd_patch_size), int(config.get("image_size_w", cticd_patch_size)))
             self.cticd = CTICD(
                 d_model=cticd_cfg.get("d_model", self.channels),
                 output_channels=self.channels,
                 attr_dim=self.channels,
                 n_channels=cticd_cfg.get("n_channels", 3),
                 n_mechanisms_per_channel=cticd_cfg.get("n_mechanisms_per_channel", 4),
-                patch_size=cticd_cfg.get("patch_size", config.get("base_patch", 4)),
+                patch_size=cticd_patch_size,
                 num_heads=cticd_cfg.get("num_heads", self.nheads),
                 edge_bias=cticd_cfg.get("edge_bias", -4.0),
                 branch_grad_scale=cticd_cfg.get("branch_grad_scale", 0.2),
@@ -609,7 +802,9 @@ class TIGERDiT(nn.Module):
 
     @staticmethod
     def _build_parallel_mask(
-        len_list: list[int], device: torch.device,
+        len_list: list[int],
+        device: torch.device,
+        valid_list: list[int] | None = None,
     ) -> torch.Tensor:
         """Block-diagonal mask: each block attends only within itself.
 
@@ -618,10 +813,61 @@ class TIGERDiT(nn.Module):
         total = sum(len_list)
         mask = torch.zeros(total, total, device=device) - float("inf")
         start = 0
-        for length in len_list:
+        for idx, length in enumerate(len_list):
             mask[start:start + length, start:start + length] = 0
+            if valid_list is not None:
+                valid = max(1, min(int(valid_list[idx]), length))
+                mask[start:start + length, start + valid:start + length] = -float("inf")
             start += length
         return mask
+
+    def _valid_tokens_for_scale(self, patch_size: int, token_count: int) -> int:
+        if self.patch_mode != "row_raster" or self.signal_length is None:
+            return token_count
+        return min(token_count, max(1, (self.signal_length + patch_size - 1) // patch_size))
+
+    def _build_row_raster_padding_masks(
+        self,
+        batch_size: int,
+        n_h: int,
+        n_w: int,
+        image_w: int,
+        patch_size: int,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor] | None:
+        """Build key-padding masks for row-raster dual-axis attention.
+
+        ``True`` entries are ignored by PyTorch attention.  Fully padded rows or
+        columns are given one unmasked anchor token to avoid all-masked attention
+        rows producing NaN on some PyTorch versions.
+        """
+        if self.patch_mode != "row_raster" or self.signal_length is None:
+            return None
+
+        rows = torch.arange(n_h, device=device).unsqueeze(1)
+        cols = torch.arange(n_w, device=device).unsqueeze(0)
+        patch_start = rows * int(image_w) + cols * int(patch_size)
+        valid = patch_start < int(self.signal_length)  # (n_h, n_w)
+        if bool(valid.all()):
+            return None
+
+        time_key_padding_mask = (~valid).unsqueeze(0).expand(batch_size, -1, -1).reshape(batch_size * n_h, n_w)
+        all_masked_time = time_key_padding_mask.all(dim=1)
+        if bool(all_masked_time.any()):
+            time_key_padding_mask[all_masked_time, 0] = False
+
+        feature_valid = valid.transpose(0, 1).contiguous()  # (n_w, n_h)
+        feature_key_padding_mask = (
+            ~feature_valid
+        ).unsqueeze(0).expand(batch_size, -1, -1).reshape(batch_size * n_w, n_h)
+        all_masked_feature = feature_key_padding_mask.all(dim=1)
+        if bool(all_masked_feature.any()):
+            feature_key_padding_mask[all_masked_feature, 0] = False
+
+        return {
+            "time_key_padding_mask": time_key_padding_mask,
+            "feature_key_padding_mask": feature_key_padding_mask,
+        }
 
     # -- forward ----------------------------------------------------------------
 
@@ -660,72 +906,102 @@ class TIGERDiT(nn.Module):
         x_list: list[torch.Tensor] = []       # each: (B, channels, n_tok_i)
         side_list: list[torch.Tensor] = []    # each: (B, side_dim,  n_tok_i)
         token_counts: list[int] = []
+        valid_counts: list[int] = []
         grids: list[tuple[int, int]] = []     # (n_h_i, n_w_i) per scale
 
         for i in range(self.multipatch_num):
             x_i = self.image_downsample[i](image)            # (B, ch, n_h_i, n_w_i)
             n_h_i, n_w_i = x_i.shape[2], x_i.shape[3]
+            ps = self.config["base_patch"] * (self.config.get("patch_scale", 2) ** i)
 
             side_i = self.side_downsample[i](n_h_i, n_w_i, device)  # (1, sd, n_h_i, n_w_i)
             side_i = side_i.expand(B, -1, -1, -1)                   # (B, sd, n_h_i, n_w_i)
 
-            x_list.append(x_i.reshape(B, self.channels, -1))
-            side_list.append(side_i.reshape(B, side_i.shape[1], -1))
+            x_list.append(x_i)
+            side_list.append(side_i)
             token_counts.append(n_h_i * n_w_i)
+            valid_counts.append(self._valid_tokens_for_scale(ps, n_h_i * n_w_i))
             grids.append((n_h_i, n_w_i))
 
         # ------------------------------------------------------------------
         # 2. Attention mask
         # ------------------------------------------------------------------
-        if (self.attention_mask_type == "parallel"
-                and self.multipatch_num > 1):
-            attention_mask = self._build_parallel_mask(token_counts, device)
+        if self.multipatch_num == 1:
+            if self.patch_mode == "row_raster":
+                ps = self.config["base_patch"]
+                n_h_i, n_w_i = grids[0]
+                attention_mask = self._build_row_raster_padding_masks(
+                    batch_size=B,
+                    n_h=n_h_i,
+                    n_w=n_w_i,
+                    image_w=W,
+                    patch_size=ps,
+                    device=device,
+                )
+            else:
+                attention_mask = None
+        elif self.attention_mask_type == "parallel":
+            attention_mask = self._build_parallel_mask(token_counts, device, valid_counts)
         else:
             attention_mask = None
 
         # ------------------------------------------------------------------
-        # 3. Concatenate along sequence dimension
+        # 3. Build token grid
         # ------------------------------------------------------------------
-        x_in    = torch.cat(x_list,    dim=-1)   # (B, channels, total_tokens)
-        side_in = torch.cat(side_list, dim=-1)   # (B, side_dim,   total_tokens)
-
-        total_tokens = x_in.shape[-1]
+        if self.multipatch_num == 1:
+            x_in = x_list[0]       # (B, channels, K, L)
+            side_in = side_list[0] # (B, side_dim, K, L)
+            total_tokens = token_counts[0]
+        else:
+            x_in = torch.cat(
+                [x_i.reshape(B, self.channels, -1) for x_i in x_list],
+                dim=-1,
+            ).unsqueeze(2)
+            side_in = torch.cat(
+                [s_i.reshape(B, s_i.shape[1], -1) for s_i in side_list],
+                dim=-1,
+            ).unsqueeze(2)
+            total_tokens = x_in.shape[-1]
 
         # ------------------------------------------------------------------
         # 4. attr_emb handling
         # ------------------------------------------------------------------
         if attr_emb is None:
             attr_cat = torch.zeros(
-                B, self.channels, total_tokens, device=device,
+                B, self.channels, *x_in.shape[2:], device=device,
             )
         else:
             # Treat condition anchors as a low-resolution condition map and
             # resize them to each patch scale. This keeps n_var x n_scale
             # anchors usable instead of collapsing back to a global vector.
-            attr_parts: list[torch.Tensor] = []
             attr_for_resize = attr_emb.float()
-            for i in range(self.multipatch_num):
-                n_h_i, n_w_i = grids[i]
-                attr_i = F.interpolate(
+            if self.multipatch_num == 1:
+                n_h_i, n_w_i = grids[0]
+                attr_cat = F.interpolate(
                     attr_for_resize,
                     size=(n_h_i, n_w_i),
                     mode="bilinear",
                     align_corners=False,
                 ).to(dtype=attr_emb.dtype)
-                attr_parts.append(attr_i.reshape(B, attr_i.shape[1], -1))
-            attr_cat = torch.cat(attr_parts, dim=-1)    # (B, attr_dim, total_tokens)
+            else:
+                attr_parts: list[torch.Tensor] = []
+                for i in range(self.multipatch_num):
+                    n_h_i, n_w_i = grids[i]
+                    attr_i = F.interpolate(
+                        attr_for_resize,
+                        size=(n_h_i, n_w_i),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).to(dtype=attr_emb.dtype)
+                    attr_parts.append(attr_i.reshape(B, attr_i.shape[1], -1))
+                attr_cat = torch.cat(attr_parts, dim=-1).unsqueeze(2)
 
             # Project if attr_dim != channels
-            attr_cat = self.attr_proj(attr_cat)          # (B, channels, total_tokens)
+            attr_shape = attr_cat.shape
+            attr_cat = self.attr_proj(attr_cat.reshape(B, attr_shape[1], -1))
+            attr_cat = attr_cat.reshape(B, self.channels, *attr_shape[2:])
 
-        # ------------------------------------------------------------------
-        # 5. Reshape for ResidualBlock: (B, C, K=1, L=total_tokens)
-        #    K=1 because multi-patch grids are flattened into a single
-        #    sequence; the block-diagonal mask ensures cross-scale isolation.
-        # ------------------------------------------------------------------
-        x_in    = x_in.unsqueeze(2)       # (B, channels, 1, total_tokens)
-        side_in = side_in.unsqueeze(2)    # (B, side_dim,   1, total_tokens)
-        attr_in = attr_cat.unsqueeze(2)   # (B, channels,   1, total_tokens)
+        attr_in = attr_cat
 
         # --- CTICD causal feature injection ---
         self._cticd_losses = None
@@ -778,7 +1054,7 @@ class TIGERDiT(nn.Module):
         # 7. Output projection
         # ------------------------------------------------------------------
         x = x.reshape(B, self.channels, total_tokens)
-        x = F.relu(self.output_projection(x))
+        x = self.output_projection(x)
 
         # ------------------------------------------------------------------
         # 8. Split back per scale, decode, and mix

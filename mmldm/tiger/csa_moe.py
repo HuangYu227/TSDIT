@@ -123,22 +123,23 @@ class AddAuxiliaryLoss(torch.autograd.Function):
 
 
 class LocalTrendExpert(nn.Module):
-    """Sparse row/column structural expert for local trend patterns.
+    """Temporal + periodic structural expert for local trend patterns.
 
-    Captures symmetric row/column context from the 2D spatial grid,
-    suitable for detecting local trends and smooth transitions.
+    Uses depthwise Conv2d to capture horizontal (within-row temporal) and
+    vertical (cross-row periodic) patterns.  More robust than mean-pooling
+    for small grids where W is small (e.g., W=2).
 
     .. note::
        Named for its inductive bias, not its input.  Receives tokens from
        **all** image channels; the router selects tokens whose structure
-       benefits from row/column context.
+       benefits from temporal/periodic context.
     """
 
     def __init__(self, dim: int):
         super().__init__()
 
-        self.row_proj = nn.Linear(dim, dim)
-        self.col_proj = nn.Linear(dim, dim)
+        self.temporal_mix = nn.Conv2d(dim, dim, kernel_size=(1, 3), padding=(0, 1), groups=dim)
+        self.periodic_mix = nn.Conv2d(dim, dim, kernel_size=(3, 1), padding=(1, 0), groups=dim)
 
         self.mix = nn.Sequential(
             nn.Linear(dim * 2, dim),
@@ -164,27 +165,26 @@ class LocalTrendExpert(nn.Module):
         if L != H * W:
             raise ValueError(f"LocalTrendExpert expects L == H*W, got L={L}, H*W={H * W}.")
 
-        x2d = rearrange(x, "b (h w) c -> b h w c", h=H, w=W)
+        x2d = rearrange(x, "b (h w) c -> b c h w", h=H, w=W)
+        t = self.temporal_mix(x2d)
+        p = self.periodic_mix(x2d)
 
-        row_ctx = x2d.mean(dim=2)  # [B, H, C]
-        col_ctx = x2d.mean(dim=1)  # [B, W, C]
+        t_flat = rearrange(t, "b c h w -> b (h w) c")
+        p_flat = rearrange(p, "b c h w -> b (h w) c")
 
-        row = l_idx // W
-        col = l_idx % W
-
-        r = self.row_proj(row_ctx[b_idx, row])
-        c = self.col_proj(col_ctx[b_idx, col])
-
-        return self.mix(torch.cat([r, c], dim=-1))
+        return self.mix(torch.cat([t_flat[b_idx, l_idx], p_flat[b_idx, l_idx]], dim=-1))
 
     def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
         B, L, C = x.shape
 
-        b_idx = torch.arange(B, device=x.device).repeat_interleave(L)
-        l_idx = torch.arange(L, device=x.device).repeat(B)
+        x2d = rearrange(x, "b (h w) c -> b c h w", h=H, w=W)
+        t = self.temporal_mix(x2d)
+        p = self.periodic_mix(x2d)
 
-        y = self.forward_sparse(x, H, W, b_idx, l_idx)
-        return y.view(B, L, C)
+        t_flat = rearrange(t, "b c h w -> b (h w) c")
+        p_flat = rearrange(p, "b c h w -> b (h w) c")
+
+        return self.mix(torch.cat([t_flat, p_flat], dim=-1))
 
 
 class RowContextExpert(nn.Module):
@@ -385,6 +385,18 @@ class CSAMoELayer(nn.Module):
         self.gate = MoEGate(dim=dim, n_exp=3, k=k, alpha=alpha)
         self.router_norm = nn.LayerNorm(dim)
 
+        # Shared expert: every token gets a small dense signal to prevent
+        # complete expert starvation when k=1 on small grids.
+        self.shared_expert = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+        )
+        nn.init.zeros_(self.shared_expert[-1].weight)
+        nn.init.zeros_(self.shared_expert[-1].bias)
+        self.shared_scale = nn.Parameter(torch.tensor(1e-3))
+
         if t_dim is None or t_dim == dim:
             self.t_proj = None
         else:
@@ -466,6 +478,10 @@ class CSAMoELayer(nn.Module):
                 out.index_put_((b_idx, l_idx), y, accumulate=True)
                 expert_pools[e_id].index_put_((b_idx, l_idx), y, accumulate=True)
 
+        # Shared expert: every token gets a small dense signal
+        shared_out = self.shared_expert(tok)
+        out = out + self.shared_scale * shared_out
+
         if self.use_cc:
             out = out + self.cc(expert_pools[0], expert_pools[1], expert_pools[2])
 
@@ -491,12 +507,16 @@ class CSAMoELayer(nn.Module):
 
 
 class StructuralConsistencyCrossAttention(nn.Module):
-    """Geometric alignment + ring cross-attention for structural consistency.
+    """Row-raster structural alignment + ring cross-attention.
 
     Input streams:
         gf: local-trend stream
         sf: row-context stream
         rf: patch-state stream
+
+    For row-raster images there is no GASF-style diagonal semantic.  The
+    alignment therefore uses row-wise trend anchors and column-wise periodic
+    context before the three streams exchange information.
     """
 
     def __init__(self, dim: int, nh: int = 4):
@@ -509,10 +529,11 @@ class StructuralConsistencyCrossAttention(nn.Module):
         self.a2 = nn.MultiheadAttention(dim, nh, batch_first=True)
         self.a3 = nn.MultiheadAttention(dim, nh, batch_first=True)
 
-        self.dp = nn.Linear(dim, dim)
-        self.fp = nn.Linear(dim, dim)
+        self.row_proj = nn.Linear(dim, dim)
+        self.col_proj = nn.Linear(dim, dim)
 
-        self.ag = nn.Parameter(torch.zeros(1))
+        self.row_gate = nn.Parameter(torch.zeros(1))
+        self.col_gate = nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -530,22 +551,13 @@ class StructuralConsistencyCrossAttention(nn.Module):
         g2 = rearrange(gf, "b (h w) c -> b h w c", h=H, w=W)
         s2 = rearrange(sf, "b (h w) c -> b h w c", h=H, w=W)
 
-        diag_len = min(H, W)
-        diag = torch.arange(diag_len, device=gf.device)
-
-        g_diag = g2[:, diag, diag, :]
-        s_time = s2.mean(dim=1)
-
-        n = min(g_diag.shape[1], s_time.shape[1])
-
-        aligned_diag = g_diag[:, :n, :] + self.ag.tanh() * self.fp(s_time[:, :n, :])
-
-        g2_aligned = g2.clone()
-        for i in range(n):
-            # Replace the temporal anchor tokens with row-context aligned tokens.
-            # aligned_diag already carries the local-trend content; double-adding
-            # g2[:, i, i, :] would over-amplify these anchor positions.
-            g2_aligned[:, i, i, :] = self.dp(aligned_diag[:, i, :])
+        row_anchor = self.row_proj(g2.mean(dim=2)).unsqueeze(2)  # (B,H,1,C)
+        col_anchor = self.col_proj(s2.mean(dim=1)).unsqueeze(1)  # (B,1,W,C)
+        g2_aligned = (
+            g2
+            + self.row_gate.tanh() * row_anchor
+            + self.col_gate.tanh() * col_anchor
+        )
 
         gfa = rearrange(g2_aligned, "b h w c -> b (h w) c")
 
@@ -568,8 +580,8 @@ class ChannelAwareResidualBlock(nn.Module):
         bo, sk = base(x, se, ae, de, am)
 
     Expected bo:
-        [B, C, 1, T]
-        where T == sum(h * w for h, w in grids)
+        [B, C, K, L]
+        where K * L == sum(h * w for h, w in grids)
     """
 
     def __init__(
@@ -583,12 +595,14 @@ class ChannelAwareResidualBlock(nn.Module):
         alpha: float = 0.01,
         inject_aux: bool = False,
         scca_heads: int = 4,
+        scca_warmup_steps: int = 500,
     ):
         super().__init__()
 
         self.base = base
         self.grids = grids
         self.ns = len(grids)
+        self.scca_warmup_steps = scca_warmup_steps
 
         self.moe = nn.ModuleList([
             CSAMoELayer(
@@ -607,15 +621,27 @@ class ChannelAwareResidualBlock(nn.Module):
             for _ in range(self.ns)
         ])
 
-        self.gate = nn.ParameterList([
-            nn.Parameter(torch.zeros(1))
+        # P0: Per-channel LayerScale replaces scalar zero-init gates.
+        # Small non-zero init (1e-3 / 1e-4) lets gradients flow from step 0
+        # while keeping the MoE contribution tiny so the base block still
+        # dominates at init (experts themselves remain zero-init internally).
+        self.moe_scale = nn.ParameterList([
+            nn.Parameter(torch.full((ch,), 1e-3))
             for _ in range(self.ns)
         ])
 
-        self.scca_gate = nn.ParameterList([
-            nn.Parameter(torch.zeros(1))
+        self.scca_scale = nn.ParameterList([
+            nn.Parameter(torch.full((ch,), 1e-4))
             for _ in range(self.ns)
         ])
+
+        # P1: Per-channel scale for skip-connection injection of MoE delta.
+        self.skip_scale = nn.Parameter(torch.full((ch,), 1e-3))
+
+        # P1: SCCA warmup step counter -- SCCA is skipped while
+        # step_counter < scca_warmup_steps to avoid noisy attention
+        # before the MoE router has learned meaningful assignments.
+        self.register_buffer("step_counter", torch.tensor(0, dtype=torch.long))
 
     def forward(
         self,
@@ -629,18 +655,19 @@ class ChannelAwareResidualBlock(nn.Module):
         bo, sk = self.base(x, se, ae, de, am)
 
         if bo.dim() != 4:
-            raise ValueError(f"Expected base output bo to be 4D [B,C,1,T], got {bo.shape}.")
+            raise ValueError(f"Expected base output bo to be 4D [B,C,K,L], got {bo.shape}.")
 
-        if bo.shape[2] != 1:
-            raise ValueError(f"Expected bo.shape[2] == 1, got bo.shape={bo.shape}.")
-
-        f = bo.squeeze(2).permute(0, 2, 1).contiguous()  # [B, L, C]
+        B, C, K, L = bo.shape
+        f = bo.permute(0, 2, 3, 1).reshape(B, K * L, C).contiguous()  # [B, K*L, C]
 
         expected_tokens = sum(h * w for h, w in self.grids)
         if expected_tokens != f.shape[1]:
             raise ValueError(
                 f"Grid token count {expected_tokens} does not match feature length {f.shape[1]}."
             )
+
+        # Whether SCCA is still in its warmup phase (router not yet stable).
+        scca_active = not (self.training and self.step_counter.item() < self.scca_warmup_steps)
 
         outs = []
         aux_list = []
@@ -658,22 +685,34 @@ class ChannelAwareResidualBlock(nn.Module):
                 return_streams=True,
             )
 
-            g_stream = tok + expert_pools[0]
-            s_stream = tok + expert_pools[1]
-            r_stream = tok + expert_pools[2]
+            # P1: SCCA conditional computation -- skip the three full
+            # attention passes during warmup when scca_scale is still near
+            # zero and the router has not stabilised yet.
+            if scca_active:
+                g_stream = tok + expert_pools[0]
+                s_stream = tok + expert_pools[1]
+                r_stream = tok + expert_pools[2]
 
-            gs, ss, rs = self.scca[scale_id](
-                g_stream,
-                s_stream,
-                r_stream,
-                nh,
-                nw,
+                gs, ss, rs = self.scca[scale_id](
+                    g_stream,
+                    s_stream,
+                    r_stream,
+                    nh,
+                    nw,
+                )
+
+                scca_delta = ((gs + ss + rs) / 3.0) - tok
+            else:
+                scca_delta = torch.zeros_like(tok)
+
+            # P0: Per-channel LayerScale.  moe_scale and scca_scale are
+            # small but non-zero at init, so the MoE experts receive task
+            # gradient from step 0 instead of being starved by gate=0.
+            out_tok = (
+                tok
+                + self.moe_scale[scale_id].view(1, 1, -1) * moe_delta
+                + self.scca_scale[scale_id].view(1, 1, -1) * scca_delta
             )
-
-            scca_delta = ((gs + ss + rs) / 3.0) - tok
-            delta = moe_delta + self.scca_gate[scale_id].tanh() * scca_delta
-
-            out_tok = tok + self.gate[scale_id].tanh() * delta
             outs.append(out_tok)
 
             if aux is not None:
@@ -682,10 +721,21 @@ class ChannelAwareResidualBlock(nn.Module):
             offset += nt
 
         out = torch.cat(outs, dim=1)
-        out = out.permute(0, 2, 1).unsqueeze(2).contiguous()
+        out = out.reshape(B, K, L, C).permute(0, 3, 1, 2).contiguous()
+
+        # P1: Inject the MoE+SCCA refinement into the skip connection so
+        # the downstream layers see the expert contribution in the skip
+        # signal (previously sk came straight from the base block with no
+        # MoE signal).
+        delta_out = out - bo                                  # [B, C, K, L]
+        sk = sk + self.skip_scale.view(1, -1, 1, 1) * delta_out
 
         aux_total = None
         if len(aux_list) > 0:
             aux_total = torch.stack(aux_list).mean()
+
+        # Advance the SCCA warmup counter (training only).
+        if self.training:
+            self.step_counter += 1
 
         return out, sk, aux_total

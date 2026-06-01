@@ -75,19 +75,46 @@ class _AnchorProjector(nn.Module):
         self.seg_size = n_steps // max(1, n_stages) + 1
 
         self.var_emb = nn.Parameter(torch.zeros((1, n_var, dim_in)))
-        self.scale_emb = nn.Parameter(torch.zeros((1, n_scale, dim_in)))
+        self.var_pe = self._build_row_pe(n_var, dim_in)
         self.step_emb = nn.Parameter(torch.zeros((1, n_stages, dim_in)))
 
         self.var_cross_attn = _make_cross_attn(dim_in, n_heads, n_layers, dim_ff)
-        self.scale_cross_attn = _make_cross_attn(dim_in, n_heads, n_layers, dim_ff)
         self.step_cross_attn = _make_cross_attn(dim_in, n_heads, n_layers, dim_ff)
+
+        # Scale path: when n_scale=1 the cross-attention produces a constant
+        # broadcast (all rows get the same scale).  Replace with a learned
+        # per-row gate that is cheaper and more expressive.
+        if n_scale == 1:
+            self.scale_gate = nn.Sequential(
+                nn.Linear(dim_in, dim_in),
+                nn.SiLU(),
+                nn.Linear(dim_in, dim_in),
+            )
+            nn.init.zeros_(self.scale_gate[-1].weight)
+            nn.init.zeros_(self.scale_gate[-1].bias)
+            self.scale_cross_attn = None
+        else:
+            self.scale_emb = nn.Parameter(torch.zeros((1, n_scale, dim_in)))
+            nn.init.trunc_normal_(self.scale_emb, std=0.02)
+            self.scale_cross_attn = _make_cross_attn(dim_in, n_heads, n_layers, dim_ff)
+            self.scale_gate = None
 
         self.proj_out = nn.Linear(dim_in, dim_out)
         self.reset_parameters()
 
+    @staticmethod
+    def _build_row_pe(n_rows: int, dim: int) -> torch.Tensor:
+        """Sinusoidal row position encoding.  Returns (1, n_rows, dim)."""
+        import math
+        pe = torch.zeros(n_rows, dim)
+        pos = torch.arange(n_rows).float().unsqueeze(1)
+        div = torch.exp(torch.arange(0, dim, 2).float() * -(math.log(10000.0) / dim))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div[: pe[:, 1::2].shape[1]])
+        return pe.unsqueeze(0)
+
     def reset_parameters(self) -> None:
         nn.init.trunc_normal_(self.var_emb, std=0.02)
-        nn.init.trunc_normal_(self.scale_emb, std=0.02)
         nn.init.trunc_normal_(self.step_emb, std=0.02)
 
     def forward(self, attr: torch.Tensor, diffusion_step: torch.Tensor) -> torch.Tensor:
@@ -103,15 +130,25 @@ class _AnchorProjector(nn.Module):
         if attr.dim() != 3:
             raise ValueError(f"attr must be 3D (B,T,D), got {tuple(attr.shape)}")
         B = attr.shape[0]
+        device = attr.device
 
-        var_emb = self.var_emb.expand(B, -1, -1)
+        # -- Variable path: learnable emb + row position encoding ------------
+        var_emb = self.var_emb.expand(B, -1, -1) + self.var_pe.to(device)
         mvar_attr = self.var_cross_attn(tgt=var_emb, memory=attr)
-        mvar_attr = mvar_attr[:, :, None, :]
+        mvar_attr = mvar_attr[:, :, None, :]  # (B, n_var, 1, D)
 
-        scale_emb = self.scale_emb.expand(B, -1, -1)
-        mscale_attr = self.scale_cross_attn(tgt=scale_emb, memory=attr)
-        mscale_attr = mscale_attr[:, None, :, :].expand(-1, self.n_var, -1, -1)
+        # -- Scale path: skip cross-attention when n_scale=1 -----------------
+        if self.n_scale == 1:
+            # Per-row scale gate conditioned on mean-pooled context
+            ctx = attr.mean(dim=1)  # (B, D)
+            mscale_attr = self.scale_gate(ctx)  # (B, D)
+            mscale_attr = mscale_attr[:, None, None, :].expand(-1, self.n_var, -1, -1)
+        else:
+            scale_emb = self.scale_emb.expand(B, -1, -1)
+            mscale_attr = self.scale_cross_attn(tgt=scale_emb, memory=attr)
+            mscale_attr = mscale_attr[:, None, :, :].expand(-1, self.n_var, -1, -1)
 
+        # -- Step path: cross-attention then gather at diffusion step ---------
         step_emb = self.step_emb.expand(B, -1, -1)
         mstep_attr = self.step_cross_attn(tgt=step_emb, memory=attr)
         indices = (diffusion_step // self.seg_size).clamp(0, self.n_stages - 1)

@@ -66,14 +66,16 @@ def get_default_config() -> dict:
             "beta_start": 0.0001,
             "beta_end": 0.02,
             "schedule": "quad",
-            "channels": 64,
-            "nheads": 8,
-            "layers": 8,
-            "n_var": 16,
-            "multipatch_num": 4,
+            "channels": 256,
+            "nheads": 16,
+            "layers": 12,
+            "n_var": 1,
+            "multipatch_num": 1,
             "base_patch": 4,
             "patch_scale": 2,
-            "diffusion_embedding_dim": 64,
+            "patch_mode": "row_raster",
+            "ff_mult": 4,
+            "diffusion_embedding_dim": 256,
             "in_channels": 1,
             "condition_type": "adaLN",
             "attention_mask_type": "parallel",
@@ -93,7 +95,7 @@ def get_default_config() -> dict:
             "drop_text_prob": 0.10,
             "drop_image_prob": 0.10,
             "drop_both_prob": 0.10,
-            "joint_emb": 128,
+            "joint_emb": 256,
             "fusion_heads": 8,
             "fusion_layers": 2,
             "reference": {
@@ -116,9 +118,9 @@ def get_default_config() -> dict:
                 "encoder": "vit",
                 "img_size": 64,
                 "patch_size": 8,
-                "embed_dim": 192,
-                "depth": 4,
-                "num_heads": 6,
+                "embed_dim": 256,
+                "depth": 6,
+                "num_heads": 8,
                 "image_emb": 128,
             },
         },
@@ -133,7 +135,7 @@ def get_default_config() -> dict:
 
         "cticd": {
             "enabled": True,
-            "d_model": 64,
+            "d_model": 128,
             "n_channels": 1,
             "n_mechanisms_per_channel": 4,
             "n_segments": 8,
@@ -492,6 +494,12 @@ class TIGERTrainer:
             model_config["diffusion"]["image_size_h"] = H
             model_config["diffusion"]["image_size_w"] = W
             model_config["diffusion"]["signal_length"] = int(T)
+            model_config["diffusion"]["patch_mode"] = "row_raster"
+            # In row-raster mode the "variable" anchor axis is reused as row
+            # anchors, so image/text conditions align with the raster rows.
+            model_config["diffusion"]["n_var"] = int(H)
+            if not model_config["diffusion"].get("allow_multipatch_raster", False):
+                model_config["diffusion"]["multipatch_num"] = 1
             if "cticd" in model_config["diffusion"]:
                 model_config["diffusion"]["cticd"]["signal_length"] = int(T)
         self.model = TIGERGenerator(model_config)

@@ -171,9 +171,24 @@ def compute_lag_dependency_prior(
 class ChannelTemporalMechanismEncoder(nn.Module):
     """Encode one transform channel into temporal mechanism states.
 
-    For row-raster images, patch tokens are ordered in row-major temporal order.
-    The encoder splits that token sequence into ``n_segments`` temporal bins and
-    lets K learnable mechanism queries attend to each bin.
+    Architecture (Perceiver IO style):
+        1. Horizontal stem: three parallel Conv2d branches (horizontal, vertical,
+           local) fuse into a single feature map — same inductive bias as the
+           DiT ConvRasterStem but operating on a single channel.
+        2. Horizontal patch: Conv2d(d_model, d_model, (1, ps), stride=(1, ps))
+           produces (B, d_model, H, n_w) tokens that cover contiguous temporal
+           spans without crossing row boundaries.
+        3. Perceiver IO encoding: K learnable mechanism queries, each with a
+           learned temporal position embedding (segment index), attend globally
+           to all tokens via cross-attention.  A Transformer encoder layer
+           (cross-attn → self-attn → FFN) refines the segment representations.
+        4. Output: (B, n_segments, n_mechanisms, d_model) mechanism states.
+
+    Compared to the previous per-segment design, this:
+      - Preserves temporal continuity (horizontal patches, not square).
+      - Lets each segment query see the full temporal context (global attention).
+      - Learns which temporal position each query represents (temporal PE).
+      - Shares the same stem design as the DiT backbone for consistency.
     """
 
     def __init__(
@@ -191,15 +206,67 @@ class ChannelTemporalMechanismEncoder(nn.Module):
         self.n_mechanisms = n_mechanisms
         self.n_segments = n_segments
         self.patch_size = patch_size
-        self.patch_embed = nn.Sequential(
-            nn.Conv2d(1, d_model, kernel_size=patch_size, stride=patch_size),
-            nn.GroupNorm(1, d_model),
-            nn.GELU(approximate="tanh"),
+
+        # -- Horizontal stem (mirrors ConvRasterStem, single-channel variant) --
+        branch_dim = max(8, d_model // 2)
+        self.stem_horizontal = nn.Sequential(
+            nn.Conv2d(1, branch_dim, kernel_size=(1, 3), padding=(0, 1)),
+            nn.GroupNorm(1, branch_dim),
+            nn.SiLU(),
         )
-        self.mechanism_queries = nn.Parameter(torch.empty(n_mechanisms, d_model))
+        self.stem_vertical = nn.Sequential(
+            nn.Conv2d(1, branch_dim, kernel_size=(3, 1), padding=(1, 0)),
+            nn.GroupNorm(1, branch_dim),
+            nn.SiLU(),
+        )
+        self.stem_local = nn.Sequential(
+            nn.Conv2d(1, branch_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(1, branch_dim),
+            nn.SiLU(),
+        )
+        self.stem_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(3 * branch_dim, 3 * branch_dim, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        nn.init.zeros_(self.stem_gate[1].weight)
+        nn.init.constant_(self.stem_gate[1].bias, 2.0)
+        self.stem_fuse = nn.Sequential(
+            nn.Conv2d(3 * branch_dim, d_model, kernel_size=1),
+            nn.GroupNorm(1, d_model),
+            nn.SiLU(),
+            nn.Conv2d(d_model, d_model, kernel_size=3, padding=1, groups=d_model),
+            nn.GroupNorm(1, d_model),
+            nn.SiLU(),
+        )
+        self.stem_skip = nn.Conv2d(1, d_model, kernel_size=1)
+
+        # -- Horizontal temporal patching ------------------------------------
+        self.patch_proj = nn.Sequential(
+            nn.Conv2d(d_model, d_model, kernel_size=(1, patch_size), stride=(1, patch_size)),
+            nn.GroupNorm(1, d_model),
+            nn.SiLU(),
+        )
+
+        # -- Perceiver IO mechanism encoder ----------------------------------
+        # n_segments * n_mechanisms total queries; reshape to (S, K, D) after
+        self.mechanism_queries = nn.Parameter(torch.empty(n_segments * n_mechanisms, d_model))
         nn.init.normal_(self.mechanism_queries, std=1.0 / math.sqrt(d_model))
-        self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
-        self.norm = nn.LayerNorm(d_model)
+        # Temporal PE: one per segment, broadcast across mechanisms
+        self.temporal_pe = nn.Parameter(torch.zeros(n_segments, 1, d_model))
+        nn.init.trunc_normal_(self.temporal_pe, std=0.02)
+
+        # Cross-attention: mechanism queries attend to tokens
+        self.cross_attn_norm_q = nn.LayerNorm(d_model)
+        self.cross_attn_norm_kv = nn.LayerNorm(d_model)
+        self.cross_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+
+        # Self-attention across segment queries
+        self.self_attn_norm = nn.LayerNorm(d_model)
+        self.self_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+
+        # Feed-forward
+        self.ffn_norm = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, 2 * d_model),
             nn.GELU(approximate="tanh"),
@@ -208,51 +275,87 @@ class ChannelTemporalMechanismEncoder(nn.Module):
         nn.init.zeros_(self.ffn[-1].weight)
         nn.init.zeros_(self.ffn[-1].bias)
 
+    def _stem_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the three-branch horizontal stem with gated fusion."""
+        h = self.stem_horizontal(x)
+        v = self.stem_vertical(x)
+        l = self.stem_local(x)
+        cat = torch.cat([h, v, l], dim=1)
+        gated = cat * self.stem_gate(cat)
+        return self.stem_fuse(gated) + self.stem_skip(x)
+
     def forward(self, channel: torch.Tensor, valid_length: Optional[int] = None) -> torch.Tensor:
+        """Encode a single-channel row-raster image into mechanism states.
+
+        Args:
+            channel: (B, 1, H, W) single-channel row-raster image.
+            valid_length: if set, number of valid time steps in the original
+                signal.  Patches whose start index >= valid_length are masked
+                out of cross-attention.
+
+        Returns:
+            states: (B, n_segments, n_mechanisms, d_model)
+        """
         if channel.dim() != 4 or channel.shape[1] != 1:
             raise ValueError(f"channel must be (B,1,H,W), got {tuple(channel.shape)}")
         B = channel.shape[0]
-        # Auto-pad if image smaller than patch_size
-        _, _, h, w = channel.shape
-        pad_h = (self.patch_size - h % self.patch_size) % self.patch_size
-        pad_w = (self.patch_size - w % self.patch_size) % self.patch_size
-        if pad_h > 0 or pad_w > 0:
-            channel = F.pad(channel, (0, pad_w, 0, pad_h), mode='replicate')
-        feat = self.patch_embed(channel)  # (B,D,h,w)
-        _, D, h, w = feat.shape
-        tokens = feat.flatten(2).transpose(1, 2).contiguous()  # (B,h*w,D), row-major
+        image_w = channel.shape[-1]
 
+        # -- Pad width to patch_size ------------------------------------------
+        pad_w = (self.patch_size - image_w % self.patch_size) % self.patch_size
+        if pad_w > 0:
+            channel = F.pad(channel, (0, pad_w, 0, 0), mode="replicate")
+
+        # -- Horizontal stem + patch ------------------------------------------
+        stem_feat = self._stem_forward(channel)
+        feat = self.patch_proj(stem_feat)  # (B, d_model, H, n_w)
+        _, D, h, w = feat.shape
+        tokens = feat.flatten(2).transpose(1, 2).contiguous()  # (B, h*w, D)
+
+        # -- Build key_padding_mask for valid tokens --------------------------
+        key_padding_mask = None
         if valid_length is not None:
-            image_w = channel.shape[-1]
             rows = torch.arange(h, device=feat.device)
             cols = torch.arange(w, device=feat.device)
             rr, cc = torch.meshgrid(rows, cols, indexing="ij")
-            patch_start = (rr * self.patch_size) * image_w + cc * self.patch_size
-            valid_mask = patch_start.flatten() < int(valid_length)
-            if valid_mask.any():
-                tokens = tokens[:, valid_mask, :]
+            patch_start = rr * image_w + cc * self.patch_size
+            valid = patch_start.flatten() < int(valid_length)  # (h*w,)
+            if not bool(valid.all()):
+                # True = ignored by PyTorch attention
+                key_padding_mask = ~valid.unsqueeze(0).expand(B, -1)  # (B, h*w)
 
-        L = max(1, tokens.shape[1])
-        segments = min(self.n_segments, L)
-        edges = torch.linspace(0, L, steps=segments + 1, device=feat.device)
-        edges = edges.round().long()
-        states = []
-        queries = self.mechanism_queries.unsqueeze(0).expand(B, -1, -1)
-        for s in range(segments):
-            start = int(edges[s].item())
-            end = int(edges[s + 1].item())
-            if end <= start:
-                end = min(L, start + 1)
-            spatial = tokens[:, start:end, :]
-            attended, _ = self.attn(query=queries, key=spatial, value=spatial, need_weights=False)
-            state = self.norm(attended)
-            state = state + self.ffn(state)
-            states.append(state)
-        # If n_segments > patch width, repeat the last state to keep a fixed shape.
-        # Detach to prevent gradient duplication (Nx gradient on the last real segment).
-        while len(states) < self.n_segments:
-            states.append(states[-1].detach())
-        return torch.stack(states, dim=1)  # (B,S,K,D)
+        # -- Perceiver IO: global cross-attention + self-attn + FFN -----------
+        # Mechanism queries: learned base + temporal PE
+        # queries: (B, S*K, D), temporal_pe: (S, 1, D) -> expand to (1, S*K, D)
+        K = self.n_mechanisms
+        S = self.n_segments
+        queries = self.mechanism_queries.unsqueeze(0).expand(B, -1, -1)  # (B, S*K, D)
+        pe = self.temporal_pe.expand(-1, K, -1).reshape(1, S * K, self.d_model)
+        queries = queries + pe
+
+        # Cross-attention: queries attend to all tokens globally
+        q_norm = self.cross_attn_norm_q(queries)
+        kv_norm = self.cross_attn_norm_kv(tokens)
+        attended, _ = self.cross_attn(
+            query=q_norm, key=kv_norm, value=kv_norm,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        queries = queries + attended
+
+        # Self-attention across all segment queries
+        q_norm = self.self_attn_norm(queries)
+        refined, _ = self.self_attn(
+            query=q_norm, key=q_norm, value=q_norm,
+            need_weights=False,
+        )
+        queries = queries + refined
+
+        # Feed-forward
+        queries = queries + self.ffn(self.ffn_norm(queries))
+
+        # (B, n_segments, n_mechanisms, d_model)
+        return queries.reshape(B, S, K, self.d_model)
 
 
 class MechanismSplitter(nn.Module):
@@ -496,12 +599,15 @@ class MechanismRecomposer(nn.Module):
         self.out_proj = _zero_module(nn.Linear(d_model, output_channels))
 
     def forward(self, mechanism_states: torch.Tensor, x_in: torch.Tensor) -> torch.Tensor:
-        q = x_in.squeeze(2).transpose(1, 2).contiguous()
+        if x_in.dim() != 4:
+            raise ValueError(f"x_in must be (B,C,K,L), got {tuple(x_in.shape)}")
+        B, C, K, L = x_in.shape
+        q = x_in.reshape(B, C, K * L).transpose(1, 2).contiguous()
         q = self.in_proj(q)
         attended, _ = self.cross_attn(query=q, key=mechanism_states, value=mechanism_states, need_weights=False)
         attended = self.norm(attended + q)
         out = self.out_proj(attended)
-        return out.transpose(1, 2).unsqueeze(2).contiguous()
+        return out.transpose(1, 2).reshape(B, C, K, L).contiguous()
 
 
 class CTICD(nn.Module):
