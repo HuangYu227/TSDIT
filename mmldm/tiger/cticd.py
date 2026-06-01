@@ -286,12 +286,14 @@ class DynamicCausalGraphLearner(nn.Module):
         init_tau: float = 1.0,
         prior_mode: str = "bias_gate",
         prior_strength: float = 1.0,
+        lag_topk: int = 0,
     ):
         super().__init__()
         self.n_nodes = n_nodes
         self.max_lag = max_lag
         self.prior_mode = str(prior_mode)
         self.prior_strength = float(prior_strength)
+        self.lag_topk = int(lag_topk)
         self.base_dag_logits = nn.Parameter(torch.full((n_nodes, n_nodes), float(edge_bias)))
         self.lag_logits = nn.Parameter(torch.full((max_lag, n_nodes, n_nodes), float(lag_edge_bias)))
         self.q_child = nn.Linear(d_model, d_model, bias=False)
@@ -321,6 +323,19 @@ class DynamicCausalGraphLearner(nn.Module):
         score = torch.bmm(parent, child.transpose(1, 2)) / tau
         # Clamp to prevent extreme logits → sigmoid saturation → matrix_exp overflow
         return score.clamp(-20.0, 20.0)
+
+    def _apply_topk(self, graph: torch.Tensor) -> torch.Tensor:
+        if self.lag_topk <= 0:
+            return graph
+        B, M, _ = graph.shape
+        k = min(self.lag_topk, M * M)
+        if k >= M * M:
+            return graph
+        flat = graph.reshape(B, -1)
+        idx = flat.topk(k, dim=1).indices
+        mask = torch.zeros_like(flat)
+        mask.scatter_(1, idx, 1.0)
+        return (flat * mask).reshape(B, M, M)
 
     def forward(
         self,
@@ -355,6 +370,7 @@ class DynamicCausalGraphLearner(nn.Module):
             Al = torch.sigmoid(lag_logits)
             if lag_prior is not None and self.prior_mode in {"gate", "bias_gate"}:
                 Al = Al * lag_prior[:, lag - 1].view(B, 1, 1)
+            Al = self._apply_topk(Al)
             lag_graphs.append(Al)
         Alags = torch.stack(lag_graphs, dim=1)  # (B,P,M,M)
 
@@ -528,6 +544,7 @@ class CTICD(nn.Module):
         lag_prior_strength: float = 1.0,
         lag_prior_significance: bool = True,
         lag_prior_bins: int = 16,
+        lag_topk: int = 0,
         signal_length: Optional[int] = None,
         injection_init: float = -4.0,
     ):
@@ -571,6 +588,7 @@ class CTICD(nn.Module):
             lag_edge_bias=lag_edge_bias,
             prior_mode=lag_prior_mode,
             prior_strength=lag_prior_strength,
+            lag_topk=lag_topk,
         )
         # Validate temporal constraint: need more segments than lags for
         # meaningful lagged prediction.  Without this, _aggregate_lagged
@@ -658,6 +676,12 @@ class CTICD(nn.Module):
         causal_features = injection_scale * causal_features
         if self.branch_grad_scale != 1.0:
             causal_features = GradientScale.apply(causal_features, self.branch_grad_scale)
+        feature_ratio = (
+            causal_features.detach().float().norm()
+            / x_in.detach().float().norm().clamp_min(1e-8)
+        )
+        lag_prob = Alags.detach().clamp(1e-6, 1.0 - 1e-6)
+        lag_entropy = (-(lag_prob * lag_prob.log() + (1.0 - lag_prob) * (1.0 - lag_prob).log())).mean()
 
         total = (
             self.lambda_causal * pred_loss
@@ -676,6 +700,10 @@ class CTICD(nn.Module):
             "cticd_prior": prior_loss.detach(),
             "cticd_edge_density": A0.detach().mean(),
             "cticd_lag_edge_density": Alags.detach().mean(),
+            "cticd_lag_active_density": (Alags.detach() > 0).float().mean(),
+            "cticd_lag_entropy": lag_entropy,
+            "cticd_feature_ratio": feature_ratio,
+            "cticd_injection_scale": injection_scale.detach(),
         }
         if lag_prior is not None:
             losses["cticd_lag_prior_mean"] = lag_prior.detach().mean()

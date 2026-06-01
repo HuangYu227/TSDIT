@@ -16,6 +16,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .dit_model import TIGERDiT
 from .cond_projector import TextOnlyProjector, MultiModalConditioner
@@ -274,6 +275,26 @@ class TIGERGenerator(nn.Module):
     # Training
     # ------------------------------------------------------------------
 
+    def _extract_x0_hat(self, noisy_x: torch.Tensor, pred_noise: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        ab = self.ddpm._extract(self.ddpm.alpha_bar, t, noisy_x)
+        return (noisy_x - (1.0 - ab).sqrt() * pred_noise) / ab.sqrt().clamp_min(1e-8)
+
+    def _row_raster_x0_loss(self, x0_hat: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        diff_cfg = self.config.get("diffusion", {})
+        signal_length = int(diff_cfg.get("signal_length", target.shape[-2] * target.shape[-1]))
+        signal_length = min(signal_length, target.shape[-2] * target.shape[-1])
+        pred_seq = x0_hat[:, 0].reshape(x0_hat.shape[0], -1)[:, :signal_length]
+        target_seq = target[:, 0].reshape(target.shape[0], -1)[:, :signal_length]
+
+        value_loss = F.l1_loss(pred_seq, target_seq)
+        if signal_length > 1:
+            pred_delta = pred_seq[:, 1:] - pred_seq[:, :-1]
+            target_delta = target_seq[:, 1:] - target_seq[:, :-1]
+            delta_loss = F.l1_loss(pred_delta, target_delta)
+        else:
+            delta_loss = value_loss.new_zeros(())
+        return value_loss, delta_loss
+
     def _noise_estimation_loss(self, x, attr_emb, t):
         noise = torch.randn_like(x)
         noisy_x = self.ddpm.forward(x, t, noise)
@@ -284,6 +305,19 @@ class TIGERGenerator(nn.Module):
 
         loss = noise_loss
         loss_dict = {"noise_loss": noise_loss.detach()}
+
+        diff_cfg = self.config.get("diffusion", {})
+        lambda_x0 = float(diff_cfg.get("lambda_x0_ts", 0.0))
+        if lambda_x0 > 0.0 and x.shape[1] == 1:
+            x0_hat = self._extract_x0_hat(noisy_x, pred_noise, t)
+            x0_value, x0_delta = self._row_raster_x0_loss(x0_hat, x)
+            delta_weight = float(diff_cfg.get("x0_delta_weight", 0.5))
+            x0_ts_loss = x0_value + delta_weight * x0_delta
+            loss = loss + lambda_x0 * x0_ts_loss
+            loss_dict["x0_ts"] = x0_ts_loss.detach()
+            loss_dict["x0_value"] = x0_value.detach()
+            loss_dict["x0_delta"] = x0_delta.detach()
+            loss_dict["x0_weighted"] = (lambda_x0 * x0_ts_loss).detach()
 
         if hasattr(self.dit, "_cticd_losses") and self.dit._cticd_losses is not None:
             lambda_cticd = self.config["diffusion"].get("lambda_cticd", 0.1)
@@ -377,7 +411,10 @@ class TIGERGenerator(nn.Module):
                 t_norm = step / max(self.num_steps - 1, 1)
                 enable_cticd = (t_norm <= cticd_enable_threshold)
                 # Use ref_images as clean source for CTICD when available
-                cticd_clean = ref_images if (enable_cticd and ref_images is not None) else None
+                # Without a clean/reference source, CTICD would infer graphs from
+                # noisy x_t at sampling time, which is not aligned with training.
+                enable_cticd = enable_cticd and (ref_images is not None)
+                cticd_clean = ref_images if enable_cticd else None
 
                 if self.is_multimodal:
                     keep = torch.zeros(B, dtype=torch.bool, device=self.device)

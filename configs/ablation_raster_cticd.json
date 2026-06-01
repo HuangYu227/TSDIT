@@ -17,7 +17,10 @@
         "layers": 8,
         "diffusion_embedding_dim": 256,
         "base_patch": 2,
-        "condition_type": "adaLN"
+        "condition_type": "adaLN",
+        "lambda_x0_ts": 0.2,
+        "x0_delta_weight": 0.5,
+        "cticd_enable_threshold": 0.5
     },
     "condition": {
         "cond_mode": "text_image",
@@ -50,7 +53,7 @@
         "num_heads": 8,
         "edge_bias": -4.0,
         "lag_edge_bias": -2.5,
-        "branch_grad_scale": 0.2,
+        "branch_grad_scale": 0.5,
         "lambda_causal": 1.0,
         "lambda_notears": 0.05,
         "lambda_sparsity": 1e-2,
@@ -62,6 +65,8 @@
         "lag_prior_strength": 1.0,
         "lag_prior_significance": true,
         "lag_prior_bins": 16,
+        "lag_topk": 4,
+        "injection_init": -2.0,
         "signal_length": 24
     }
 }

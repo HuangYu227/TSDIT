@@ -600,7 +600,9 @@ class TIGERDiT(nn.Module):
                 lag_prior_strength=cticd_cfg.get("lag_prior_strength", 1.0),
                 lag_prior_significance=cticd_cfg.get("lag_prior_significance", True),
                 lag_prior_bins=cticd_cfg.get("lag_prior_bins", 16),
+                lag_topk=cticd_cfg.get("lag_topk", 0),
                 signal_length=cticd_cfg.get("signal_length", None),
+                injection_init=cticd_cfg.get("injection_init", -4.0),
             )
 
     # -- mask builder -----------------------------------------------------------

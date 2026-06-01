@@ -77,8 +77,11 @@ def get_default_config() -> dict:
             "in_channels": 1,
             "condition_type": "adaLN",
             "attention_mask_type": "parallel",
+            "lambda_x0_ts": 0.2,
+            "x0_delta_weight": 0.5,
             "lambda_cticd": 0.1,
             "lambda_moe": 0.05,
+            "cticd_enable_threshold": 0.5,
         },
 
         "condition": {
@@ -139,7 +142,7 @@ def get_default_config() -> dict:
             "num_heads": 4,
             "edge_bias": -4.0,
             "lag_edge_bias": -2.5,
-            "branch_grad_scale": 0.2,
+            "branch_grad_scale": 0.5,
             "lambda_causal": 1.0,
             "lambda_notears": 0.05,
             "lambda_sparsity": 1e-2,
@@ -151,6 +154,8 @@ def get_default_config() -> dict:
             "lag_prior_strength": 1.0,
             "lag_prior_significance": True,
             "lag_prior_bins": 16,
+            "lag_topk": 4,
+            "injection_init": -2.0,
         },
 
         "data": {
@@ -486,6 +491,7 @@ class TIGERTrainer:
             H, W = RowRasterEncoder._optimal_hw(T, self.config["data"].get("patch_size", 8))
             model_config["diffusion"]["image_size_h"] = H
             model_config["diffusion"]["image_size_w"] = W
+            model_config["diffusion"]["signal_length"] = int(T)
             if "cticd" in model_config["diffusion"]:
                 model_config["diffusion"]["cticd"]["signal_length"] = int(T)
         self.model = TIGERGenerator(model_config)
@@ -722,6 +728,8 @@ class TIGERTrainer:
             postfix = {"loss": f"{loss_dict['all'].item():.4f}"}
             if "noise_loss" in loss_dict:
                 postfix["noise"] = f"{loss_dict['noise_loss'].item():.4f}"
+            if "x0_weighted" in loss_dict:
+                postfix["x0"] = f"{loss_dict['x0_weighted'].item():.4f}"
             if "cticd_weighted" in loss_dict:
                 postfix["cticd"] = f"{loss_dict['cticd_weighted'].item():.4f}"
             if "moe_aux" in loss_dict:
@@ -735,6 +743,10 @@ class TIGERTrainer:
                 postfix["lag_e"] = f"{loss_dict['cticd_lag_edge_density'].item():.3f}"
             if "cticd_lag_prior_mean" in loss_dict:
                 postfix["lag_p"] = f"{loss_dict['cticd_lag_prior_mean'].item():.3f}"
+            if "cticd_lag_active_density" in loss_dict:
+                postfix["lag_a"] = f"{loss_dict['cticd_lag_active_density'].item():.3f}"
+            if "cticd_feature_ratio" in loss_dict:
+                postfix["c_fr"] = f"{loss_dict['cticd_feature_ratio'].item():.3f}"
             postfix["grad"] = f"{grad_norm:.2f}"
             postfix["lr"] = f"{self.scheduler.get_lr():.2e}"
             pbar.set_postfix(postfix)
@@ -774,13 +786,17 @@ class TIGERTrainer:
         if num_updates > 0:
             sub = {
                 k: loss_avgs[k]
-                for k in ["noise_loss", "cticd_weighted", "moe_aux",
+                for k in ["noise_loss", "x0_weighted", "x0_ts",
+                          "cticd_weighted", "moe_aux",
                           "cticd_total", "cticd_prior",
-                          "cticd_lag_edge_density", "cticd_lag_prior_mean"]
+                          "cticd_lag_edge_density", "cticd_lag_prior_mean",
+                          "cticd_lag_active_density", "cticd_feature_ratio"]
                 if k in loss_avgs
             }
             if "noise_loss" in sub:
                 loss_parts.append(f"noise={sub['noise_loss']:.4f}")
+            if "x0_weighted" in sub:
+                loss_parts.append(f"x0={sub['x0_weighted']:.4f}")
             if "cticd_weighted" in sub:
                 loss_parts.append(f"cticd={sub['cticd_weighted']:.4f}")
             if "moe_aux" in sub:
@@ -793,6 +809,10 @@ class TIGERTrainer:
                 loss_parts.append(f"lag_e={sub['cticd_lag_edge_density']:.3f}")
             if "cticd_lag_prior_mean" in sub:
                 loss_parts.append(f"lag_p={sub['cticd_lag_prior_mean']:.3f}")
+            if "cticd_lag_active_density" in sub:
+                loss_parts.append(f"lag_a={sub['cticd_lag_active_density']:.3f}")
+            if "cticd_feature_ratio" in sub:
+                loss_parts.append(f"c_fr={sub['cticd_feature_ratio']:.3f}")
         loss_parts.append(f"lr={self.scheduler.get_lr():.2e}")
         loss_parts.append(f"{dt:.1f}s")
         loss_parts.append(f"skip={num_skipped}/{total_batches}")
@@ -938,6 +958,7 @@ class TIGERTrainer:
                 guidance_scale=ccfg.get("text_guidance_scale", 1.0),
                 image_guidance_scale=ccfg.get("image_guidance_scale", 1.0),
                 interaction_guidance_scale=ccfg.get("interaction_guidance_scale", 0.0),
+                cticd_enable_threshold=self.config.get("diffusion", {}).get("cticd_enable_threshold", 0.5),
             )
             gen_img = gen_imgs[0]
 

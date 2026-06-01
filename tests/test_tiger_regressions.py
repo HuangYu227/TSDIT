@@ -4,11 +4,13 @@ import torch
 
 from mmldm.tiger.data.dataset import TIGERCollateFn
 from mmldm.tiger.dit_model import TIGERDiT
+from mmldm.tiger.image_to_ts import RowRasterDecoder
 from mmldm.tiger.train import (
     apply_cli_overrides,
     denormalize_ts_batch,
     get_default_config,
 )
+from mmldm.tiger.ts_to_image import RowRasterEncoder
 
 
 def _cli_args(**overrides):
@@ -131,3 +133,26 @@ def test_dit_accepts_multi_anchor_condition_map():
     out = model(image, diffusion_step, attr_emb)
 
     assert out.shape == image.shape
+
+
+def test_row_raster_is_single_channel_row_major_roundtrip():
+    ts = torch.tensor([
+        [2.0, 4.0, 6.0, 8.0, 10.0],
+        [-1.0, 0.0, 1.0, 2.0, 3.0],
+    ])
+    encoder = RowRasterEncoder(patch_size=4)
+
+    image, norm_params = encoder.encode(ts)
+
+    assert image.shape == (2, 1, 4, 4)
+    flat = image[:, 0].reshape(2, -1)
+    expected_norm = (ts - ts.amin(dim=-1, keepdim=True)) / (
+        ts.amax(dim=-1, keepdim=True) - ts.amin(dim=-1, keepdim=True)
+    )
+    assert torch.allclose(flat[:, : ts.shape[1]], expected_norm)
+    assert torch.allclose(flat[:, ts.shape[1]:], torch.full((2, 11), 0.5))
+
+    decoded = RowRasterDecoder().decode(image, ts_length=ts.shape[1], norm_params=norm_params)
+
+    assert decoded.shape == ts.shape
+    assert torch.allclose(decoded, ts)
