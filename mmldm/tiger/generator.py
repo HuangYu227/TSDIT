@@ -81,7 +81,7 @@ class TIGERGenerator(nn.Module):
 
     def _init_cond_projector(self, diff_config, cond_config):
         n_var = diff_config.get("n_var", 16)
-        n_scale = diff_config.get("multipatch_num", 1)
+        n_scale = diff_config.get("condition_n_scale", diff_config.get("multipatch_num", 1))
         n_steps = diff_config["num_steps"]
         n_stages = cond_config.get("num_stages", 4)
 

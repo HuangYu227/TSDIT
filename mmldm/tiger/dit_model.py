@@ -850,6 +850,7 @@ class TIGERDiT(nn.Module):
         valid = patch_start < int(self.signal_length)  # (n_h, n_w)
         if bool(valid.all()):
             return None
+        token_valid_mask = valid.unsqueeze(0).expand(batch_size, -1, -1).reshape(batch_size, n_h * n_w)
 
         time_key_padding_mask = (~valid).unsqueeze(0).expand(batch_size, -1, -1).reshape(batch_size * n_h, n_w)
         all_masked_time = time_key_padding_mask.all(dim=1)
@@ -867,6 +868,7 @@ class TIGERDiT(nn.Module):
         return {
             "time_key_padding_mask": time_key_padding_mask,
             "feature_key_padding_mask": feature_key_padding_mask,
+            "token_valid_mask": token_valid_mask,
         }
 
     # -- forward ----------------------------------------------------------------

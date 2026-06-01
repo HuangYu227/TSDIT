@@ -312,14 +312,18 @@ class ChannelTemporalMechanismEncoder(nn.Module):
         _, D, h, w = feat.shape
         tokens = feat.flatten(2).transpose(1, 2).contiguous()  # (B, h*w, D)
 
-        # -- Build key_padding_mask for valid tokens --------------------------
+        # -- Build token validity and segment-local cross-attention mask ------
         key_padding_mask = None
+        cross_attn_mask = None
+        valid_length_int = int(valid_length) if valid_length is not None else h * image_w
+        valid_length_int = max(1, min(valid_length_int, h * image_w))
+        rows = torch.arange(h, device=feat.device)
+        cols = torch.arange(w, device=feat.device)
+        rr, cc = torch.meshgrid(rows, cols, indexing="ij")
+        token_start = (rr * image_w + cc * self.patch_size).flatten()
+        token_end = token_start + self.patch_size
+        valid = token_start < valid_length_int
         if valid_length is not None:
-            rows = torch.arange(h, device=feat.device)
-            cols = torch.arange(w, device=feat.device)
-            rr, cc = torch.meshgrid(rows, cols, indexing="ij")
-            patch_start = rr * image_w + cc * self.patch_size
-            valid = patch_start.flatten() < int(valid_length)  # (h*w,)
             if not bool(valid.all()):
                 # True = ignored by PyTorch attention
                 key_padding_mask = ~valid.unsqueeze(0).expand(B, -1)  # (B, h*w)
@@ -333,20 +337,43 @@ class ChannelTemporalMechanismEncoder(nn.Module):
         pe = self.temporal_pe.expand(-1, K, -1).reshape(1, S * K, self.d_model)
         queries = queries + pe
 
-        # Cross-attention: queries attend to all tokens globally
+        # Cross-attention: each segment query only sees its own temporal window.
+        # This prevents future-token leakage before lagged graph prediction.
+        edges = torch.linspace(0, valid_length_int, steps=S + 1, device=feat.device)
+        allowed = []
+        valid_idx = torch.where(valid)[0]
+        for s in range(S):
+            start = edges[s]
+            end = edges[s + 1]
+            segment_allowed = (token_start.float() < end) & (token_end.float() > start) & valid
+            if not bool(segment_allowed.any()):
+                center = (start + end) * 0.5
+                fallback_pool = valid_idx if valid_idx.numel() > 0 else torch.arange(tokens.shape[1], device=feat.device)
+                nearest = fallback_pool[(token_start[fallback_pool].float() - center).abs().argmin()]
+                segment_allowed = torch.zeros_like(valid)
+                segment_allowed[nearest] = True
+            allowed.append(segment_allowed)
+        allowed = torch.stack(allowed, dim=0).repeat_interleave(K, dim=0)  # (S*K, h*w)
+        cross_attn_mask = ~allowed
+
         q_norm = self.cross_attn_norm_q(queries)
         kv_norm = self.cross_attn_norm_kv(tokens)
         attended, _ = self.cross_attn(
             query=q_norm, key=kv_norm, value=kv_norm,
+            attn_mask=cross_attn_mask,
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )
         queries = queries + attended
 
-        # Self-attention across all segment queries
+        # Causal self-attention across segment queries: segment s can refine
+        # itself using mechanisms from <=s only, never future segment states.
+        query_segment = torch.arange(S, device=feat.device).repeat_interleave(K)
+        causal_query_mask = query_segment.unsqueeze(0) > query_segment.unsqueeze(1)
         q_norm = self.self_attn_norm(queries)
         refined, _ = self.self_attn(
             query=q_norm, key=q_norm, value=q_norm,
+            attn_mask=causal_query_mask,
             need_weights=False,
         )
         queries = queries + refined

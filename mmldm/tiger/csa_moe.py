@@ -72,7 +72,7 @@ class MoEGate(nn.Module):
         self.w = nn.Parameter(torch.empty(n_exp, dim))
         nn.init.kaiming_uniform_(self.w, a=math.sqrt(5))
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, valid_mask: Optional[torch.Tensor] = None):
         B, L, C = x.shape
         flat = x.reshape(B * L, C)
 
@@ -86,9 +86,20 @@ class MoEGate(nn.Module):
         if self.training and self.alpha > 0:
             selected = F.one_hot(ti, num_classes=self.n_exp).float().sum(dim=1)
             selected = selected / float(self.k)
+            if valid_mask is not None:
+                valid_flat = valid_mask.reshape(B * L).to(device=x.device, dtype=torch.bool)
+                if bool(valid_flat.any()):
+                    selected_for_aux = selected[valid_flat]
+                    prob_for_aux = prob[valid_flat]
+                else:
+                    selected_for_aux = selected
+                    prob_for_aux = prob
+            else:
+                selected_for_aux = selected
+                prob_for_aux = prob
 
-            load = selected.mean(dim=0)       # actual selected expert ratio
-            importance = prob.mean(dim=0)     # router probability mass
+            load = selected_for_aux.mean(dim=0)       # actual selected expert ratio
+            importance = prob_for_aux.mean(dim=0)     # router probability mass
 
             aux = (importance * load * self.n_exp).sum() * self.alpha
 
@@ -430,6 +441,7 @@ class CSAMoELayer(nn.Module):
         H: int,
         W: int,
         t_emb: Optional[torch.Tensor] = None,
+        valid_mask: Optional[torch.Tensor] = None,
         return_streams: bool = False,
     ):
         """
@@ -450,13 +462,17 @@ class CSAMoELayer(nn.Module):
 
         if L != H * W:
             raise ValueError(f"CSAMoELayer expects L == H*W, got L={L}, H*W={H * W}.")
+        if valid_mask is not None:
+            if valid_mask.shape != (B, L):
+                raise ValueError(f"valid_mask must be {(B, L)}, got {tuple(valid_mask.shape)}")
+            valid_mask = valid_mask.to(device=tok.device, dtype=torch.bool)
 
         t = self._project_t(t_emb, tok)
 
         ri = tok if t is None else tok + t.unsqueeze(1)
         ri = self.router_norm(ri)
 
-        ti, tw, aux = self.gate(ri)
+        ti, tw, aux = self.gate(ri, valid_mask=valid_mask)
 
         out = tok.new_zeros(B, L, C)
         expert_pools = [tok.new_zeros(B, L, C) for _ in range(3)]
@@ -467,6 +483,8 @@ class CSAMoELayer(nn.Module):
 
             for e_id, expert in enumerate(self.experts):
                 mask = idx_k == e_id
+                if valid_mask is not None:
+                    mask = mask & valid_mask
                 b_idx, l_idx = torch.where(mask)
 
                 if b_idx.numel() == 0:
@@ -480,6 +498,8 @@ class CSAMoELayer(nn.Module):
 
         # Shared expert: every token gets a small dense signal
         shared_out = self.shared_expert(tok)
+        if valid_mask is not None:
+            shared_out = shared_out * valid_mask.unsqueeze(-1).to(dtype=shared_out.dtype)
         out = out + self.shared_scale * shared_out
 
         if self.use_cc:
@@ -488,7 +508,9 @@ class CSAMoELayer(nn.Module):
         if self.training:
             with torch.no_grad():
                 self.last_route_frac = torch.stack([
-                    (ti == e_id).float().mean()
+                    ((ti == e_id) & valid_mask.unsqueeze(-1)).float().sum()
+                    / valid_mask.float().sum().clamp_min(1.0)
+                    if valid_mask is not None else (ti == e_id).float().mean()
                     for e_id in range(3)
                 ])
 
@@ -542,17 +564,32 @@ class StructuralConsistencyCrossAttention(nn.Module):
         rf: torch.Tensor,
         H: int,
         W: int,
+        valid_mask: Optional[torch.Tensor] = None,
     ):
         B, L, C = gf.shape
 
         if L != H * W:
             raise ValueError(f"SCCA expects L == H*W, got L={L}, H*W={H * W}.")
+        if valid_mask is not None:
+            if valid_mask.shape != (B, L):
+                raise ValueError(f"valid_mask must be {(B, L)}, got {tuple(valid_mask.shape)}")
+            valid_mask = valid_mask.to(device=gf.device, dtype=torch.bool)
 
         g2 = rearrange(gf, "b (h w) c -> b h w c", h=H, w=W)
         s2 = rearrange(sf, "b (h w) c -> b h w c", h=H, w=W)
 
-        row_anchor = self.row_proj(g2.mean(dim=2)).unsqueeze(2)  # (B,H,1,C)
-        col_anchor = self.col_proj(s2.mean(dim=1)).unsqueeze(1)  # (B,1,W,C)
+        key_padding_mask = None
+        if valid_mask is None:
+            row_ctx = g2.mean(dim=2)
+            col_ctx = s2.mean(dim=1)
+        else:
+            valid2 = valid_mask.reshape(B, H, W).to(dtype=gf.dtype).unsqueeze(-1)
+            row_ctx = (g2 * valid2).sum(dim=2) / valid2.sum(dim=2).clamp_min(1.0)
+            col_ctx = (s2 * valid2).sum(dim=1) / valid2.sum(dim=1).clamp_min(1.0)
+            key_padding_mask = ~valid_mask
+
+        row_anchor = self.row_proj(row_ctx).unsqueeze(2)  # (B,H,1,C)
+        col_anchor = self.col_proj(col_ctx).unsqueeze(1)  # (B,1,W,C)
         g2_aligned = (
             g2
             + self.row_gate.tanh() * row_anchor
@@ -561,9 +598,14 @@ class StructuralConsistencyCrossAttention(nn.Module):
 
         gfa = rearrange(g2_aligned, "b h w c -> b (h w) c")
 
-        g, _ = self.a1(query=gfa, key=sf, value=sf, need_weights=False)
-        s, _ = self.a2(query=sf, key=rf, value=rf, need_weights=False)
-        r, _ = self.a3(query=rf, key=gfa, value=gfa, need_weights=False)
+        g, _ = self.a1(query=gfa, key=sf, value=sf, key_padding_mask=key_padding_mask, need_weights=False)
+        s, _ = self.a2(query=sf, key=rf, value=rf, key_padding_mask=key_padding_mask, need_weights=False)
+        r, _ = self.a3(query=rf, key=gfa, value=gfa, key_padding_mask=key_padding_mask, need_weights=False)
+        if valid_mask is not None:
+            valid_f = valid_mask.unsqueeze(-1).to(dtype=gf.dtype)
+            g = g * valid_f
+            s = s * valid_f
+            r = r * valid_f
 
         return g, s, r
 
@@ -668,6 +710,13 @@ class ChannelAwareResidualBlock(nn.Module):
 
         # Whether SCCA is still in its warmup phase (router not yet stable).
         scca_active = not (self.training and self.step_counter.item() < self.scca_warmup_steps)
+        token_valid_mask = None
+        if isinstance(am, dict) and am.get("token_valid_mask", None) is not None:
+            token_valid_mask = am["token_valid_mask"].to(device=f.device, dtype=torch.bool)
+            if token_valid_mask.shape != (B, f.shape[1]):
+                raise ValueError(
+                    f"token_valid_mask must be {(B, f.shape[1])}, got {tuple(token_valid_mask.shape)}"
+                )
 
         outs = []
         aux_list = []
@@ -676,12 +725,16 @@ class ChannelAwareResidualBlock(nn.Module):
         for scale_id, (nh, nw) in enumerate(self.grids):
             nt = nh * nw
             tok = f[:, offset:offset + nt, :].contiguous()
+            valid_scale = None
+            if token_valid_mask is not None:
+                valid_scale = token_valid_mask[:, offset:offset + nt].contiguous()
 
             moe_delta, aux, expert_pools, _ = self.moe[scale_id](
                 tok,
                 H=nh,
                 W=nw,
                 t_emb=t_emb,
+                valid_mask=valid_scale,
                 return_streams=True,
             )
 
@@ -699,11 +752,16 @@ class ChannelAwareResidualBlock(nn.Module):
                     r_stream,
                     nh,
                     nw,
+                    valid_mask=valid_scale,
                 )
 
                 scca_delta = ((gs + ss + rs) / 3.0) - tok
             else:
                 scca_delta = torch.zeros_like(tok)
+            if valid_scale is not None:
+                valid_f = valid_scale.unsqueeze(-1).to(dtype=tok.dtype)
+                moe_delta = moe_delta * valid_f
+                scca_delta = scca_delta * valid_f
 
             # P0: Per-channel LayerScale.  moe_scale and scca_scale are
             # small but non-zero at init, so the MoE experts receive task

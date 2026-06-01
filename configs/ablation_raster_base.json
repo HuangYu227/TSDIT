@@ -2,6 +2,7 @@
     "data": {
         "representation": "row_raster",
         "patch_size": 8,
+        "layout_patch_size": 2,
         "dataset_type": "csv",
         "datasets": ["ETTh1"],
         "time_interval": 24,
@@ -12,10 +13,10 @@
     },
     "diffusion": {
         "in_channels": 1,
-        "channels": 128,
+        "channels": 256,
         "nheads": 8,
-        "layers": 8,
-        "diffusion_embedding_dim": 256,
+        "layers": 12,
+        "diffusion_embedding_dim": 512,
         "base_patch": 2,
         "multipatch_num": 1,
         "n_var": 1,
@@ -40,8 +41,8 @@
             "encoder": "vit",
             "in_channels": 1,
             "patch_size": 2,
-            "embed_dim": 256,
-            "depth": 4,
+            "embed_dim": 384,
+            "depth": 6,
             "num_heads": 8
         }
     },

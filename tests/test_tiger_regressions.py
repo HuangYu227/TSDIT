@@ -4,6 +4,8 @@ import torch
 import pytest
 
 from mmldm.tiger.data.dataset import TIGERCollateFn
+from mmldm.tiger.cond_projector import TextOnlyProjector
+from mmldm.tiger.csa_moe import CSAMoELayer
 from mmldm.tiger.cticd import ChannelTemporalMechanismEncoder
 from mmldm.tiger.dit_model import ImageSideEncoder, RowRasterPatchDecoder, RowRasterPatchEmbedding, TIGERDiT
 from mmldm.tiger.image_to_ts import RowRasterDecoder
@@ -146,18 +148,24 @@ def test_row_raster_is_single_channel_row_major_roundtrip():
 
     image, norm_params = encoder.encode(ts)
 
-    assert image.shape == (2, 1, 4, 4)
+    assert image.shape == (2, 1, 2, 4)
     flat = image[:, 0].reshape(2, -1)
     expected_norm = (ts - ts.amin(dim=-1, keepdim=True)) / (
         ts.amax(dim=-1, keepdim=True) - ts.amin(dim=-1, keepdim=True)
     )
     assert torch.allclose(flat[:, : ts.shape[1]], expected_norm)
-    assert torch.allclose(flat[:, ts.shape[1]:], torch.full((2, 11), 0.5))
+    assert torch.allclose(flat[:, ts.shape[1]:], torch.full((2, 3), 0.5))
 
     decoded = RowRasterDecoder().decode(image, ts_length=ts.shape[1], norm_params=norm_params)
 
     assert decoded.shape == ts.shape
     assert torch.allclose(decoded, ts)
+
+
+def test_row_raster_layout_minimizes_padding_near_square():
+    assert RowRasterEncoder._optimal_hw(24, patch_size=2) == (4, 6)
+    assert RowRasterEncoder._optimal_hw(48, patch_size=2) == (6, 8)
+    assert RowRasterEncoder._optimal_hw(96, patch_size=2) == (8, 12)
 
 
 def test_row_raster_patch_embedding_preserves_row_axis():
@@ -235,6 +243,7 @@ def test_row_raster_padding_masks_ignore_padded_tokens():
     assert masks is not None
     assert masks["time_key_padding_mask"].shape == (8, 2)
     assert masks["feature_key_padding_mask"].shape == (4, 4)
+    assert masks["token_valid_mask"].shape == (2, 8)
     assert masks["time_key_padding_mask"][2].tolist() == [False, True]
 
 
@@ -293,6 +302,56 @@ def test_cticd_mechanism_encoder_uses_horizontal_row_raster_patches():
     # Full forward: stem + horizontal patch + Perceiver IO
     states = encoder(image, valid_length=10)
     assert states.shape == (2, 4, 2, 8)
+
+
+def test_cticd_mechanism_encoder_segment_local_attention_runs():
+    encoder = ChannelTemporalMechanismEncoder(
+        d_model=16,
+        n_mechanisms=2,
+        n_segments=4,
+        patch_size=2,
+        num_heads=4,
+    )
+
+    states = encoder(torch.randn(2, 1, 4, 6), valid_length=24)
+
+    assert states.shape == (2, 4, 2, 16)
+    assert torch.isfinite(states).all()
+
+
+def test_csa_moe_accepts_valid_token_mask():
+    layer = CSAMoELayer(dim=16, t_dim=16, k=1)
+    tok = torch.randn(2, 12, 16)
+    valid = torch.ones(2, 12, dtype=torch.bool)
+    valid[:, -2:] = False
+
+    out, aux, pools, _ = layer(
+        tok,
+        H=4,
+        W=3,
+        t_emb=torch.randn(2, 16),
+        valid_mask=valid,
+        return_streams=True,
+    )
+
+    assert out.shape == tok.shape
+    assert all(pool.shape == tok.shape for pool in pools)
+    assert aux is not None
+
+
+def test_text_conditioner_can_emit_row_and_column_anchors():
+    projector = TextOnlyProjector(
+        n_var=4,
+        n_scale=3,
+        n_steps=10,
+        n_stages=4,
+        dim_in_text=8,
+        dim_out=16,
+    )
+
+    out = projector(torch.randn(2, 5, 8), torch.randint(0, 10, (2,)))
+
+    assert out.shape == (2, 16, 4, 3)
 
     # Verify horizontal patch produces H x ceil(W/ps) grid
     with torch.no_grad():

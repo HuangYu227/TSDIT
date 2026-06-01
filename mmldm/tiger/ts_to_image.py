@@ -410,22 +410,60 @@ class RowRasterEncoder:
     set to 0.5 and ignored by the decoder via ``original_length``.
     """
 
-    def __init__(self, patch_size: int = 8, n_channels: int = 1):
+    def __init__(self, patch_size: int = 2, n_channels: int = 1):
         self.patch_size = patch_size
         self.n_channels = n_channels
         if self.n_channels != 1:
             raise ValueError("RowRasterEncoder is a single-channel representation; use n_channels=1.")
 
     @staticmethod
-    def _optimal_hw(T: int, patch_size: int):
-        """Compute optimal rectangular H x W >= T, both multiples of patch_size."""
+    def _optimal_hw(
+        T: int,
+        patch_size: int = 2,
+        max_aspect: float = 2.0,
+        prefer_wide: bool = True,
+    ):
+        """Compute a near-square row-raster layout with minimal padding.
+
+        Row-raster is a storage/layout for temporal convolution, not a strict
+        square image representation.  The row count does not need to be a
+        multiple of ``patch_size`` because the DiT row-raster patcher only
+        patches horizontally.  Width is aligned to ``patch_size`` so each token
+        covers a contiguous horizontal time span.
+        """
         import math
-        sqrt_T = int(math.sqrt(T))
-        H = max(patch_size, (sqrt_T // patch_size) * patch_size)
-        W = int(math.ceil(T / H / patch_size)) * patch_size
-        if H * W < T:
-            W += patch_size
-        return H, W
+
+        T = int(T)
+        if T <= 0:
+            raise ValueError(f"T must be positive, got {T}")
+        patch_size = max(1, int(patch_size))
+        max_aspect = max(1.0, float(max_aspect))
+
+        best = None
+        for H in range(1, T + 1):
+            min_w = math.ceil(T / H)
+            W = math.ceil(min_w / patch_size) * patch_size
+            area = H * W
+            pad = area - T
+            aspect = max(H / W, W / H)
+            if aspect > max_aspect:
+                continue
+
+            wide_penalty = 0.0 if (not prefer_wide or W >= H) else 0.05
+            cost = (
+                pad / T,
+                abs(math.log(W / H)),
+                wide_penalty,
+                area,
+            )
+            if best is None or cost < best[0]:
+                best = (cost, H, W)
+
+        if best is None:
+            H = max(1, int(math.sqrt(T)))
+            W = math.ceil(math.ceil(T / H) / patch_size) * patch_size
+            return H, W
+        return best[1], best[2]
 
     def encode(self, ts: torch.Tensor) -> Tuple[torch.Tensor, NormParams]:
         """Encode a batch of time series into row-raster images.

@@ -67,7 +67,7 @@ def get_default_config() -> dict:
             "beta_end": 0.02,
             "schedule": "quad",
             "channels": 256,
-            "nheads": 16,
+            "nheads": 8,
             "layers": 12,
             "n_var": 1,
             "multipatch_num": 1,
@@ -75,7 +75,7 @@ def get_default_config() -> dict:
             "patch_scale": 2,
             "patch_mode": "row_raster",
             "ff_mult": 4,
-            "diffusion_embedding_dim": 256,
+            "diffusion_embedding_dim": 512,
             "in_channels": 1,
             "condition_type": "adaLN",
             "attention_mask_type": "parallel",
@@ -111,17 +111,17 @@ def get_default_config() -> dict:
             "text": {
                 "pretrain_model_path": "openai/clip-vit-base-patch32",
                 "pretrain_model_dim": 512,
-                "textemb_hidden_dim": 256,
-                "text_emb": 128,
+                "textemb_hidden_dim": 512,
+                "text_emb": 256,
             },
             "image": {
                 "encoder": "vit",
                 "img_size": 64,
                 "patch_size": 8,
-                "embed_dim": 256,
+                "embed_dim": 384,
                 "depth": 6,
                 "num_heads": 8,
-                "image_emb": 128,
+                "image_emb": 256,
             },
         },
 
@@ -135,9 +135,9 @@ def get_default_config() -> dict:
 
         "cticd": {
             "enabled": True,
-            "d_model": 128,
+            "d_model": 256,
             "n_channels": 1,
-            "n_mechanisms_per_channel": 4,
+            "n_mechanisms_per_channel": 6,
             "n_segments": 8,
             "max_lag": 2,
             "patch_size": 2,
@@ -156,14 +156,15 @@ def get_default_config() -> dict:
             "lag_prior_strength": 1.0,
             "lag_prior_significance": True,
             "lag_prior_bins": 16,
-            "lag_topk": 4,
+            "lag_topk": 6,
             "injection_init": -2.0,
         },
 
         "data": {
             "dataset_type": "weather_npy",
             "representation": "row_raster",
-            "patch_size": 8,
+            "patch_size": 8,          # legacy fallback for old configs
+            "layout_patch_size": 2,   # row-raster width alignment
             "decode_mode": "row_raster",
             "image_size": 64,
             "n_fft": 64,
@@ -420,6 +421,17 @@ class TIGERTrainer:
 
     # ---- data ---------------------------------------------------------------
 
+    def _row_raster_layout_patch_size(self) -> int:
+        dc = self.config["data"]
+        if dc.get("representation", "gasf") != "row_raster":
+            return int(dc.get("patch_size", 8))
+        return int(
+            dc.get(
+                "layout_patch_size",
+                self.config.get("diffusion", {}).get("base_patch", dc.get("patch_size", 2)),
+            )
+        )
+
     def _init_data(self):
         dc = self.config["data"]
         common = dict(
@@ -432,7 +444,7 @@ class TIGERTrainer:
             datasets=dc.get("datasets"),
             time_interval=dc.get("time_interval", 24),
             representation=dc.get("representation", "gasf"),
-            patch_size=dc.get("patch_size", 8),
+            patch_size=self._row_raster_layout_patch_size() if dc.get("representation", "gasf") == "row_raster" else dc.get("patch_size", 8),
         )
         # ── split naming ──────────────────────────────────────────────────
         # Weather   .npy files: train / valid / test
@@ -490,18 +502,26 @@ class TIGERTrainer:
         if "data" in self.config and self.config["data"].get("representation") == "row_raster":
             from .ts_to_image import RowRasterEncoder
             T = self.config["data"].get("time_interval", 24)
-            H, W = RowRasterEncoder._optimal_hw(T, self.config["data"].get("patch_size", 8))
+            H, W = RowRasterEncoder._optimal_hw(T, self._row_raster_layout_patch_size())
             model_config["diffusion"]["image_size_h"] = H
             model_config["diffusion"]["image_size_w"] = W
             model_config["diffusion"]["signal_length"] = int(T)
             model_config["diffusion"]["patch_mode"] = "row_raster"
+            base_patch = int(model_config["diffusion"].get("base_patch", self._row_raster_layout_patch_size()))
+            base_patch = max(1, min(base_patch, int(W)))
+            model_config["diffusion"]["base_patch"] = base_patch
             # In row-raster mode the "variable" anchor axis is reused as row
-            # anchors, so image/text conditions align with the raster rows.
+            # anchors and condition_n_scale is reused as horizontal temporal
+            # patch anchors, so image/text conditions align with the actual
+            # row-raster token grid instead of broadcasting over columns.
             model_config["diffusion"]["n_var"] = int(H)
+            model_config["diffusion"]["condition_n_scale"] = int((W + base_patch - 1) // base_patch)
             if not model_config["diffusion"].get("allow_multipatch_raster", False):
                 model_config["diffusion"]["multipatch_num"] = 1
             if "cticd" in model_config["diffusion"]:
                 model_config["diffusion"]["cticd"]["signal_length"] = int(T)
+                cticd_patch = int(model_config["diffusion"]["cticd"].get("patch_size", base_patch))
+                model_config["diffusion"]["cticd"]["patch_size"] = max(1, min(cticd_patch, int(W)))
         self.model = TIGERGenerator(model_config)
 
         if self.config.get("model_path"):
@@ -928,7 +948,7 @@ class TIGERTrainer:
         representation = dc.get("representation", "gasf")
         if representation == "row_raster":
             from .ts_to_image import RowRasterEncoder
-            H, W = RowRasterEncoder._optimal_hw(ts_len, dc.get("patch_size", 8))
+            H, W = RowRasterEncoder._optimal_hw(ts_len, self._row_raster_layout_patch_size())
             in_channels = self.config.get("diffusion", {}).get("in_channels", 1)
             image_shape = (in_channels, H, W)
         else:
