@@ -401,9 +401,16 @@ class TIGERGenerator(nn.Module):
         empty_text_emb = None if self.is_multimodal else self.encode_text([""] * B)
         img_w = guidance_scale if image_guidance_scale is None else image_guidance_scale
 
+        # DDIM uses fewer steps for fast sampling; DDPM uses full steps
+        if sampler == "ddim":
+            ddim_steps = min(50, self.num_steps)
+            step_indices = torch.linspace(0, self.num_steps - 1, ddim_steps, device=self.device).long()
+        else:
+            step_indices = torch.arange(self.num_steps - 1, -1, -1, device=self.device)
+
         for _ in range(n_samples):
             x = torch.randn(sample_shape, device=self.device)
-            for step in range(self.num_steps - 1, -1, -1):
+            for step in step_indices:
                 noise = torch.randn_like(x)
                 t = torch.full((B,), step, device=self.device, dtype=torch.long)
 
