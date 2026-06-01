@@ -771,8 +771,8 @@ class SimpleCTICDFallback(nn.Module):
         tokens = tokens + self.ffn(self.norm2(tokens))
 
         # Broadcast back to (B, C, K, L)
-        out = self.out_proj(tokens.mean(dim=1, keepdim=True))  # (B, 1, C)
-        causal_features = out.unsqueeze(-1).expand(B, C, K, L)
+        out = self.out_proj(tokens.mean(dim=1))  # (B, C)
+        causal_features = out.unsqueeze(-1).unsqueeze(-1).expand(B, C, K, L)
 
         scale = torch.sigmoid(self.injection_logit)
         causal_features = scale * causal_features
