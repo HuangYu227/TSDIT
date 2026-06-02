@@ -533,7 +533,7 @@ class MATDTrainer:
         x0 = x0.to(self.device)
         self.optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=self.use_amp, device_type=self.device.type):
+        with autocast(enabled=self.use_amp):
             fwd = self._forward_model(x0, texts, training=True, meta_override=meta_override)
             total_loss, all_terms = self._compute_stage_losses(fwd, x0, stage)
 
@@ -740,7 +740,7 @@ class MATDTrainer:
         for batch in dataloader:
             x0, texts = batch[:2]
             x0 = x0.to(self.device)
-            with autocast(enabled=self.use_amp, device_type=self.device.type):
+            with autocast(enabled=self.use_amp):
                 fwd = self._forward_model(x0, texts, training=False)
                 _, all_terms = self._compute_stage_losses(fwd, x0, stage)
             for k, v in all_terms.items():
