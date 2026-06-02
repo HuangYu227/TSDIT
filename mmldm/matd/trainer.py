@@ -22,6 +22,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(it, **kw):
+        return it
+
 from .losses import (
     AlignmentLoss,
     CausalLosses,
@@ -340,6 +346,14 @@ class MATDTrainer:
         B = len(texts)
         token_hidden, pooled, attention_mask = self._encode_text(texts)
         null_tokens, null_pooled = self._get_null_cond(B)
+        # Align null_tokens sequence length to token_hidden
+        M_real = token_hidden.shape[1]
+        M_null = null_tokens.shape[1]
+        if M_null < M_real:
+            pad = null_tokens[:, -1:, :].expand(-1, M_real - M_null, -1)
+            null_tokens = torch.cat([null_tokens, pad], dim=1)
+        elif M_null > M_real:
+            null_tokens = null_tokens[:, :M_real, :]
         if training and self.cfg_dropout > 0:
             mask = torch.rand(B, device=self.device) < self.cfg_dropout
             if mask.any():
@@ -702,8 +716,9 @@ class MATDTrainer:
             self._set_train(*self.model.keys())
             epoch_losses: dict[str, float] = {}
             n_batches = 0
+            pbar = tqdm(dataloader, desc=f"{tag} epoch {epoch+1}/{epochs}", leave=False)
 
-            for batch in dataloader:
+            for batch in pbar:
                 loss_dict = self.train_step(batch, stage=stage)
                 for k, v in loss_dict.items():
                     epoch_losses[k] = epoch_losses.get(k, 0.0) + v
@@ -711,12 +726,13 @@ class MATDTrainer:
 
                 if self.global_step % self.log_interval == 0:
                     lr = self.optimizer.param_groups[0]["lr"]
-                    logger.info("%s step=%d  loss_total=%.4f  lr=%.2e", tag, self.global_step, loss_dict.get("loss_total", 0.0), lr)
+                    lt = loss_dict.get("loss_total", 0.0)
+                    pbar.set_postfix(loss=f"{lt:.4f}", lr=f"{lr:.1e}")
 
             avg = {k: v / max(n_batches, 1) for k, v in epoch_losses.items()}
             avg["epoch"] = epoch
             history.append(avg)
-            logger.info("%s epoch=%d  avg_loss_total=%.4f", tag, epoch, avg.get("loss_total", 0.0))
+            print(f"{tag} epoch={epoch+1}/{epochs}  loss={avg.get('loss_total', 0.0):.4f}")
 
             if val_dataloader is not None and (epoch + 1) % 5 == 0:
                 val_loss = self._validate(val_dataloader, stage=stage)
