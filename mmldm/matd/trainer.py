@@ -182,16 +182,20 @@ class MATDTrainer:
         for epoch in range(epochs):
             accum: dict[str, float] = {}
             n = 0
-            for batch in tqdm(dataloader, desc=f"stage{stage}-epoch{epoch}"):
+            pbar = tqdm(dataloader, desc=f"stage{stage}-epoch{epoch}")
+            for batch in pbar:
                 metrics = self.train_step(batch, stage=stage)
                 for k, v in metrics.items():
                     accum[k] = accum.get(k, 0.0) + v
                 n += 1
+                if hasattr(pbar, "set_postfix"):
+                    pbar.set_postfix(loss_total=f"{metrics.get('loss_total', 0.0):.5f}")
                 if self.global_step % self.log_interval == 0:
                     logger.info("stage=%d step=%d loss_total=%.5f", stage, self.global_step, metrics.get("loss_total", 0.0))
             avg = {k: v / max(n, 1) for k, v in accum.items()}
             avg["epoch"] = float(epoch)
             history.append(avg)
+            logger.info("stage=%d epoch=%d train_loss=%.5f", stage, epoch, avg.get("loss_total", 0.0))
             if val_dataloader is not None:
                 val = self.validate(val_dataloader, stage=stage)
                 logger.info("stage=%d epoch=%d val_loss=%.5f", stage, epoch, val.get("loss_total", 0.0))

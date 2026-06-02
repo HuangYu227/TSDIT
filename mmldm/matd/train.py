@@ -18,7 +18,9 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import logging
 import os
+import sys
 
 from mmldm.matd import MATDModel, MATDConfig, MATDTrainer, MATDDataModule, MATDEvaluator
 
@@ -42,6 +44,12 @@ def main() -> None:
 
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
+        force=True,
+    )
 
     cfg = MATDConfig(
         embed_dim=args.embed_dim,
