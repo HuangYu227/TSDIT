@@ -49,7 +49,7 @@ from .losses import (
 )
 
 # Full model
-from .matd_model import MATDModel
+from .matd_model import MATDModel, MATDConfig
 
 # Trainer & Generator
 from .trainer import MATDTrainer, EMA
@@ -72,7 +72,7 @@ __all__ = [
     "DiffusionLoss", "ReconstructionLoss", "DeltaLoss", "FFTLoss",
     "DensityWeightedLoss", "AlignmentLoss", "MoELosses", "CausalLosses",
     "LossWeights", "compute_total_loss",
-    "MATDModel",
+    "MATDModel", "MATDConfig",
     "MATDTrainer", "EMA", "MATDGenerator",
     "MATDEvaluator", "calculate_mrr",
 ]
