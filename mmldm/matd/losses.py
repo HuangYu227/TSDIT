@@ -123,8 +123,8 @@ class FFTLoss(nn.Module):
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
         """Compute FFT magnitude loss."""
-        spec_pred = torch.fft.rfft(pred, dim=1)
-        spec_target = torch.fft.rfft(target, dim=1)
+        spec_pred = torch.fft.rfft(pred.float(), dim=1)
+        spec_target = torch.fft.rfft(target.float(), dim=1)
         mag_pred = spec_pred.abs()
         mag_target = spec_target.abs()
         loss = F.l1_loss(mag_pred, mag_target)
