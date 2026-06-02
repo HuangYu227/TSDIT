@@ -55,7 +55,7 @@ def main() -> None:
         batch_size=args.batch_size,
         total_steps=args.total_steps,
         warmup_steps=args.warmup_steps,
-        eval_interval=10,
+        log_interval=1,
     )
 
     dm = MATDDataModule(
