@@ -9,7 +9,7 @@ from .data_adapter import MATDDataset, MATDDataModule, matd_collate_fn
 # Tokenizer (DA-ATP)
 from .tokenizer import (
     DensityAwareAdaptivePatch,
-    TemporalTransformerBlock,
+    TemporalContextBlock,
     AdaptiveTemporalEncoder,
 )
 
@@ -46,6 +46,7 @@ from .losses import (
     CausalLosses,
     LossWeights,
     compute_total_loss,
+    weights_from_config,
 )
 
 # Full model
@@ -61,7 +62,7 @@ from .evaluator import MATDEvaluator, calculate_mrr
 __all__ = [
     "MATD_DEFAULT_CONFIG", "get_matd_config",
     "MATDDataset", "MATDDataModule", "matd_collate_fn",
-    "DensityAwareAdaptivePatch", "TemporalTransformerBlock", "AdaptiveTemporalEncoder",
+    "DensityAwareAdaptivePatch", "TemporalContextBlock", "AdaptiveTemporalEncoder",
     "MATDTextEncoder", "NullTextEncoder",
     "TextToPatchPlanner", "PlannerLoss",
     "TextSemanticSlotExtractor", "SemanticCausalConditionInjector",
@@ -71,7 +72,7 @@ __all__ = [
     "VariablePatchDecoder", "LinearPatchDecoder",
     "DiffusionLoss", "ReconstructionLoss", "DeltaLoss", "FFTLoss",
     "DensityWeightedLoss", "AlignmentLoss", "MoELosses", "CausalLosses",
-    "LossWeights", "compute_total_loss",
+    "LossWeights", "compute_total_loss", "weights_from_config",
     "MATDModel", "MATDConfig",
     "MATDTrainer", "EMA", "MATDGenerator",
     "MATDEvaluator", "calculate_mrr",

@@ -66,7 +66,7 @@ def main() -> None:
     )
 
     model = MATDModel(cfg).cuda()
-    trainer = MATDTrainer(model.submodules, cfg.__dict__, device="cuda")
+    trainer = MATDTrainer(model, cfg.__dict__, device="cuda")
 
     train_loader = dm.train_dataloader()
     val_loader = dm.val_dataloader()

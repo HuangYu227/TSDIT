@@ -1,18 +1,20 @@
-"""Variable Patch Decoders for MATD framework.
+"""MATD decoder1: Partition-of-Unity Neural Field Decoder.
 
-Reconstruct time series from patch latents produced by the diffusion prior.
-Two implementations:
+Drop-in replacement for ``decoder.py``.
 
-1. **VariablePatchDecoder** -- sincos positional encoding + MLP, produces
-   variable-length output per patch that respects the predicted patch layout.
-2. **LinearPatchDecoder** -- fast linear prototype, projects each latent
-   directly to its maximum patch length.
+The public class ``VariablePatchDecoder`` preserves the current interface:
 
-Both decoders handle variable-length patches, concatenate them, and
-crop/pad to the requested target length.
+    x_hat = decoder(z, meta, target_length)
 
-Reference: MATD framework design doc.
+where ``z`` is ``(B, K, D)``, ``meta`` is ``(B, K, 9)``, and output is
+``(B, target_length, 1)``.
+
+Compared with the earlier decoder, this version does not round each patch
+length and concatenate hard segments.  Instead, it evaluates a continuous
+per-patch neural field at every target time coordinate and blends patch fields
+with a differentiable partition-of-unity weight derived from metadata.
 """
+
 from __future__ import annotations
 
 import math
@@ -22,60 +24,94 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ==========================================================================
-#  Positional Encoding Helpers
-# ==========================================================================
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
-def sincos_positional_encoding(
-    positions: torch.Tensor,
-    dim: int = 16,
-) -> torch.Tensor:
-    """Generate sinusoidal positional encodings for positions in [0, 1].
-
-    Uses ``dim // 2`` frequency bands with log-spaced wavelengths from
-    2pi to 2pi * 2^(dim//2 - 1), following the standard transformer
-    positional encoding scheme scaled to the unit interval.
+def fourier_features(x: torch.Tensor, num_bands: int) -> torch.Tensor:
+    """Fourier features for scalar coordinates.
 
     Args:
-        positions: (N,) tensor of positions in [0, 1].
-        dim:       Output feature dimension (must be even).
-
+        x: Tensor of arbitrary shape.
+        num_bands: Number of frequency bands.
     Returns:
-        (N, dim) tensor of sin/cos features.
+        Tensor with shape ``x.shape + (2 * num_bands,)``.
     """
-    assert dim % 2 == 0, f"dim must be even, got {dim}"
-    half = dim // 2
-    freqs = torch.arange(half, device=positions.device, dtype=positions.dtype)
-    freqs = 2.0 * math.pi * (2.0 ** freqs)  # (half,)
-    angles = positions.unsqueeze(-1) * freqs.unsqueeze(0)
-    return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)  # (N, dim)
+    if num_bands <= 0:
+        return x.new_zeros(*x.shape, 0)
+    freqs = 2.0 ** torch.arange(num_bands, device=x.device, dtype=x.dtype)
+    angles = 2.0 * math.pi * x.unsqueeze(-1) * freqs
+    return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
 
 
-# ==========================================================================
-#  1. Variable Patch Decoder (sincos + MLP)
-# ==========================================================================
+class DecoderTemporalAttention(nn.Module):
+    """Lightweight temporal context block over patch latents before decoding."""
+
+    def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.0) -> None:
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.norm = nn.LayerNorm(dim)
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.out = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+        self.rel_bias = nn.Sequential(nn.Linear(3, num_heads), nn.Tanh())
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim * 4),
+            nn.GELU(approximate="tanh"),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, z: torch.Tensor, meta: torch.Tensor) -> torch.Tensor:
+        B, K, D = z.shape
+        h = self.norm(z)
+        qkv = self.qkv(h).reshape(B, K, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        center = meta[..., 2]
+        length = meta[..., 3]
+        density = meta[..., 7]
+        rel = torch.stack(
+            [
+                center[:, :, None] - center[:, None, :],
+                length[:, :, None] - length[:, None, :],
+                density[:, :, None] - density[:, None, :],
+            ],
+            dim=-1,
+        )
+        bias = self.rel_bias(rel).permute(0, 3, 1, 2)
+        attn = attn + bias
+        attn = self.dropout(F.softmax(attn, dim=-1))
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, K, D)
+        z = z + self.out(out)
+        z = z + self.ffn(z)
+        return z
 
 
-class VariablePatchDecoder(nn.Module):
-    """Variable-length patch decoder with sincos positional encoding.
+# ---------------------------------------------------------------------------
+# Decoder
+# ---------------------------------------------------------------------------
 
-    For each patch *k* the decoder:
 
-    1. Reads the target length ``L_k = round(length_k * T)`` from metadata.
-    2. Generates local positions ``u_j = j / max(L_k - 1, 1)`` in [0, 1].
-    3. Concatenates ``[z_k, meta_k, sincos(u_j)]`` per position.
-    4. Passes through an MLP to produce scalar values.
+class PartitionOfUnityPatchDecoder(nn.Module):
+    """Continuous neural-field decoder for adaptive temporal patches.
 
-    All patches are concatenated and cropped / padded to ``target_length``.
-
-    Architecture::
-
-        [z_k (D) | meta_k (9) | sincos(u_j) (pos_dim)]  -->  MLP  -->  value
-
-        MLP: Linear(D + 9 + pos_dim, hidden) -> GELU
-              -> Linear(hidden, hidden) -> GELU
-              -> Linear(hidden, 1)
+    Each patch latent defines a local neural field over normalized local time.
+    At every global output coordinate, all patch fields are blended by a soft
+    partition of unity computed from patch center, length, and density.  This
+    avoids non-differentiable length rounding and reduces boundary artifacts.
     """
 
     def __init__(
@@ -83,185 +119,223 @@ class VariablePatchDecoder(nn.Module):
         latent_dim: int,
         meta_dim: int = 9,
         hidden_dim: int = 256,
-        pos_dim: int = 16,
+        local_bands: int = 8,
+        global_bands: int = 6,
+        context_depth: int = 1,
+        context_heads: int = 8,
+        dropout: float = 0.0,
+        sharpness: float = 6.0,
+        density_weight: float = 0.15,
+        chunk_size: int = 16,
+        detail_scale: float = 0.5,
     ) -> None:
-        """
-        Args:
-            latent_dim: Dimension D of patch latents.
-            meta_dim:   Dimension of per-patch metadata (default 9).
-            hidden_dim: Hidden layer width in the MLP.
-            pos_dim:    Dimension of sincos positional encoding (must be even).
-        """
         super().__init__()
+        if meta_dim < 9:
+            raise ValueError("meta_dim must be at least 9")
         self.latent_dim = latent_dim
         self.meta_dim = meta_dim
-        self.pos_dim = pos_dim
+        self.hidden_dim = hidden_dim
+        self.local_bands = local_bands
+        self.global_bands = global_bands
+        self.sharpness = float(sharpness)
+        self.density_weight = float(density_weight)
+        self.chunk_size = int(chunk_size)
+        self.detail_scale = float(detail_scale)
 
-        input_dim = latent_dim + meta_dim + pos_dim
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
+        self.z_norm = nn.LayerNorm(latent_dim)
+        self.meta_to_z = nn.Sequential(
+            nn.Linear(9, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.context_blocks = nn.ModuleList(
+            [DecoderTemporalAttention(latent_dim, num_heads=context_heads, dropout=dropout) for _ in range(context_depth)]
+        )
+
+        coord_dim = 2 * local_bands + 2 * global_bands + 4  # local/global raw coords too
+        in_dim = latent_dim + 9 + coord_dim
+
+        self.field_net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
+            nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(
-        self,
-        z: torch.Tensor,
-        meta: torch.Tensor,
-        target_length: int,
-    ) -> torch.Tensor:
-        """Decode patch latents into a time series.
+        self.trend_head = nn.Sequential(
+            nn.LayerNorm(latent_dim + 9),
+            nn.Linear(latent_dim + 9, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 4),
+        )
+
+        calib_hidden = max(4, hidden_dim // 4)
+        self.output_calib = nn.Sequential(
+            nn.Linear(1, calib_hidden),
+            nn.SiLU(),
+            nn.Linear(calib_hidden, 1),
+        )
+        # Residual calibration starts near identity.
+        nn.init.zeros_(self.output_calib[-1].weight)
+        nn.init.zeros_(self.output_calib[-1].bias)
+
+    def _check_inputs(self, z: torch.Tensor, meta: torch.Tensor) -> torch.Tensor:
+        if z.dim() != 3:
+            raise ValueError(f"z must have shape (B,K,D), got {tuple(z.shape)}")
+        if meta.dim() != 3 or meta.shape[0] != z.shape[0] or meta.shape[1] != z.shape[1]:
+            raise ValueError(f"meta must have shape (B,K,C) aligned to z; got z={tuple(z.shape)}, meta={tuple(meta.shape)}")
+        if meta.shape[-1] < 9:
+            raise ValueError(f"meta must have at least 9 channels, got {meta.shape[-1]}")
+        if z.shape[-1] != self.latent_dim:
+            raise ValueError(f"z latent dim={z.shape[-1]} does not match latent_dim={self.latent_dim}")
+        return meta[..., :9].to(device=z.device, dtype=z.dtype)
+
+    def _contextualize(self, z: torch.Tensor, meta: torch.Tensor) -> torch.Tensor:
+        h = self.z_norm(z) + self.meta_to_z(meta)
+        for block in self.context_blocks:
+            h = block(h, meta)
+        return h
+
+    def _partition_weights(self, pos: torch.Tensor, meta: torch.Tensor) -> torch.Tensor:
+        """Compute soft patch weights.
 
         Args:
-            z:             (B, K, D) patch latents.
-            meta:          (B, K, 9) patch metadata with channel layout
-                           ``[start, end, center, length, log_length,
-                              mass, density, log_density, order]``.
-            target_length: Desired output length T.
-
+            pos: (C,) global coordinates in [0, 1].
+            meta: (B, K, 9)
         Returns:
-            x_hat: (B, T, 1) reconstructed time series.
+            weights: (B, C, K)
         """
-        B, K, D = z.shape
+        center = meta[..., 2].clamp(0.0, 1.0)
+        length = meta[..., 3].clamp_min(1e-4)
+        log_density = meta[..., 7].clamp(-10.0, 10.0)
+
+        dist = (pos[None, :, None] - center[:, None, :]) / (0.5 * length[:, None, :] + 1e-4)
+        score = -self.sharpness * dist.pow(2) + self.density_weight * log_density[:, None, :]
+
+        # Encourage exact interval coverage without hard masking.
+        start = meta[..., 0]
+        end = meta[..., 1]
+        edge_temp = 80.0
+        inside_left = torch.sigmoid((pos[None, :, None] - start[:, None, :]) * edge_temp)
+        inside_right = torch.sigmoid((end[:, None, :] - pos[None, :, None]) * edge_temp)
+        inside_bonus = torch.log((inside_left * inside_right).clamp_min(1e-6))
+        score = score + 0.5 * inside_bonus
+        return F.softmax(score, dim=-1)
+
+    def _field_values(self, z_ctx: torch.Tensor, meta: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """Evaluate per-patch fields at global coordinates.
+
+        Args:
+            z_ctx: (B, K, D)
+            meta:  (B, K, 9)
+            pos:   (C,)
+        Returns:
+            values: (B, C, K, 1)
+        """
+        B, K, D = z_ctx.shape
+        C = pos.numel()
+
+        start = meta[..., 0]
+        length = meta[..., 3].clamp_min(1e-4)
+        center = meta[..., 2]
+        local = (pos[None, :, None] - start[:, None, :]) / length[:, None, :]
+        centered_local = local * 2.0 - 1.0
+        global_rel = pos[None, :, None] - center[:, None, :]
+
+        local_ff = fourier_features(local, self.local_bands)
+        global_ff = fourier_features(pos, self.global_bands)
+        global_ff = global_ff[None, :, None, :].expand(B, C, K, -1)
+
+        raw_coords = torch.stack(
+            [
+                local,
+                centered_local,
+                global_rel,
+                pos[None, :, None].expand(B, C, K),
+            ],
+            dim=-1,
+        )
+        coord = torch.cat([raw_coords, local_ff, global_ff], dim=-1)
+
+        z_e = z_ctx[:, None, :, :].expand(B, C, K, D)
+        m_e = meta[:, None, :, :].expand(B, C, K, 9)
+        inp = torch.cat([z_e, m_e, coord], dim=-1)
+        detail = self.field_net(inp)
+
+        coeff = self.trend_head(torch.cat([z_ctx, meta], dim=-1))
+        u = centered_local.unsqueeze(-1)
+        trend = (
+            coeff[:, None, :, 0:1]
+            + coeff[:, None, :, 1:2] * u
+            + coeff[:, None, :, 2:3] * u.pow(2)
+            + coeff[:, None, :, 3:4] * u.pow(3)
+        )
+        return trend + self.detail_scale * detail
+
+    def forward(self, z: torch.Tensor, meta: torch.Tensor, target_length: int) -> torch.Tensor:
+        if target_length <= 0:
+            raise ValueError(f"target_length must be positive, got {target_length}")
+        meta9 = self._check_inputs(z, meta)
+        z_ctx = self._contextualize(z, meta9)
+
         device = z.device
         dtype = z.dtype
+        T = int(target_length)
+        coords = (torch.arange(T, device=device, dtype=dtype) + 0.5) / T
 
-        # meta channel 3 = normalised length
-        lengths = meta[:, :, 3]  # (B, K) -- each sums to ~1 across K
+        outputs: list[torch.Tensor] = []
+        chunk = max(1, self.chunk_size)
+        for start in range(0, T, chunk):
+            pos = coords[start:start + chunk]
+            weights = self._partition_weights(pos, meta9)
+            values = self._field_values(z_ctx, meta9, pos)
+            y = (weights.unsqueeze(-1) * values).sum(dim=2)
+            outputs.append(y)
 
-        decoded_patches: list[torch.Tensor] = []
+        out = torch.cat(outputs, dim=1)
+        return out + self.output_calib(out)
 
-        for b in range(B):
-            patch_list: list[torch.Tensor] = []
-            for k in range(K):
-                z_k = z[b, k]        # (D,)
-                m_k = meta[b, k]     # (9,)
-
-                # Target number of time-steps for this patch
-                L_k = max(1, round(float(lengths[b, k].item()) * target_length))
-
-                # Local positions u_j in [0, 1]
-                denom = max(L_k - 1, 1)
-                u = torch.arange(L_k, device=device, dtype=dtype) / denom  # (L_k,)
-                pos_enc = sincos_positional_encoding(u, dim=self.pos_dim)
-
-                # Broadcast z_k and m_k across positions
-                z_expand = z_k.unsqueeze(0).expand(L_k, -1)     # (L_k, D)
-                m_expand = m_k.unsqueeze(0).expand(L_k, -1)     # (L_k, 9)
-
-                inp = torch.cat([z_expand, m_expand, pos_enc], dim=-1)
-                vals = self.net(inp).squeeze(-1)  # (L_k,)
-                patch_list.append(vals)
-
-            # Concatenate all patches for this sample
-            decoded = torch.cat(patch_list, dim=0)  # (sum_L,)
-
-            # Crop or pad to target_length
-            total_len = decoded.shape[0]
-            if total_len >= target_length:
-                decoded = decoded[:target_length]
-            else:
-                pad = torch.zeros(
-                    target_length - total_len, device=device, dtype=dtype,
-                )
-                decoded = torch.cat([decoded, pad], dim=0)
-
-            decoded_patches.append(decoded)
-
-        x_hat = torch.stack(decoded_patches, dim=0)  # (B, T)
-        return x_hat.unsqueeze(-1)  # (B, T, 1)
+    @torch.no_grad()
+    def partition_weights(self, meta: torch.Tensor, target_length: int) -> torch.Tensor:
+        """Expose soft patch assignment weights for visualization/debugging."""
+        if meta.dim() != 3 or meta.shape[-1] < 9:
+            raise ValueError("meta must have shape (B,K,>=9)")
+        meta9 = meta[..., :9]
+        T = int(target_length)
+        coords = (torch.arange(T, device=meta.device, dtype=meta.dtype) + 0.5) / T
+        return self._partition_weights(coords, meta9)
 
 
-# ==========================================================================
-#  2. Linear Patch Decoder (fast prototype)
-# ==========================================================================
+# Backward-compatible names expected by MATDModel.
+VariablePatchDecoder = PartitionOfUnityPatchDecoder
 
 
 class LinearPatchDecoder(nn.Module):
-    """Fast linear patch decoder.
+    """Compatibility wrapper: linear prototype retained for ablations."""
 
-    Each patch latent is projected through a single linear layer to
-    produce ``max_patch_len`` values.  The actual number of values kept
-    per patch is determined by the metadata length channel, and the
-    remainder is discarded.
-
-    Suitable for rapid prototyping where decoder fidelity is secondary
-    to iteration speed.
-
-    Architecture::
-
-        z_k (D) --[Linear(D, max_patch_len)]--> values  --> crop(L_k)
-    """
-
-    def __init__(
-        self,
-        latent_dim: int,
-        max_patch_len: int = 128,
-    ) -> None:
-        """
-        Args:
-            latent_dim:    Dimension D of patch latents.
-            max_patch_len: Maximum decoded length per patch.
-                           Values beyond the actual patch length are discarded.
-        """
+    def __init__(self, latent_dim: int, max_patch_len: int = 128) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.max_patch_len = max_patch_len
-
         self.proj = nn.Linear(latent_dim, max_patch_len)
 
-    def forward(
-        self,
-        z: torch.Tensor,
-        meta: torch.Tensor,
-        target_length: int,
-    ) -> torch.Tensor:
-        """Decode patch latents into a time series.
-
-        Args:
-            z:             (B, K, D) patch latents.
-            meta:          (B, K, 9) patch metadata.
-            target_length: Desired output length T.
-
-        Returns:
-            x_hat: (B, T, 1) reconstructed time series.
-        """
+    def forward(self, z: torch.Tensor, meta: torch.Tensor, target_length: int) -> torch.Tensor:
         B, K, D = z.shape
-        device = z.device
-        dtype = z.dtype
-
-        # Project all patches at once: (B, K, max_patch_len)
-        all_values = self.proj(z)
-
-        # meta channel 3 = normalised length
-        lengths = meta[:, :, 3]  # (B, K)
-
-        decoded_patches: list[torch.Tensor] = []
-
+        vals = self.proj(z)
+        lengths = meta[..., 3]
+        decoded = []
         for b in range(B):
-            patch_list: list[torch.Tensor] = []
+            parts = []
             for k in range(K):
-                L_k = max(1, round(float(lengths[b, k].item()) * target_length))
-                L_k = min(L_k, self.max_patch_len)
-                vals = all_values[b, k, :L_k]  # (L_k,)
-                patch_list.append(vals)
-
-            decoded = torch.cat(patch_list, dim=0)  # (sum_L,)
-
-            # Crop or pad to target_length
-            total_len = decoded.shape[0]
-            if total_len >= target_length:
-                decoded = decoded[:target_length]
+                L = max(1, round(float(lengths[b, k].item()) * target_length))
+                parts.append(vals[b, k, : min(L, self.max_patch_len)])
+            y = torch.cat(parts, dim=0)
+            if y.numel() < target_length:
+                y = F.pad(y, (0, target_length - y.numel()))
             else:
-                pad = torch.zeros(
-                    target_length - total_len, device=device, dtype=dtype,
-                )
-                decoded = torch.cat([decoded, pad], dim=0)
-
-            decoded_patches.append(decoded)
-
-        x_hat = torch.stack(decoded_patches, dim=0)  # (B, T)
-        return x_hat.unsqueeze(-1)  # (B, T, 1)
-
+                y = y[:target_length]
+            decoded.append(y)
+        return torch.stack(decoded, dim=0).unsqueeze(-1)

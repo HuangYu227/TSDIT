@@ -46,6 +46,10 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     "target_seg_len": 8,
     "min_tokens": 8,
     "max_tokens": 128,
+    "encoder_context_depth": 2,
+    "encoder_num_heads": 8,
+    "encoder_spectral_bins": 8,
+    "encoder_meta_fourier_bands": 4,
 
     # -----------------------------------------------------------------------
     # Text encoder
@@ -70,6 +74,9 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     # conditioning into a fixed-size set of concept embeddings.
     # -----------------------------------------------------------------------
     "n_slots": 6,
+    "slot_iters": 2,
+    "scci_heads": 4,
+    "scci_dropout": 0.0,
 
     # -----------------------------------------------------------------------
     # Planner (Text-to-Patch)
@@ -88,6 +95,19 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     # -----------------------------------------------------------------------
     "n_experts": 6,
     "top_k": 2,
+    "moe_hidden_mult": 4,
+    "moe_router_hidden_mult": 2,
+    "moe_dropout": 0.0,
+    "moe_noisy_gating": True,
+    "moe_capacity_factor_train": 1.25,
+    "moe_capacity_factor_eval": 2.0,
+    "moe_prior_scale": 1.0,
+    "moe_balance_weight": 0.01,
+    "moe_z_loss_weight": 0.001,
+    "moe_prior_kl_weight": 0.05,
+    "moe_router_smooth_weight": 0.01,
+    "moe_capacity_weight": 0.1,
+    "moe_residual_scale": 0.1,
 
     # -----------------------------------------------------------------------
     # Causal discovery (C-SCMON)
@@ -124,6 +144,9 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     "dit_dim": 256,
     "mlp_ratio": 4.0,
     "pred_mode": "eps",
+    "dit_dropout": 0.0,
+    "dit_qk_norm": False,
+    "min_snr_gamma": None,
 
     # -----------------------------------------------------------------------
     # Decoder (patch latent -> raw time series)
@@ -132,6 +155,11 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     # maps patch latents back to the original time-series resolution.
     # -----------------------------------------------------------------------
     "decoder_hidden": 256,
+    "decoder_context_depth": 1,
+    "decoder_context_heads": 8,
+    "decoder_local_bands": 8,
+    "decoder_global_bands": 6,
+    "decoder_chunk_size": 16,
 
     # -----------------------------------------------------------------------
     # Diffusion schedule
@@ -164,6 +192,8 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     "lambda_align": 0.05,
     "lambda_moe": 0.01,
     "lambda_causal": 0.01,
+    "lambda_diffusion": 1.0,
+    "lambda_scci": 0.0,
 
     # -----------------------------------------------------------------------
     # Training
@@ -205,6 +235,14 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     # planner learning before end-to-end fine-tuning.
     # -----------------------------------------------------------------------
     "use_oracle_meta_prob": 1.0,
+
+    # -----------------------------------------------------------------------
+    # Sampling
+    # -----------------------------------------------------------------------
+    "use_causal_guidance_in_sampling": True,
+    "planner_beta": 1.0,
+    "align_temperature": 0.07,
+    "text_max_length": 128,
 }
 
 

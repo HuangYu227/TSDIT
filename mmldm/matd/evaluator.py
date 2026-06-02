@@ -220,7 +220,6 @@ class MATDEvaluator:
                 gen = self.model.generate(
                     texts,
                     target_length=T,
-                    n_samples=B,
                     cfg_scale=self.cfg_scale,
                     ddim_steps=self.ddim_steps,
                 )  # (B, T, 1)
