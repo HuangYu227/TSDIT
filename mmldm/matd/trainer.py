@@ -162,7 +162,7 @@ class MATDTrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         self.grad_scaler.step(self.optimizer)
         self.grad_scaler.update()
-        if self.scheduler is not None:
+        if self.scheduler is not None and self.global_step > 0:
             self.scheduler.step()
         if self.ema is not None:
             self.ema.update(self.model)
