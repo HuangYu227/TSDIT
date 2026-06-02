@@ -238,7 +238,7 @@ class SemanticCausalTemporalMoE(nn.Module):
                 flat_text[mask], flat_t[mask],
                 flat_causal[mask])
             delta_z = delta_z.masked_scatter_(
-                mask.unsqueeze(-1).expand(-1, D), expert_out)
+                mask.unsqueeze(-1).expand(-1, D), expert_out.to(delta_z.dtype))
 
         z_out = z + delta_z.reshape(B, K, D)
         return z_out, router_p, prior_p
