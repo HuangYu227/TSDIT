@@ -117,6 +117,7 @@ class MATDConfig:
     dit_qk_norm: bool = False
     min_snr_gamma: float | None = None
     eval_interval: int = 10
+    log_interval: int = 50
 
     # Decoder
     decoder_hidden: int = 256
