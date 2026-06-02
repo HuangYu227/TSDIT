@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import os
 
-from mmldm.matd import MATDModel, MATDConfig, MATDTrainer, MATDDataModule
+from mmldm.matd import MATDModel, MATDConfig, MATDTrainer, MATDDataModule, MATDEvaluator
 
 
 def main() -> None:
@@ -55,6 +55,7 @@ def main() -> None:
         batch_size=args.batch_size,
         total_steps=args.total_steps,
         warmup_steps=args.warmup_steps,
+        eval_interval=10,
     )
 
     dm = MATDDataModule(
@@ -76,11 +77,22 @@ def main() -> None:
     train_loaders = {s: train_loader for s in (1, 2, 3, 4)}
     val_loaders = {s: val_loader for s in (1, 2, 3, 4)}
 
+    # Create evaluator for stage-4 metric tracking
+    evaluator = MATDEvaluator(
+        model=model,
+        data_module=dm,
+        device='cuda',
+        n_samples_per_text=10,
+        cfg_scale=cfg.cfg_scale,
+        ddim_steps=cfg.ddim_steps,
+    )
+
     trainer.train_all_stages(
         train_loaders=train_loaders,
         epochs_per_stage=epochs_per_stage,
         val_loaders=val_loaders,
         save_dir=args.save_dir,
+        evaluator=evaluator,
     )
 
 

@@ -167,7 +167,7 @@ class MATDTrainer:
         terms = out.get("loss_terms", {"loss_total": loss})
         return {k: (v.detach().item() if torch.is_tensor(v) else float(v)) for k, v in terms.items()}
 
-    def train_stage(self, dataloader: torch.utils.data.DataLoader, epochs: int, stage: int = 3, val_dataloader: Optional[torch.utils.data.DataLoader] = None) -> list[dict[str, float]]:
+    def train_stage(self, dataloader: torch.utils.data.DataLoader, epochs: int, stage: int = 3, val_dataloader: Optional[torch.utils.data.DataLoader] = None, evaluator: Optional[Any] = None, save_dir: Optional[str] = None) -> list[dict[str, float]]:
         # Stage freezing.  Full model training remains default for stages 3/4.
         if stage == 1:
             self._set_trainable({"encoder", "decoder"})
@@ -190,22 +190,28 @@ class MATDTrainer:
             avg["epoch"] = float(epoch)
             history.append(avg)
             if val_dataloader is not None:
-                val = self.validate(val_dataloader)
+                val = self.validate(val_dataloader, stage=stage)
                 logger.info("stage=%d epoch=%d val_loss=%.5f", stage, epoch, val.get("loss_total", 0.0))
+            # Stage-4: run evaluation every eval_interval epochs
+            if stage == 4 and evaluator is not None and (epoch + 1) % self.eval_interval == 0:
+                eval_results = evaluator.evaluate()
+                evaluator.print_results(eval_results)
+                sota_count = self._check_sota(eval_results, save_dir)
+                logger.info("stage=%d epoch=%d eval SOTA count=%d", stage, epoch, sota_count)
         return history
 
-    def train_all_stages(self, train_loaders: dict[int, torch.utils.data.DataLoader], epochs_per_stage: dict[int, int], val_loaders: Optional[dict[int, torch.utils.data.DataLoader]] = None, save_dir: Optional[str] = None, mix_ratio: float = 0.5) -> dict[int, list[dict[str, float]]]:
+    def train_all_stages(self, train_loaders: dict[int, torch.utils.data.DataLoader], epochs_per_stage: dict[int, int], val_loaders: Optional[dict[int, torch.utils.data.DataLoader]] = None, save_dir: Optional[str] = None, mix_ratio: float = 0.5, evaluator: Optional[Any] = None) -> dict[int, list[dict[str, float]]]:
         hist: dict[int, list[dict[str, float]]] = {}
         for stage in (1, 2, 3, 4):
             if stage not in train_loaders:
                 continue
-            hist[stage] = self.train_stage(train_loaders[stage], epochs_per_stage.get(stage, 1), stage=stage, val_dataloader=(val_loaders or {}).get(stage))
+            hist[stage] = self.train_stage(train_loaders[stage], epochs_per_stage.get(stage, 1), stage=stage, val_dataloader=(val_loaders or {}).get(stage), evaluator=evaluator if stage == 4 else None, save_dir=save_dir)
             if save_dir is not None:
                 self.save_checkpoint(os.path.join(save_dir, f"stage{stage}.pt"))
         return hist
 
     @torch.no_grad()
-    def validate(self, dataloader: torch.utils.data.DataLoader) -> dict[str, float]:
+    def validate(self, dataloader: torch.utils.data.DataLoader, stage: int = 3) -> dict[str, float]:
         if self.ema is not None:
             self.ema.apply(self.model)
         self.model.eval()
@@ -215,7 +221,7 @@ class MATDTrainer:
             x0, texts = batch[:2]
             x0 = x0.to(self.device)
             with autocast(device_type=self.device.type, enabled=self.use_amp and self.device.type == "cuda"):
-                out = self.model.forward_train(x0, list(texts))
+                out = self.model.forward_train(x0, list(texts), stage=stage)
             for k, v in out.get("loss_terms", {}).items():
                 if torch.is_tensor(v):
                     accum[k] = accum.get(k, 0.0) + float(v.detach().item())
@@ -223,6 +229,47 @@ class MATDTrainer:
         if self.ema is not None:
             self.ema.restore(self.model)
         return {k: v / max(n, 1) for k, v in accum.items()}
+
+    def _check_sota(self, results: dict[str, Any], save_dir: Optional[str] = None) -> int:
+        """Check if current metrics are SOTA and save best checkpoint."""
+        # Metrics where lower is better
+        lower_better = {"MSE", "WAPE", "MDD", "KL", "MMD", "C-FID"}
+        # Metrics where higher is better
+        higher_better = {"MRR"}
+        sota_count = 0
+        improved = []
+        for metric in lower_better | higher_better:
+            val = results.get(metric)
+            if val is None or val != val:  # skip NaN
+                continue
+            if metric in lower_better:
+                if metric not in self.best_metrics or val < self.best_metrics[metric]:
+                    self.best_metrics[metric] = val
+                    improved.append(metric)
+            else:
+                if metric not in self.best_metrics or val > self.best_metrics[metric]:
+                    self.best_metrics[metric] = val
+                    improved.append(metric)
+        # Count how many metrics are at their best
+        current_sota = 0
+        for metric in lower_better | higher_better:
+            val = results.get(metric)
+            if val is None or val != val:
+                continue
+            if metric in lower_better and val <= self.best_metrics.get(metric, float("inf")):
+                current_sota += 1
+            elif metric in higher_better and val >= self.best_metrics.get(metric, float("-inf")):
+                current_sota += 1
+        if improved:
+            logger.info("Improved metrics: %s", improved)
+        # Save best checkpoint if >= 3 metrics are SOTA
+        if current_sota >= 3 and current_sota > self.best_sota_count:
+            self.best_sota_count = current_sota
+            if save_dir is not None:
+                best_path = os.path.join(save_dir, "best.pt")
+                self.save_checkpoint(best_path)
+                logger.info("Saved best checkpoint (%d SOTA metrics) to %s", current_sota, best_path)
+        return current_sota
 
     def save_checkpoint(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
