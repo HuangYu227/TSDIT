@@ -153,7 +153,7 @@ class MATDTrainer:
     def train_step(self, batch: tuple, stage: int = 3, meta_override: Optional[torch.Tensor] = None) -> dict[str, float]:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
-        with autocast(device_type=self.device.type, enabled=self.use_amp and self.device.type == "cuda"):
+        with autocast(enabled=self.use_amp and self.device.type == "cuda"):
             out = self._forward(batch, stage=stage, meta_override=meta_override)
             loss = out["loss"] if "loss" in out else out["loss_total"]
         self.grad_scaler.scale(loss).backward()
@@ -223,7 +223,7 @@ class MATDTrainer:
         for batch in dataloader:
             x0, texts = batch[:2]
             x0 = x0.to(self.device)
-            with autocast(device_type=self.device.type, enabled=self.use_amp and self.device.type == "cuda"):
+            with autocast(enabled=self.use_amp and self.device.type == "cuda"):
                 out = self.model.forward_train(x0, list(texts), stage=stage)
             for k, v in out.get("loss_terms", {}).items():
                 if torch.is_tensor(v):
