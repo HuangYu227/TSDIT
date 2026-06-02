@@ -247,7 +247,13 @@ class MATDModel(nn.Module):
             mask = torch.rand(len(texts), device=pooled.device) < self.cfg.p_drop_text
             if mask.any():
                 M = token_hidden.shape[1]
-                nt = null_tokens[:, :M] if null_tokens.shape[1] > M else null_tokens
+                N = null_tokens.shape[1]
+                if N > M:
+                    nt = null_tokens[:, :M]
+                elif N < M:
+                    nt = F.pad(null_tokens, (0, 0, 0, M - N))
+                else:
+                    nt = null_tokens
                 token_hidden = torch.where(mask[:, None, None], nt, token_hidden)
                 pooled = torch.where(mask[:, None], null_pooled, pooled)
         return token_hidden, pooled, null_tokens, null_pooled, attention_mask
