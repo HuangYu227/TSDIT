@@ -67,7 +67,21 @@ def main() -> None:
 
     model = MATDModel(cfg).cuda()
     trainer = MATDTrainer(model.submodules, cfg.__dict__, device="cuda")
-    trainer.fit(dm.train_dataloader(), dm.val_dataloader(), total_steps=cfg.total_steps)
+
+    train_loader = dm.train_dataloader()
+    val_loader = dm.val_dataloader()
+
+    # 4-stage training: autoencoder -> planner -> diffusion -> joint finetune
+    epochs_per_stage = {1: 50, 2: 50, 3: 300, 4: 100}
+    train_loaders = {s: train_loader for s in (1, 2, 3, 4)}
+    val_loaders = {s: val_loader for s in (1, 2, 3, 4)}
+
+    trainer.train_all_stages(
+        train_loaders=train_loaders,
+        epochs_per_stage=epochs_per_stage,
+        val_loaders=val_loaders,
+        save_dir=args.save_dir,
+    )
 
 
 if __name__ == "__main__":
