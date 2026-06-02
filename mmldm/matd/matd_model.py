@@ -290,17 +290,19 @@ class MATDModel(nn.Module):
                 planner=self.cfg.lambda_plan,
                 scci=self.cfg.lambda_scci,
             )
-        # stage 3 (default): oracle-meta diffusion
+        # stage 3 (default): oracle-meta diffusion. Keep this stage focused on
+        # denoising; x0 reconstruction from very small alpha_bar timesteps can
+        # dominate numerics before the denoiser is stable.
         return LossWeights(
             diffusion=self.cfg.lambda_diffusion,
-            reconstruction=self.cfg.lambda_x0,
-            delta=self.cfg.lambda_delta,
-            fft=self.cfg.lambda_fft,
-            alignment=self.cfg.lambda_align,
-            moe=self.cfg.lambda_moe,
-            causal=self.cfg.lambda_causal,
-            planner=self.cfg.lambda_plan,
-            scci=self.cfg.lambda_scci,
+            reconstruction=0.0,
+            delta=0.0,
+            fft=0.0,
+            alignment=0.0,
+            moe=0.0,
+            causal=0.0,
+            planner=0.0,
+            scci=0.0,
         )
 
     def forward_train(self, x0: torch.Tensor, texts: list[str], meta_override: Optional[torch.Tensor] = None, stage: int = 3) -> dict[str, Any]:

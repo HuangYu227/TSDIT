@@ -126,6 +126,8 @@ class MATDTrainer:
         if trainable_names is None:
             for p in self.model.parameters():
                 p.requires_grad = True
+            self.optimizer = self._build_optimizer()
+            self._build_scheduler(int(_cfg_get(self.config, "total_steps", 100000)))
             return
         for name, module in self.named_components().items():
             req = name in trainable_names
@@ -156,19 +158,40 @@ class MATDTrainer:
         with autocast(enabled=self.use_amp and self.device.type == "cuda"):
             out = self._forward(batch, stage=stage, meta_override=meta_override)
             loss = out["loss"] if "loss" in out else out["loss_total"]
+        terms = out.get("loss_terms", {"loss_total": loss})
+        metrics = {k: (v.detach().item() if torch.is_tensor(v) else float(v)) for k, v in terms.items()}
+        if not torch.isfinite(loss.detach()):
+            bad_terms = {k: v for k, v in metrics.items() if not math.isfinite(v)}
+            logger.warning("stage=%d step=%d non-finite loss; skipping optimizer step; bad_terms=%s", stage, self.global_step, bad_terms)
+            self.optimizer.zero_grad(set_to_none=True)
+            metrics["skipped_step"] = 1.0
+            return metrics
         self.grad_scaler.scale(loss).backward()
         self.grad_scaler.unscale_(self.optimizer)
+        grad_norm = torch.tensor(0.0, device=self.device)
         if self.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+        if torch.is_tensor(grad_norm) and not torch.isfinite(grad_norm.detach()):
+            logger.warning("stage=%d step=%d non-finite grad_norm=%s; skipping optimizer step", stage, self.global_step, grad_norm.detach().item())
+            self.optimizer.zero_grad(set_to_none=True)
+            if self.grad_scaler.is_enabled():
+                self.grad_scaler.update(max(self.grad_scaler.get_scale() * 0.5, 1.0))
+            metrics["grad_norm"] = float("nan")
+            metrics["skipped_step"] = 1.0
+            return metrics
+        old_scale = self.grad_scaler.get_scale() if self.grad_scaler.is_enabled() else 1.0
         self.grad_scaler.step(self.optimizer)
         self.grad_scaler.update()
-        if self.scheduler is not None and self.global_step > 0:
+        new_scale = self.grad_scaler.get_scale() if self.grad_scaler.is_enabled() else old_scale
+        optimizer_stepped = (not self.grad_scaler.is_enabled()) or new_scale >= old_scale
+        if self.scheduler is not None and self.global_step > 0 and optimizer_stepped:
             self.scheduler.step()
-        if self.ema is not None:
+        if self.ema is not None and optimizer_stepped:
             self.ema.update(self.model)
         self.global_step += 1
-        terms = out.get("loss_terms", {"loss_total": loss})
-        return {k: (v.detach().item() if torch.is_tensor(v) else float(v)) for k, v in terms.items()}
+        metrics["grad_norm"] = float(grad_norm.detach().item()) if torch.is_tensor(grad_norm) else float(grad_norm)
+        metrics["skipped_step"] = 0.0 if optimizer_stepped else 1.0
+        return metrics
 
     def train_stage(self, dataloader: torch.utils.data.DataLoader, epochs: int, stage: int = 3, val_dataloader: Optional[torch.utils.data.DataLoader] = None, evaluator: Optional[Any] = None, save_dir: Optional[str] = None) -> list[dict[str, float]]:
         # Stage freezing.  Full model training remains default for stages 3/4.
