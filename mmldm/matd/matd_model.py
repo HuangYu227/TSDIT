@@ -147,6 +147,7 @@ class MATDConfig:
     weight_decay: float = 0.01
     warmup_steps: int = 1000
     total_steps: int = 100_000
+    batch_size: int = 32
     grad_clip: float = 1.0
 
     # -- Classifier-Free Guidance --
