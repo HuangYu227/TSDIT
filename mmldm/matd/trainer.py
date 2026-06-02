@@ -16,7 +16,10 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
-from torch.amp import GradScaler, autocast
+try:
+    from torch.amp import GradScaler, autocast
+except ImportError:
+    from torch.cuda.amp import GradScaler, autocast
 
 try:
     from tqdm import tqdm
