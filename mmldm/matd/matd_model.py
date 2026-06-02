@@ -116,6 +116,7 @@ class MATDConfig:
     dit_dropout: float = 0.0
     dit_qk_norm: bool = False
     min_snr_gamma: float | None = None
+    eval_interval: int = 10
 
     # Decoder
     decoder_hidden: int = 256
