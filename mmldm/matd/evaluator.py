@@ -328,6 +328,7 @@ class MATDEvaluator:
         if val is not None:
             jftsd_text, jftsd_text_status = val, status
         else:
+            jftsd_text_status = status
             logger.warning("J-FTSD (text) failed: %s", reason)
 
         jftsd_planner, jftsd_planner_status = None, "skipped"
@@ -337,6 +338,7 @@ class MATDEvaluator:
         if val is not None:
             jftsd_planner, jftsd_planner_status = val, status
         else:
+            jftsd_planner_status = status
             logger.warning("J-FTSD (planner) failed: %s", reason)
 
         jftsd_slots, jftsd_slots_status = None, "skipped"
@@ -346,6 +348,7 @@ class MATDEvaluator:
         if val is not None:
             jftsd_slots, jftsd_slots_status = val, status
         else:
+            jftsd_slots_status = status
             logger.warning("J-FTSD (slots) failed: %s", reason)
 
         # --- Assemble results ---
