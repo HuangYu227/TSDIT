@@ -1,16 +1,18 @@
 """MATD Evaluator -- Fair comparison with T2S and CaTSG metrics.
 
 Computes 7 metrics on raw-scale (denormalized) data:
-  T2S-compatible:   MSE, WAPE, MRR (K=10), C-FID (optional, TS2Vec)
+  T2S-compatible:   MSE, WAPE, MRR (K=10)
   CaTSG-compatible: MDD (n_bins=20), KL (flat, 50 bins), MMD (RBF)
+  Distribution:     J-FTSD (text), J-FTSD (planner), J-FTSD (slots)
 
 All metric implementations delegate to ``unified_metrics.py`` which has
 been verified to exactly match the original T2S and CaTSG computation
 logic.  MRR is implemented here with the same algorithm as T2S.
 
-J-FTSD is excluded because CaTSG uses structured features as condition
-while MATD uses text -- the condition formats are incompatible, making
-direct comparison unfair.
+J-FTSD is computed with three different MATD conditions:
+  - text:     pooled text encoder output (B, text_dim)
+  - planner:  planner metadata (B, K, 9)
+  - slots:    SCCI slot features (B, n_slots, D)
 
 Fairness guarantees:
   1. **Raw-scale computation**: MATD outputs are per-sample normalized
@@ -23,13 +25,14 @@ Fairness guarantees:
   4. **MMD**: Exact CaTSG (RBF kernel on flattened ``(N, L*D)``).
   5. **MRR**: Exact T2S (cosine similarity on flattened vectors,
      threshold=0.5, K independent generations).
-  6. **C-FID**: TS2Vec encoder trained on real data, Frechet distance
-     in embedding space.
+  6. **J-FTSD**: Contrastive+Frechet distance conditioned on MATD's
+     own text/planner/slot representations.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Optional
 
 import numpy as np
@@ -127,7 +130,6 @@ class MATDEvaluator:
             (default: use model's ``cfg.cfg_scale``).
         ddim_steps: DDIM steps for fast sampling
             (default: use model's ``cfg.ddim_steps``).
-        compute_cfid: Whether to compute C-FID (requires ``ts2vec``).
     """
 
     def __init__(
@@ -138,7 +140,6 @@ class MATDEvaluator:
         n_samples_per_text: int = 10,
         cfg_scale: float | None = None,
         ddim_steps: int | None = None,
-        compute_cfid: bool = False,
     ) -> None:
         self.model = model
         self.dm = data_module
@@ -146,7 +147,6 @@ class MATDEvaluator:
         self.n_samples = n_samples_per_text
         self.cfg_scale = cfg_scale
         self.ddim_steps = ddim_steps
-        self.compute_cfid = compute_cfid
 
     # ------------------------------------------------------------------
     #  Helpers
@@ -179,19 +179,24 @@ class MATDEvaluator:
         """Run full evaluation on the test split.
 
         For each test batch:
-          1. Generate K independent samples per text (fresh noise each).
-          2. Denormalize to raw scale.
-          3. First sample → single-sample metrics (MSE, WAPE, MDD, KL,
-             MMD, C-FID).
-          4. All K samples → MRR.
+          1. Extract conditions (text embed, planner meta, slots).
+          2. Generate K independent samples per text (fresh noise each).
+          3. Denormalize to raw scale.
+          4. First sample → single-sample metrics (MSE, WAPE, MDD, KL,
+             MMD).
+          5. All K samples → MRR.
+
+        After all batches, compute 3 J-FTSD scores conditioned on text,
+        planner, and slot representations respectively.
 
         Returns:
-            Dict with 7 metrics plus metadata::
+            Dict with metrics plus metadata::
 
-                MSE, WAPE, MRR          -- T2S-compatible
-                MDD, KL, MMD            -- CaTSG-compatible
-                C-FID, C-FID_status     -- optional
-                num_samples, seq_len    -- metadata
+                MSE, WAPE, MRR                  -- T2S-compatible
+                MDD, KL, MMD                    -- CaTSG-compatible
+                J-FTSD_text, J-FTSD_planner,
+                  J-FTSD_slots                  -- distribution-level
+                num_samples, seq_len            -- metadata
         """
         self.model.eval()
 
@@ -203,9 +208,12 @@ class MATDEvaluator:
             collate_fn=matd_collate_fn,
         )
 
-        all_gen_single = []  # (N, T) first generation, denormalized
-        all_gen_k = []       # (N, T, 1, K) all K generations, denormalized
-        all_real_raw = []    # (N, T) ground truth, denormalized
+        all_gen_single = []    # (N, T) first generation, denormalized
+        all_gen_k = []         # (N, T, 1, K) all K generations, denormalized
+        all_real_raw = []      # (N, T) ground truth, denormalized
+        all_text_embed = []    # list of (B, text_dim)
+        all_planner_meta = []  # list of (B, K, 9)
+        all_scci_slots = []    # list of (B, n_slots, D)
         sample_offset = 0
 
         for batch in test_loader:
@@ -214,7 +222,31 @@ class MATDEvaluator:
             B = x0_norm.shape[0]
             T = x0_norm.shape[1]
 
-            # Generate K independent samples per text
+            # -- Extract conditions (eval mode, no grad) --
+            token_hidden, pooled, attention_mask = self.model.text_encoder(texts)
+            text_padding_mask = attention_mask == 0
+
+            K_patches = (
+                self.model.encoder._choose_k(T)
+                if hasattr(self.model.encoder, "_choose_k")
+                else max(
+                    self.model.cfg.min_tokens,
+                    math.ceil(T / self.model.cfg.target_seg_len),
+                )
+            )
+            planner_meta = self.model.planner(
+                token_hidden, text_padding_mask=text_padding_mask, n_patches=K_patches
+            )
+            scci_slots = self.model.slot_extractor(
+                token_hidden, text_padding_mask=text_padding_mask
+            )
+
+            # Only keep the first 9 meta dims (consistent with decoder)
+            all_text_embed.append(pooled.detach().cpu())               # (B, text_dim)
+            all_planner_meta.append(planner_meta[..., :9].detach().cpu())  # (B, K, 9)
+            all_scci_slots.append(scci_slots.detach().cpu())           # (B, n_slots, D)
+
+            # -- Generate K independent samples per text --
             gen_k_list: list[np.ndarray] = []
             for _k in range(self.n_samples):
                 gen = self.model.generate(
@@ -252,22 +284,26 @@ class MATDEvaluator:
             sample_offset += B
 
         # Concatenate all batches
-        real_raw = np.concatenate(all_real_raw, axis=0)      # (N, T)
-        gen_single = np.concatenate(all_gen_single, axis=0)  # (N, T)
-        gen_multi = np.concatenate(all_gen_k, axis=0)        # (N, T, 1, K)
+        real_raw = np.concatenate(all_real_raw, axis=0)          # (N, T)
+        gen_single = np.concatenate(all_gen_single, axis=0)      # (N, T)
+        gen_multi = np.concatenate(all_gen_k, axis=0)            # (N, T, 1, K)
+        text_embed = torch.cat(all_text_embed, dim=0).numpy()    # (N, text_dim)
+        planner_meta = torch.cat(all_planner_meta, dim=0).numpy()  # (N, K, 9)
+        scci_slots = torch.cat(all_scci_slots, dim=0).numpy()    # (N, n_slots, D)
 
         # --- T2S + CaTSG metrics via unified_metrics ---
         from mmldm.tiger.evaluation.unified_metrics import (
+            calculate_jftsd_baseline,
             compute_all_unified_metrics,
         )
 
         unified = compute_all_unified_metrics(
             real_raw=real_raw,          # (N, T) -> ensure_btd -> (N, T, 1)
             gen_raw=gen_single,         # (N, T) -> ensure_btd -> (N, T, 1)
-            condition=None,             # No J-FTSD (condition format mismatch)
+            condition=None,
             device=str(self.device),
             compute_01=False,
-            compute_cfid=self.compute_cfid,
+            compute_cfid=False,
             compute_jftsd=False,
         )
 
@@ -278,6 +314,30 @@ class MATDEvaluator:
             k=self.n_samples,
             threshold=0.5,
         )
+
+        # --- J-FTSD with 3 condition variants ---
+        device_str = str(self.device)
+
+        jftsd_text, jftsd_text_status = None, "skipped"
+        val, status, _reason = calculate_jftsd_baseline(
+            real_raw, gen_single, text_embed, device=device_str
+        )
+        if val is not None:
+            jftsd_text, jftsd_text_status = val, status
+
+        jftsd_planner, jftsd_planner_status = None, "skipped"
+        val, status, _reason = calculate_jftsd_baseline(
+            real_raw, gen_single, planner_meta, device=device_str
+        )
+        if val is not None:
+            jftsd_planner, jftsd_planner_status = val, status
+
+        jftsd_slots, jftsd_slots_status = None, "skipped"
+        val, status, _reason = calculate_jftsd_baseline(
+            real_raw, gen_single, scci_slots, device=device_str
+        )
+        if val is not None:
+            jftsd_slots, jftsd_slots_status = val, status
 
         # --- Assemble results ---
         results: dict[str, Any] = {
@@ -293,9 +353,13 @@ class MATDEvaluator:
             "MDD": unified["MDD_raw_20"],
             "KL": unified["KL_raw_flat"],
             "MMD": unified["MMD_raw_rbf"],
-            # Optional
-            "C-FID": unified["C_FID_TS2Vec"],
-            "C-FID_status": unified["C_FID_TS2Vec_status"],
+            # Distribution-level (J-FTSD variants)
+            "J-FTSD_text": jftsd_text,
+            "J-FTSD_text_status": jftsd_text_status,
+            "J-FTSD_planner": jftsd_planner,
+            "J-FTSD_planner_status": jftsd_planner_status,
+            "J-FTSD_slots": jftsd_slots,
+            "J-FTSD_slots_status": jftsd_slots_status,
         }
 
         return results
@@ -324,11 +388,12 @@ class MATDEvaluator:
         print(f"    KL:   {results['KL']:.6f}")
         print(f"    MMD:  {results['MMD']:.6f}")
         print()
-        print("  Distribution-level:")
-        cfid = results.get("C-FID")
-        status = results.get("C-FID_status", "skipped")
-        if cfid is not None:
-            print(f"    C-FID: {cfid:.4f} ({status})")
-        else:
-            print(f"    C-FID: skipped ({status})")
+        print("  Distribution-level (J-FTSD):")
+        for variant in ("text", "planner", "slots"):
+            val = results.get(f"J-FTSD_{variant}")
+            status = results.get(f"J-FTSD_{variant}_status", "skipped")
+            if val is not None:
+                print(f"    J-FTSD ({variant}): {val:.4f} ({status})")
+            else:
+                print(f"    J-FTSD ({variant}): skipped ({status})")
         print("=" * 60)

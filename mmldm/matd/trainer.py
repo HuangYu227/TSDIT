@@ -275,7 +275,7 @@ class MATDTrainer:
     def _check_sota(self, results: dict[str, Any], save_dir: Optional[str] = None) -> int:
         """Check if current metrics are SOTA and save best checkpoint."""
         # Metrics where lower is better
-        lower_better = {"MSE", "WAPE", "MDD", "KL", "MMD", "C-FID"}
+        lower_better = {"MSE", "WAPE", "MDD", "KL", "MMD", "J-FTSD_text", "J-FTSD_planner", "J-FTSD_slots"}
         # Metrics where higher is better
         higher_better = {"MRR"}
         sota_count = 0
