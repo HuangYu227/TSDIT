@@ -211,7 +211,8 @@ class MATDTrainer:
             accum: dict[str, float] = {}
             n = 0
             skipped = 0
-            pbar = tqdm(dataloader, desc=f"stage{stage}-epoch{epoch}")
+            desc = f"epoch{epoch}" if stage == 0 else f"stage{stage}-epoch{epoch}"
+            pbar = tqdm(dataloader, desc=desc)
             for batch in pbar:
                 metrics = self.train_step(batch, stage=stage)
                 for k, v in metrics.items():
