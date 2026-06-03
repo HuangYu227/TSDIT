@@ -45,6 +45,8 @@ def main() -> None:
                         help="Training stage: 0=joint, 1/2/3/4=single stage, all=sequential 1->4")
     parser.add_argument("--joint_epochs", type=int, default=200,
                         help="Epochs for --stage 0 joint training (default: 200)")
+    parser.add_argument("--no_causal_guidance", action="store_true",
+                        help="Disable causal guidance during inference/sampling")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -69,6 +71,7 @@ def main() -> None:
         total_steps=args.total_steps,
         warmup_steps=args.warmup_steps,
         log_interval=14,
+        use_causal_guidance_in_sampling=not args.no_causal_guidance,
     )
 
     dm = MATDDataModule(
