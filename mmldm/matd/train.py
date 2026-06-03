@@ -40,6 +40,9 @@ def main() -> None:
     parser.add_argument("--embed_dim", type=int, default=256)
     parser.add_argument("--dit_depth", type=int, default=8)
     parser.add_argument("--dit_heads", type=int, default=8)
+    parser.add_argument("--stage", type=str, default="all",
+                        choices=["0", "1", "2", "3", "4", "all"],
+                        help="Training stage: 0=joint, 1/2/3/4=single stage, all=sequential 1->4")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -95,13 +98,33 @@ def main() -> None:
         ddim_steps=cfg.ddim_steps,
     )
 
-    trainer.train_all_stages(
-        train_loaders=train_loaders,
-        epochs_per_stage=epochs_per_stage,
-        val_loaders=val_loaders,
-        save_dir=args.save_dir,
-        evaluator=evaluator,
-    )
+    if args.stage == "0":
+        # Joint training mode: all components, single pass
+        joint_epochs = epochs_per_stage.get(1, 10)
+        trainer.train_stage(
+            train_loaders[1], joint_epochs, stage=0,
+            val_dataloader=val_loaders.get(1), evaluator=evaluator,
+            save_dir=args.save_dir,
+        )
+    elif args.stage in ("1", "2", "3", "4"):
+        # Single stage training
+        s = int(args.stage)
+        loader = train_loaders.get(s, train_loaders[1])
+        val_loader = val_loaders.get(s)
+        trainer.train_stage(
+            loader, epochs_per_stage.get(s, 10), stage=s,
+            val_dataloader=val_loader, evaluator=evaluator if s == 4 else None,
+            save_dir=args.save_dir,
+        )
+    else:
+        # Original multi-stage sequential training (default "all")
+        trainer.train_all_stages(
+            train_loaders=train_loaders,
+            epochs_per_stage=epochs_per_stage,
+            val_loaders=val_loaders,
+            save_dir=args.save_dir,
+            evaluator=evaluator,
+        )
 
 
 if __name__ == "__main__":

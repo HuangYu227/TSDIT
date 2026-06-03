@@ -268,6 +268,18 @@ class MATDModel(nn.Module):
 
     def _stage_weights(self, stage: int) -> LossWeights:
         """Return loss weights tuned for each training stage."""
+        if stage == 0:  # joint training — all components at once
+            return LossWeights(
+                diffusion=self.cfg.lambda_diffusion,
+                reconstruction=0.0,  # avoids 1/sqrt(alpha_bar) amplification NaN at high t
+                delta=self.cfg.lambda_delta,
+                fft=self.cfg.lambda_fft,
+                alignment=self.cfg.lambda_align,
+                moe=self.cfg.lambda_moe,
+                causal=self.cfg.lambda_causal,
+                planner=self.cfg.lambda_plan,
+                scci=self.cfg.lambda_scci,
+            )
         if stage == 1:  # autoencoder: encoder + decoder only
             return LossWeights(
                 diffusion=0.0, reconstruction=0.0, delta=1.0, fft=1.0,

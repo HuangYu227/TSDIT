@@ -232,8 +232,8 @@ class MATDTrainer:
             if val_dataloader is not None:
                 val = self.validate(val_dataloader, stage=stage)
                 logger.info("stage=%d epoch=%d val_loss=%.5f", stage, epoch, val.get("loss_total", 0.0))
-            # Stage-4: run evaluation every eval_interval epochs
-            if stage == 4 and evaluator is not None and (epoch + 1) % self.eval_interval == 0:
+            # Run evaluation every eval_interval epochs (stage 0 joint or stage 4 finetune)
+            if stage in (0, 4) and evaluator is not None and (epoch + 1) % self.eval_interval == 0:
                 eval_results = evaluator.evaluate()
                 evaluator.print_results(eval_results)
                 sota_count = self._check_sota(eval_results, save_dir)
