@@ -125,19 +125,21 @@ class MATDTrainer:
         min_lr_ratio = float(sched_cfg.get("min_lr_ratio", _cfg_get(self.config, "min_lr_ratio", 0.01)))
         self.scheduler = _cosine_warmup_scheduler(self.optimizer, warmup, total_steps, min_lr_ratio)
 
-    def _set_trainable(self, trainable_names: Optional[set[str]]) -> None:
+    def _set_trainable(self, trainable_names: Optional[set[str]], stage_steps: Optional[int] = None) -> None:
+        if stage_steps is None:
+            stage_steps = int(_cfg_get(self.config, "total_steps", 100000))
         if trainable_names is None:
             for p in self.model.parameters():
                 p.requires_grad = True
             self.optimizer = self._build_optimizer()
-            self._build_scheduler(int(_cfg_get(self.config, "total_steps", 100000)))
+            self._build_scheduler(stage_steps)
             return
         for name, module in self.named_components().items():
             req = name in trainable_names
             for p in module.parameters():
                 p.requires_grad = req
         self.optimizer = self._build_optimizer()
-        self._build_scheduler(int(_cfg_get(self.config, "total_steps", 100000)))
+        self._build_scheduler(stage_steps)
 
     def named_components(self) -> dict[str, nn.Module]:
         if hasattr(self.model, "submodules") and isinstance(getattr(self.model, "submodules"), dict):
@@ -200,12 +202,13 @@ class MATDTrainer:
 
     def train_stage(self, dataloader: torch.utils.data.DataLoader, epochs: int, stage: int = 3, val_dataloader: Optional[torch.utils.data.DataLoader] = None, evaluator: Optional[Any] = None, save_dir: Optional[str] = None) -> list[dict[str, float]]:
         # Stage freezing.  Full model training remains default for stages 3/4.
+        stage_steps = len(dataloader) * epochs
         if stage == 1:
-            self._set_trainable({"encoder", "decoder"})
+            self._set_trainable({"encoder", "decoder"}, stage_steps=stage_steps)
         elif stage == 2:
-            self._set_trainable({"text_encoder", "null_encoder", "planner", "slot_extractor", "injector"})
+            self._set_trainable({"text_encoder", "null_encoder", "planner", "slot_extractor", "injector"}, stage_steps=stage_steps)
         else:
-            self._set_trainable(None)
+            self._set_trainable(None, stage_steps=stage_steps)
         history: list[dict[str, float]] = []
         for epoch in range(epochs):
             accum: dict[str, float] = {}
