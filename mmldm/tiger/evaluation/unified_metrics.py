@@ -377,16 +377,18 @@ def calculate_jftsd_baseline(
     opt = torch.optim.Adam(list(x_enc.parameters()) + list(c_enc.parameters()), lr=1e-3)
 
     try:
-        for _ in range(train_steps):
-            idx = torch.randperm(B)
-            z_t = F_torch.normalize(x_enc(real_t[idx]), dim=-1)
-            z_m = F_torch.normalize(c_enc(cond_t[idx]), dim=-1)
-            logits = (z_t @ z_m.T) / np.sqrt(emb_dim)
-            labels = torch.arange(B, device=device)
-            loss = (F_torch.cross_entropy(logits, labels) + F_torch.cross_entropy(logits.T, labels)) / 2
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+        # Must enable grad for contrastive training even if caller uses @torch.no_grad()
+        with torch.enable_grad():
+            for _ in range(train_steps):
+                idx = torch.randperm(B)
+                z_t = F_torch.normalize(x_enc(real_t[idx]), dim=-1)
+                z_m = F_torch.normalize(c_enc(cond_t[idx]), dim=-1)
+                logits = (z_t @ z_m.T) / np.sqrt(emb_dim)
+                labels = torch.arange(B, device=device)
+                loss = (F_torch.cross_entropy(logits, labels) + F_torch.cross_entropy(logits.T, labels)) / 2
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
 
         with torch.no_grad():
             x_real_rep = x_enc(real_t)
