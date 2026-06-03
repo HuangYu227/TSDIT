@@ -301,7 +301,7 @@ def calculate_jftsd_baseline(
     gen: np.ndarray,
     condition: np.ndarray,
     device: str = "cuda",
-    emb_dim: int = 64,
+    emb_dim: int = 16,
     train_steps: int = 200,
     seed: int = 42,
 ) -> tuple[Optional[float], str, str]:
@@ -332,6 +332,15 @@ def calculate_jftsd_baseline(
         cond = cond[:, np.newaxis, :]
     D_c = cond.shape[-1]
 
+    # Auto-reduce emb_dim so that 2*emb_dim < B (covariance must be full-rank)
+    max_dim = max(4, (B - 1) // 2)
+    if 2 * emb_dim > max_dim:
+        emb_dim = max_dim // 2
+
+    # Sanitize inputs
+    if np.any(np.isnan(real)) or np.any(np.isnan(gen)) or np.any(np.isnan(cond)):
+        return None, "failed", "NaN in input arrays"
+
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -355,6 +364,8 @@ def calculate_jftsd_baseline(
             super().__init__()
             self.encoder = nn.Sequential(nn.Linear(in_dim, 128), nn.ReLU(), nn.Linear(128, out_dim))
         def forward(self, c_data):
+            if c_data.dim() == 2:
+                c_data = c_data.unsqueeze(1)  # (B, D) -> (B, 1, D)
             B_c, L_c, D_c_inner = c_data.shape
             c_flat = c_data.reshape(-1, D_c_inner)
             c_encoded = self.encoder(c_flat)
@@ -390,7 +401,7 @@ def calculate_jftsd_baseline(
         sigma_real = np.cov(z_real.T)
         sigma_gen = np.cov(z_gen.T)
 
-        eps = 1e-6
+        eps = 1e-5
         sigma_real += np.eye(sigma_real.shape[0]) * eps
         sigma_gen += np.eye(sigma_gen.shape[0]) * eps
 
