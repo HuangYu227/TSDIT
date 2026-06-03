@@ -36,12 +36,16 @@ class DiffusionLoss(nn.Module):
 
     @staticmethod
     def _min_snr_weight(t: torch.Tensor, alpha_bar: torch.Tensor, gamma: float, x: torch.Tensor) -> torch.Tensor:
-        ab = alpha_bar.to(device=t.device, dtype=x.dtype).gather(0, t)
+        # Compute SNR weights in fp32 even under AMP.  Late cosine timesteps can
+        # underflow to zero in fp16/bf16, which turns min(snr, gamma) / snr into
+        # 0/0 and poisons the diffusion loss with NaNs.
+        ab = alpha_bar.to(device=t.device, dtype=torch.float32).gather(0, t)
         snr = ab / (1.0 - ab).clamp_min(1e-8)
         # Standard Min-SNR-gamma: min(snr, gamma) / snr
         # Downweights high-SNR (clean) timesteps, preserves low-SNR (noisy) ones
         weight = torch.minimum(snr, torch.full_like(snr, float(gamma))) / snr.clamp_min(1e-8)
-        return weight
+        weight = torch.nan_to_num(weight, nan=0.0, posinf=1.0, neginf=0.0)
+        return weight.to(dtype=x.dtype)
 
     def forward(
         self,

@@ -189,7 +189,7 @@ class MATDTrainer:
         metrics = {k: (v.detach().item() if torch.is_tensor(v) else float(v)) for k, v in terms.items()}
         if not torch.isfinite(loss.detach()):
             bad_terms = {k: v for k, v in metrics.items() if not math.isfinite(v)}
-            logger.debug("stage=%d step=%d non-finite loss; skipping optimizer step; bad_terms=%s", stage, self.global_step, bad_terms)
+            logger.warning("stage=%d step=%d non-finite loss; skipping optimizer step; bad_terms=%s", stage, self.global_step, bad_terms)
             self.optimizer.zero_grad(set_to_none=True)
             metrics["skipped_step"] = 1.0
             return metrics
@@ -199,7 +199,7 @@ class MATDTrainer:
         if self.max_grad_norm > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         if torch.is_tensor(grad_norm) and not torch.isfinite(grad_norm.detach()):
-            logger.debug("stage=%d step=%d non-finite grad_norm=%s; skipping optimizer step", stage, self.global_step, grad_norm.detach().item())
+            logger.warning("stage=%d step=%d non-finite grad_norm=%s; skipping optimizer step", stage, self.global_step, grad_norm.detach().item())
             self.optimizer.zero_grad(set_to_none=True)
             if self.grad_scaler.is_enabled():
                 self.grad_scaler.update(max(self.grad_scaler.get_scale() * 0.5, 1.0))
