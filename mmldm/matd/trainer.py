@@ -164,6 +164,8 @@ class MATDTrainer:
             bad_terms = {k: v for k, v in metrics.items() if not math.isfinite(v)}
             logger.warning("stage=%d step=%d non-finite loss; skipping optimizer step; bad_terms=%s", stage, self.global_step, bad_terms)
             self.optimizer.zero_grad(set_to_none=True)
+            if self.grad_scaler.is_enabled():
+                self.grad_scaler.update(max(self.grad_scaler.get_scale() * 0.5, 1.0))
             metrics["skipped_step"] = 1.0
             return metrics
         self.grad_scaler.scale(loss).backward()
