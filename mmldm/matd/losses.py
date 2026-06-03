@@ -38,7 +38,7 @@ class DiffusionLoss(nn.Module):
     def _min_snr_weight(t: torch.Tensor, alpha_bar: torch.Tensor, gamma: float, x: torch.Tensor) -> torch.Tensor:
         ab = alpha_bar.to(device=t.device, dtype=x.dtype).gather(0, t)
         snr = ab / (1.0 - ab).clamp_min(1e-8)
-        weight = torch.minimum(snr, torch.full_like(snr, float(gamma))) / gamma
+        weight = torch.minimum(snr, torch.full_like(snr, float(gamma))) / max(gamma, 1e-8)
         return weight
 
     def forward(
@@ -130,7 +130,7 @@ class AlignmentLoss(nn.Module):
 
     def __init__(self, temperature: float = 0.07) -> None:
         super().__init__()
-        self.temperature = temperature
+        self.temperature = max(temperature, 1e-6)
 
     def forward(self, ts_embed: torch.Tensor, text_embed: torch.Tensor) -> dict[str, torch.Tensor]:
         B = ts_embed.shape[0]

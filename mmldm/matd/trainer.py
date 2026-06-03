@@ -99,6 +99,9 @@ class MATDTrainer:
         self.max_grad_norm = float(_cfg_get(config, "grad_clip", _cfg_get(config, "max_grad_norm", 1.0)))
         self.global_step = int(_cfg_get(config, "global_step", 0))
         self.log_interval = int(_cfg_get(config, "log_interval", 50))
+        self.eval_interval = int(_cfg_get(config, "eval_interval", 10))
+        self.best_metrics: dict[str, float] = {}
+        self.best_sota_count: int = 0
 
         self.optimizer = self._build_optimizer()
         self.scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None
