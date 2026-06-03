@@ -348,7 +348,7 @@ class MATDModel(nn.Module):
 
         loss_dicts: dict[str, dict[str, torch.Tensor]] = {}
         loss_dicts["diffusion"] = self.loss_diffusion(eps_pred, diff_target, t=t, alpha_bar=self.alpha_bar)
-        loss_dicts["reconstruction"] = self.loss_recon(x0_hat, z_moe.detach())
+        loss_dicts["reconstruction"] = self.loss_recon(x0_hat, x0_seq.detach())
         loss_dicts["delta"] = self.loss_delta(x_hat, x0_seq)
         loss_dicts["fft"] = self.loss_fft(x_hat, x0_seq)
         loss_dicts["planner"] = self.loss_planner(meta_pred, meta_oracle.detach())
