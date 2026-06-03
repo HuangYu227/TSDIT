@@ -220,7 +220,13 @@ class MATDTrainer:
         metrics["skipped_step"] = 0.0 if optimizer_stepped else 1.0
         return metrics
 
-    def train_stage(self, dataloader: torch.utils.data.DataLoader, epochs: int, stage: int = 3, val_dataloader: Optional[torch.utils.data.DataLoader] = None, evaluator: Optional[Any] = None, save_dir: Optional[str] = None) -> list[dict[str, float]]:
+    def train_stage(self, dataloader: torch.utils.data.DataLoader, epochs: int, stage: int = 3, val_dataloader: Optional[torch.utils.data.DataLoader] = None, evaluator: Optional[Any] = None, save_dir: Optional[str] = None, save_best_every: int = 10, patience: int = 0) -> list[dict[str, float]]:
+        """Train one stage with optional best-weight saving and early stopping.
+
+        Args:
+            save_best_every: Save best checkpoint every N epochs (0 = disabled).
+            patience: Early stop after N epochs without improvement (0 = disabled).
+        """
         # Stage freezing.  Full model training remains default for stages 3/4.
         stage_steps = len(dataloader) * epochs
         if stage == 1:
@@ -230,6 +236,8 @@ class MATDTrainer:
         else:
             self._set_trainable(None, stage_steps=stage_steps)
         history: list[dict[str, float]] = []
+        best_loss = float("inf")
+        no_improve = 0
         for epoch in range(epochs):
             accum: dict[str, float] = {}
             n = 0
@@ -250,12 +258,28 @@ class MATDTrainer:
             avg = {k: v / max(n, 1) for k, v in accum.items()}
             avg["epoch"] = float(epoch)
             history.append(avg)
-            logger.info("stage=%d epoch=%d train_loss=%.5f", stage, epoch, avg.get("loss_total", 0.0))
+            train_loss = avg.get("loss_total", float("inf"))
+            logger.info("stage=%d epoch=%d train_loss=%.5f", stage, epoch, train_loss)
             if skipped > 0:
                 logger.warning("stage=%d epoch=%d %d/%d batches skipped (non-finite loss/grad)", stage, epoch, skipped, n)
+            val_loss = train_loss
             if val_dataloader is not None:
                 val = self.validate(val_dataloader, stage=stage)
-                logger.info("stage=%d epoch=%d val_loss=%.5f", stage, epoch, val.get("loss_total", 0.0))
+                val_loss = val.get("loss_total", float("inf"))
+                logger.info("stage=%d epoch=%d val_loss=%.5f", stage, epoch, val_loss)
+            # Save best checkpoint every save_best_every epochs
+            if save_dir is not None and save_best_every > 0 and (epoch + 1) % save_best_every == 0:
+                if val_loss < best_loss:
+                    best_loss = val_loss
+                    no_improve = 0
+                    best_path = os.path.join(save_dir, f"stage{stage}_best.pt")
+                    self.save_checkpoint(best_path)
+                    logger.info("stage=%d epoch=%d new best_loss=%.5f saved to %s", stage, epoch, best_loss, best_path)
+                else:
+                    no_improve += save_best_every
+                    if patience > 0 and no_improve >= patience:
+                        logger.info("stage=%d early stop at epoch=%d (no improvement for %d epochs)", stage, epoch, no_improve)
+                        break
             # Run evaluation every eval_interval epochs (stage 0 joint or stage 4 finetune)
             if stage in (0, 4) and evaluator is not None and (epoch + 1) % self.eval_interval == 0:
                 eval_results = evaluator.evaluate()
