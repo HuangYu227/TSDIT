@@ -43,6 +43,8 @@ def main() -> None:
     parser.add_argument("--stage", type=str, default="all",
                         choices=["0", "1", "2", "3", "4", "all"],
                         help="Training stage: 0=joint, 1/2/3/4=single stage, all=sequential 1->4")
+    parser.add_argument("--joint_epochs", type=int, default=200,
+                        help="Epochs for --stage 0 joint training (default: 200)")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -100,7 +102,7 @@ def main() -> None:
 
     if args.stage == "0":
         # Joint training mode: all components, single pass
-        joint_epochs = epochs_per_stage.get(1, 10)
+        joint_epochs = args.joint_epochs
         trainer.train_stage(
             train_loaders[1], joint_epochs, stage=0,
             val_dataloader=val_loaders.get(1), evaluator=evaluator,
