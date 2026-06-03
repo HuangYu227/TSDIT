@@ -165,7 +165,7 @@ class MATDTrainer:
         metrics = {k: (v.detach().item() if torch.is_tensor(v) else float(v)) for k, v in terms.items()}
         if not torch.isfinite(loss.detach()):
             bad_terms = {k: v for k, v in metrics.items() if not math.isfinite(v)}
-            logger.warning("stage=%d step=%d non-finite loss; skipping optimizer step; bad_terms=%s", stage, self.global_step, bad_terms)
+            logger.debug("stage=%d step=%d non-finite loss; skipping optimizer step; bad_terms=%s", stage, self.global_step, bad_terms)
             self.optimizer.zero_grad(set_to_none=True)
             if self.grad_scaler.is_enabled():
                 self.grad_scaler.update(max(self.grad_scaler.get_scale() * 0.5, 1.0))
@@ -177,7 +177,7 @@ class MATDTrainer:
         if self.max_grad_norm > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         if torch.is_tensor(grad_norm) and not torch.isfinite(grad_norm.detach()):
-            logger.warning("stage=%d step=%d non-finite grad_norm=%s; skipping optimizer step", stage, self.global_step, grad_norm.detach().item())
+            logger.debug("stage=%d step=%d non-finite grad_norm=%s; skipping optimizer step", stage, self.global_step, grad_norm.detach().item())
             self.optimizer.zero_grad(set_to_none=True)
             if self.grad_scaler.is_enabled():
                 self.grad_scaler.update(max(self.grad_scaler.get_scale() * 0.5, 1.0))
@@ -210,13 +210,16 @@ class MATDTrainer:
         for epoch in range(epochs):
             accum: dict[str, float] = {}
             n = 0
+            skipped = 0
             pbar = tqdm(dataloader, desc=f"stage{stage}-epoch{epoch}")
             for batch in pbar:
                 metrics = self.train_step(batch, stage=stage)
                 for k, v in metrics.items():
                     accum[k] = accum.get(k, 0.0) + v
                 n += 1
-                if hasattr(pbar, "set_postfix"):
+                if metrics.get("skipped_step", 0.0) > 0:
+                    skipped += 1
+                if hasattr(pbar, "set_postfix") and self.global_step % self.log_interval == 0:
                     pbar.set_postfix(loss_total=f"{metrics.get('loss_total', 0.0):.5f}")
                 if self.global_step % self.log_interval == 0:
                     logger.info("stage=%d step=%d loss_total=%.5f", stage, self.global_step, metrics.get("loss_total", 0.0))
@@ -224,6 +227,8 @@ class MATDTrainer:
             avg["epoch"] = float(epoch)
             history.append(avg)
             logger.info("stage=%d epoch=%d train_loss=%.5f", stage, epoch, avg.get("loss_total", 0.0))
+            if skipped > 0:
+                logger.warning("stage=%d epoch=%d %d/%d batches skipped (non-finite loss/grad)", stage, epoch, skipped, n)
             if val_dataloader is not None:
                 val = self.validate(val_dataloader, stage=stage)
                 logger.info("stage=%d epoch=%d val_loss=%.5f", stage, epoch, val.get("loss_total", 0.0))
