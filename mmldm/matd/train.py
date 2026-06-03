@@ -106,6 +106,8 @@ def main() -> None:
             val_dataloader=val_loaders.get(1), evaluator=evaluator,
             save_dir=args.save_dir,
         )
+        if args.save_dir:
+            trainer.save_checkpoint(os.path.join(args.save_dir, "joint.pt"))
     elif args.stage in ("1", "2", "3", "4"):
         # Single stage training
         s = int(args.stage)

@@ -238,7 +238,8 @@ class MATDTrainer:
                 eval_results = evaluator.evaluate()
                 evaluator.print_results(eval_results)
                 sota_count = self._check_sota(eval_results, save_dir)
-                logger.info("stage=%d epoch=%d eval SOTA count=%d", stage, epoch, sota_count)
+                metric_str = " ".join(f"{k}={v:.4f}" for k, v in eval_results.items() if v is not None and v == v)
+                logger.info("stage=%d epoch=%d eval SOTA=%d %s", stage, epoch, sota_count, metric_str)
         return history
 
     def train_all_stages(self, train_loaders: dict[int, torch.utils.data.DataLoader], epochs_per_stage: dict[int, int], val_loaders: Optional[dict[int, torch.utils.data.DataLoader]] = None, save_dir: Optional[str] = None, mix_ratio: float = 0.5, evaluator: Optional[Any] = None) -> dict[int, list[dict[str, float]]]:
