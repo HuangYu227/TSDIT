@@ -238,7 +238,7 @@ class MATDTrainer:
                 eval_results = evaluator.evaluate()
                 evaluator.print_results(eval_results)
                 sota_count = self._check_sota(eval_results, save_dir)
-                metric_str = " ".join(f"{k}={v:.4f}" for k, v in eval_results.items() if v is not None and v == v)
+                metric_str = " ".join(f"{k}={v:.4f}" if isinstance(v, (int, float)) and v == v else f"{k}={v}" for k, v in eval_results.items() if v is not None)
                 logger.info("stage=%d epoch=%d eval SOTA=%d %s", stage, epoch, sota_count, metric_str)
         return history
 
