@@ -317,27 +317,36 @@ class MATDEvaluator:
 
         # --- J-FTSD with 3 condition variants ---
         device_str = str(self.device)
+        logger.info("J-FTSD shapes: real=%s gen=%s text=%s planner=%s slots=%s",
+                     real_raw.shape, gen_single.shape, text_embed.shape,
+                     planner_meta.shape, scci_slots.shape)
 
         jftsd_text, jftsd_text_status = None, "skipped"
-        val, status, _reason = calculate_jftsd_baseline(
+        val, status, reason = calculate_jftsd_baseline(
             real_raw, gen_single, text_embed, device=device_str
         )
         if val is not None:
             jftsd_text, jftsd_text_status = val, status
+        else:
+            logger.warning("J-FTSD (text) failed: %s", reason)
 
         jftsd_planner, jftsd_planner_status = None, "skipped"
-        val, status, _reason = calculate_jftsd_baseline(
+        val, status, reason = calculate_jftsd_baseline(
             real_raw, gen_single, planner_meta, device=device_str
         )
         if val is not None:
             jftsd_planner, jftsd_planner_status = val, status
+        else:
+            logger.warning("J-FTSD (planner) failed: %s", reason)
 
         jftsd_slots, jftsd_slots_status = None, "skipped"
-        val, status, _reason = calculate_jftsd_baseline(
+        val, status, reason = calculate_jftsd_baseline(
             real_raw, gen_single, scci_slots, device=device_str
         )
         if val is not None:
             jftsd_slots, jftsd_slots_status = val, status
+        else:
+            logger.warning("J-FTSD (slots) failed: %s", reason)
 
         # --- Assemble results ---
         results: dict[str, Any] = {
