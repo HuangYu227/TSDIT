@@ -45,6 +45,8 @@ def main() -> None:
                         help="Training stage: 0=joint, 1/2/3/4=single stage, all=sequential 1->4")
     parser.add_argument("--joint_epochs", type=int, default=200,
                         help="Epochs for --stage 0 joint training (default: 200)")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Epochs for single-stage training (overrides default per-stage epochs)")
     parser.add_argument("--no_causal_guidance", action="store_true",
                         help="Disable causal guidance during inference/sampling")
     args = parser.parse_args()
@@ -118,8 +120,9 @@ def main() -> None:
         s = int(args.stage)
         loader = train_loaders.get(s, train_loaders[1])
         val_loader = val_loaders.get(s)
+        n_epochs = args.epochs if args.epochs is not None else epochs_per_stage.get(s, 10)
         trainer.train_stage(
-            loader, epochs_per_stage.get(s, 10), stage=s,
+            loader, n_epochs, stage=s,
             val_dataloader=val_loader, evaluator=evaluator if s == 4 else None,
             save_dir=args.save_dir,
         )
