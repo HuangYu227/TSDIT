@@ -38,7 +38,9 @@ class DiffusionLoss(nn.Module):
     def _min_snr_weight(t: torch.Tensor, alpha_bar: torch.Tensor, gamma: float, x: torch.Tensor) -> torch.Tensor:
         ab = alpha_bar.to(device=t.device, dtype=x.dtype).gather(0, t)
         snr = ab / (1.0 - ab).clamp_min(1e-8)
-        weight = torch.minimum(snr, torch.full_like(snr, float(gamma))) / max(gamma, 1e-8)
+        # Standard Min-SNR-gamma: min(snr, gamma) / snr
+        # Downweights high-SNR (clean) timesteps, preserves low-SNR (noisy) ones
+        weight = torch.minimum(snr, torch.full_like(snr, float(gamma))) / snr.clamp_min(1e-8)
         return weight
 
     def forward(
@@ -204,6 +206,7 @@ class CausalLosses(nn.Module):
 class LossWeights:
     diffusion: float = 1.0
     reconstruction: float = 0.0
+    latent_anchor: float = 0.0
     delta: float = 0.0
     fft: float = 0.0
     density_weighted: float = 0.0
@@ -222,6 +225,7 @@ def weights_from_config(config: dict) -> LossWeights:
     return LossWeights(
         diffusion=config.get("lambda_diffusion", 1.0),
         reconstruction=config.get("lambda_x0", config.get("lambda_recon", 0.2)),
+        latent_anchor=config.get("lambda_latent_anchor", 0.01),
         delta=config.get("lambda_delta", 0.1),
         fft=config.get("lambda_fft", 0.05),
         alignment=config.get("lambda_align", 0.05),
@@ -247,6 +251,7 @@ def compute_total_loss(loss_dicts: dict[str, dict[str, torch.Tensor]], weights: 
     group_spec = [
         ("diffusion", weights.diffusion, "loss_diffusion"),
         ("reconstruction", weights.reconstruction, "loss_recon"),
+        ("latent_anchor", weights.latent_anchor, "loss_latent_anchor"),
         ("delta", weights.delta, "loss_delta"),
         ("fft", weights.fft, "loss_fft"),
         ("density_weighted", weights.density_weighted, "loss_density_weighted"),

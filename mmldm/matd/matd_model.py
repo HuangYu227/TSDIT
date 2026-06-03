@@ -115,7 +115,7 @@ class MATDConfig:
     pred_mode: str = "eps"  # eps or v
     dit_dropout: float = 0.0
     dit_qk_norm: bool = False
-    min_snr_gamma: float | None = None
+    min_snr_gamma: float | None = 5.0
     eval_interval: int = 10
     log_interval: int = 50
 
@@ -142,6 +142,7 @@ class MATDConfig:
     lambda_moe: float = 0.01
     lambda_causal: float = 0.01
     lambda_scci: float = 0.0
+    lambda_latent_anchor: float = 0.01
 
     # Optimizer / CFG
     lr: float = 1e-4
@@ -271,7 +272,8 @@ class MATDModel(nn.Module):
         if stage == 0:  # joint training — all components at once
             return LossWeights(
                 diffusion=self.cfg.lambda_diffusion,
-                reconstruction=0.0,  # avoids 1/sqrt(alpha_bar) amplification NaN at high t
+                reconstruction=self.cfg.lambda_x0,  # now stable: x_hat vs x0_seq
+                latent_anchor=self.cfg.lambda_latent_anchor,
                 delta=self.cfg.lambda_delta,
                 fft=self.cfg.lambda_fft,
                 alignment=self.cfg.lambda_align,
@@ -282,18 +284,21 @@ class MATDModel(nn.Module):
             )
         if stage == 1:  # autoencoder: encoder + decoder only
             return LossWeights(
-                diffusion=0.0, reconstruction=0.0, delta=1.0, fft=1.0,
+                diffusion=0.0, reconstruction=1.0, latent_anchor=0.01,
+                delta=0.1, fft=0.05,
                 alignment=0.0, moe=0.0, causal=0.0, planner=0.0, scci=0.0,
             )
         if stage == 2:  # planner + alignment + SCCI
             return LossWeights(
-                diffusion=0.0, reconstruction=0.0, delta=0.0, fft=0.0,
-                alignment=1.0, moe=0.0, causal=0.0, planner=1.0, scci=1.0,
+                diffusion=0.0, reconstruction=0.0, latent_anchor=0.0,
+                delta=0.0, fft=0.0,
+                alignment=0.05, moe=0.0, causal=0.0, planner=1.0, scci=0.01,
             )
         if stage == 4:  # joint finetune — everything at full strength
             return LossWeights(
                 diffusion=self.cfg.lambda_diffusion,
                 reconstruction=self.cfg.lambda_x0,
+                latent_anchor=self.cfg.lambda_latent_anchor,
                 delta=self.cfg.lambda_delta,
                 fft=self.cfg.lambda_fft,
                 alignment=self.cfg.lambda_align,
@@ -302,12 +307,11 @@ class MATDModel(nn.Module):
                 planner=self.cfg.lambda_plan,
                 scci=self.cfg.lambda_scci,
             )
-        # stage 3 (default): oracle-meta diffusion. Keep this stage focused on
-        # denoising; x0 reconstruction from very small alpha_bar timesteps can
-        # dominate numerics before the denoiser is stable.
+        # stage 3 (default): oracle-meta diffusion with soft reconstruction
         return LossWeights(
             diffusion=self.cfg.lambda_diffusion,
-            reconstruction=0.0,
+            reconstruction=self.cfg.lambda_x0 * 0.5,
+            latent_anchor=self.cfg.lambda_latent_anchor * 0.5,
             delta=0.0,
             fft=0.0,
             alignment=0.0,
@@ -334,51 +338,77 @@ class MATDModel(nn.Module):
             meta = meta_pred
         meta_9 = meta[..., :9].to(z0.dtype)
 
-        t = torch.randint(0, self.cfg.timesteps, (B,), device=z0.device, dtype=torch.long)
-        t_emb = self.denoiser.timestep_embed(t)
-        slots = self.slot_extractor(token_hidden, text_padding_mask=text_key_padding_mask)
-        causal_feat, A0, Alags, causal_losses = self.causal(z0, pooled, meta=meta_9)
-        z_cond, slot_attn, text_cond = self.injector(z0, meta_9, slots, t_emb, causal_feat)
-        t_emb_k = t_emb.unsqueeze(1).expand(-1, K, -1)
-        z_moe, router_p, prior_p = self.moe(z_cond, meta_9, text_cond, t_emb_k, causal_feat)
-
-        # t already sampled above for t_emb
-        noise = torch.randn_like(z_moe)
-        z_t = self._q_sample(z_moe, t, noise)
-        eps_pred = self.denoiser(z_t, t, token_hidden, meta_9, pooled, causal_feat=causal_feat, text_padding_mask=text_key_padding_mask)
-        if self.cfg.pred_mode == "v":
-            ab = self._extract(t, z_moe)
-            diff_target = ab.sqrt() * noise - (1.0 - ab).sqrt() * z_moe
-            x0_hat = self._predict_x0_from_v(z_t, eps_pred, t)
+        # Stage 1 pure autoencoder: skip causal/SCCI/MoE, use z0 directly
+        if stage == 1:
+            z_moe = z0
+            causal_feat = None
+            A0 = Alags = None
+            causal_losses = {}
+            slot_attn = None
+            router_p = prior_p = None
         else:
-            diff_target = noise
-            x0_hat = self._predict_x0_from_eps(z_t, eps_pred, t)
+            t = torch.randint(0, self.cfg.timesteps, (B,), device=z0.device, dtype=torch.long)
+            t_emb = self.denoiser.timestep_embed(t)
+            slots = self.slot_extractor(token_hidden, text_padding_mask=text_key_padding_mask)
+            causal_feat, A0, Alags, causal_losses = self.causal(z0, pooled, meta=meta_9)
+            z_cond, slot_attn, text_cond = self.injector(z0, meta_9, slots, t_emb, causal_feat)
+            t_emb_k = t_emb.unsqueeze(1).expand(-1, K, -1)
+            z_moe, router_p, prior_p = self.moe(z_cond, meta_9, text_cond, t_emb_k, causal_feat)
+
+        # Stage 1: pure autoencoder, no diffusion
+        if stage == 1:
+            noise = None
+            z_t = None
+            eps_pred = None
+            diff_target = None
+        else:
+            noise = torch.randn_like(z_moe)
+            z_t = self._q_sample(z_moe, t, noise)
+            eps_pred = self.denoiser(z_t, t, token_hidden, meta_9, pooled, causal_feat=causal_feat, text_padding_mask=text_key_padding_mask)
+            if self.cfg.pred_mode == "v":
+                ab = self._extract(t, z_moe)
+                diff_target = ab.sqrt() * noise - (1.0 - ab).sqrt() * z_moe
+            else:
+                diff_target = noise
 
         target_len = x0.shape[1]
         x_hat = self.decoder(z_moe, meta_9, target_len)
         x0_seq = x0.unsqueeze(-1) if x0.dim() == 2 else x0  # ensure (B,T,C)
 
         loss_dicts: dict[str, dict[str, torch.Tensor]] = {}
-        loss_dicts["diffusion"] = self.loss_diffusion(eps_pred, diff_target, t=t, alpha_bar=self.alpha_bar)
-        loss_dicts["reconstruction"] = self.loss_recon(x0_hat, z_moe.detach())
+        if stage != 1:
+            loss_dicts["diffusion"] = self.loss_diffusion(eps_pred, diff_target, t=t, alpha_bar=self.alpha_bar)
+
+        # Stable reconstruction: x_hat (decoded from clean z_moe) vs x0_seq (ground truth)
+        # Replaces unstable x0_hat reconstruction that explodes at high timesteps
+        ts_recon = self.loss_recon(x_hat, x0_seq)
+        latent_anchor = F.smooth_l1_loss(z_moe, z0.detach())
+        loss_dicts["reconstruction"] = {
+            "loss_ts_recon_l1": ts_recon.get("loss_recon_l1", torch.tensor(0.0, device=x0.device)),
+            "loss_ts_recon_mse": ts_recon.get("loss_recon_mse", torch.tensor(0.0, device=x0.device)),
+            "loss_recon": ts_recon["loss_recon"],
+        }
+        loss_dicts["latent_anchor"] = {"loss_latent_anchor": latent_anchor}
+
         loss_dicts["delta"] = self.loss_delta(x_hat, x0_seq)
         loss_dicts["fft"] = self.loss_fft(x_hat, x0_seq)
-        loss_dicts["planner"] = self.loss_planner(meta_pred, meta_oracle.detach())
-        loss_dicts["alignment"] = self.loss_align(z0.mean(dim=1), pooled)
-        moe_aux = getattr(self.moe, "last_aux_losses", None)
-        loss_dicts["moe"] = moe_aux if moe_aux else self.loss_moe(router_p, prior_p)
-        loss_dicts["causal"] = {
-            "loss_mechanism": causal_losses.get("predict", z0.new_tensor(0.0)),
-            "loss_dag": causal_losses.get("notears", z0.new_tensor(0.0)),
-            "loss_sparsity": causal_losses.get("sparsity", z0.new_tensor(0.0)),
-            "loss_smooth": causal_losses.get("smooth", z0.new_tensor(0.0)),
-            "loss_disentangle": causal_losses.get("disentangle", z0.new_tensor(0.0)),
-            "loss_causal": causal_losses.get("loss_causal", z0.new_tensor(0.0)),
-        }
-        scci_aux = getattr(self.injector, "last_aux_losses", None)
-        if scci_aux:
-            scci_loss = sum(v for k, v in scci_aux.items() if k.startswith("loss_"))
-            loss_dicts["scci"] = {**scci_aux, "loss_scci": scci_loss}
+        if stage != 1:
+            loss_dicts["planner"] = self.loss_planner(meta_pred, meta_oracle.detach())
+            loss_dicts["alignment"] = self.loss_align(z0.mean(dim=1), pooled)
+            moe_aux = getattr(self.moe, "last_aux_losses", None)
+            loss_dicts["moe"] = moe_aux if moe_aux else self.loss_moe(router_p, prior_p)
+            loss_dicts["causal"] = {
+                "loss_mechanism": causal_losses.get("predict", z0.new_tensor(0.0)),
+                "loss_dag": causal_losses.get("notears", z0.new_tensor(0.0)),
+                "loss_sparsity": causal_losses.get("sparsity", z0.new_tensor(0.0)),
+                "loss_smooth": causal_losses.get("smooth", z0.new_tensor(0.0)),
+                "loss_disentangle": causal_losses.get("disentangle", z0.new_tensor(0.0)),
+                "loss_causal": causal_losses.get("loss_causal", z0.new_tensor(0.0)),
+            }
+            scci_aux = getattr(self.injector, "last_aux_losses", None)
+            if scci_aux:
+                scci_loss = sum(v for k, v in scci_aux.items() if k.startswith("loss_"))
+                loss_dicts["scci"] = {**scci_aux, "loss_scci": scci_loss}
 
         weights = self._stage_weights(stage)
         total_loss, all_terms = compute_total_loss(loss_dicts, weights)

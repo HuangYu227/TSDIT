@@ -29,6 +29,10 @@ class CEncoder(nn.Module):
             nn.Linear(128, out_dim))
 
     def forward(self, c_data):  # c_data: (B, L, D_c) or (B, D_c)
+        if c_data.dim() == 2:
+            c_data = c_data.unsqueeze(1)  # (B, D_c) -> (B, 1, D_c)
+        elif c_data.dim() != 3:
+            raise ValueError(f"c_data must be (B,D) or (B,L,D), got {tuple(c_data.shape)}")
         B, L, D_c = c_data.shape
         c_flat = c_data.reshape(-1, D_c)            # (B * L, D_c)
         c_encoded = self.encoder(c_flat)         # (B * L, emb_dim)

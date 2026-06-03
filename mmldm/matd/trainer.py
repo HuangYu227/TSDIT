@@ -101,7 +101,7 @@ class MATDTrainer:
         self.log_interval = int(_cfg_get(config, "log_interval", 50))
         self.eval_interval = int(_cfg_get(config, "eval_interval", 10))
         self.best_metrics: dict[str, float] = {}
-        self.best_sota_count: int = 0
+        self.best_count: int = 0
 
         self.optimizer = self._build_optimizer()
         self.scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None
@@ -131,6 +131,7 @@ class MATDTrainer:
         if trainable_names is None:
             for p in self.model.parameters():
                 p.requires_grad = True
+            self._respect_freeze_policy()
             self.optimizer = self._build_optimizer()
             self._build_scheduler(stage_steps)
             return
@@ -138,8 +139,29 @@ class MATDTrainer:
             req = name in trainable_names
             for p in module.parameters():
                 p.requires_grad = req
+        self._respect_freeze_policy()
         self.optimizer = self._build_optimizer()
         self._build_scheduler(stage_steps)
+
+    def _respect_freeze_policy(self) -> None:
+        """Re-apply component-level freeze policies after _set_trainable.
+
+        _set_trainable(None) sets all params requires_grad=True, which
+        unfreezes the text encoder backbone that was intentionally frozen
+        at init time. This method re-freezes it.
+        """
+        cfg = getattr(self.model, "cfg", None)
+        if cfg is None:
+            return
+        text_frozen = getattr(cfg, "text_frozen", True)
+        if not text_frozen:
+            return
+        text_enc = getattr(self.model, "text_encoder", None)
+        if text_enc is not None:
+            backbone = getattr(text_enc, "encoder", None)
+            if backbone is not None:
+                for p in backbone.parameters():
+                    p.requires_grad = False
 
     def named_components(self) -> dict[str, nn.Module]:
         if hasattr(self.model, "submodules") and isinstance(getattr(self.model, "submodules"), dict):
@@ -240,9 +262,9 @@ class MATDTrainer:
             if stage in (0, 4) and evaluator is not None and (epoch + 1) % self.eval_interval == 0:
                 eval_results = evaluator.evaluate()
                 evaluator.print_results(eval_results)
-                sota_count = self._check_sota(eval_results, save_dir)
+                best_count = self._check_best_so_far(eval_results, save_dir)
                 metric_str = " ".join(f"{k}={v:.4f}" if isinstance(v, (int, float)) and v == v else f"{k}={v}" for k, v in eval_results.items() if v is not None)
-                logger.info("stage=%d epoch=%d eval SOTA=%d %s", stage, epoch, sota_count, metric_str)
+                logger.info("stage=%d epoch=%d eval best=%d %s", stage, epoch, best_count, metric_str)
         return history
 
     def train_all_stages(self, train_loaders: dict[int, torch.utils.data.DataLoader], epochs_per_stage: dict[int, int], val_loaders: Optional[dict[int, torch.utils.data.DataLoader]] = None, save_dir: Optional[str] = None, mix_ratio: float = 0.5, evaluator: Optional[Any] = None) -> dict[int, list[dict[str, float]]]:
@@ -275,13 +297,13 @@ class MATDTrainer:
             self.ema.restore(self.model)
         return {k: v / max(n, 1) for k, v in accum.items()}
 
-    def _check_sota(self, results: dict[str, Any], save_dir: Optional[str] = None) -> int:
-        """Check if current metrics are SOTA and save best checkpoint."""
+    def _check_best_so_far(self, results: dict[str, Any], save_dir: Optional[str] = None) -> int:
+        """Check if current metrics are best-so-far and save best checkpoint."""
         # Metrics where lower is better
         lower_better = {"MSE", "WAPE", "MDD", "KL", "MMD", "J-FTSD_text", "J-FTSD_planner", "J-FTSD_slots"}
         # Metrics where higher is better
         higher_better = {"MRR"}
-        sota_count = 0
+        best_count = 0
         improved = []
         for metric in lower_better | higher_better:
             val = results.get(metric)
@@ -296,25 +318,25 @@ class MATDTrainer:
                     self.best_metrics[metric] = val
                     improved.append(metric)
         # Count how many metrics are at their best
-        current_sota = 0
+        current_best = 0
         for metric in lower_better | higher_better:
             val = results.get(metric)
             if val is None or val != val:
                 continue
             if metric in lower_better and val <= self.best_metrics.get(metric, float("inf")):
-                current_sota += 1
+                current_best += 1
             elif metric in higher_better and val >= self.best_metrics.get(metric, float("-inf")):
-                current_sota += 1
+                current_best += 1
         if improved:
             logger.info("Improved metrics: %s", improved)
-        # Save best checkpoint if >= 3 metrics are SOTA
-        if current_sota >= 3 and current_sota > self.best_sota_count:
-            self.best_sota_count = current_sota
+        # Save best checkpoint if >= 3 metrics are best-so-far
+        if current_best >= 3 and current_best > self.best_count:
+            self.best_count = current_best
             if save_dir is not None:
                 best_path = os.path.join(save_dir, "best.pt")
                 self.save_checkpoint(best_path)
-                logger.info("Saved best checkpoint (%d SOTA metrics) to %s", current_sota, best_path)
-        return current_sota
+                logger.info("Saved best checkpoint (%d best-so-far metrics) to %s", current_best, best_path)
+        return current_best
 
     def save_checkpoint(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
