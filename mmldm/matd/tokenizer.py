@@ -279,11 +279,13 @@ class DensityAwareAdaptivePatchV2(nn.Module):
         hann = torch.hann_window(W, device=x.device, dtype=x.dtype)
         windows = windows * hann.view(1, 1, W)
         X = torch.fft.rfft(windows.float(), dim=-1)
-        P = X.abs().pow(2).to(x.dtype) + 1e-8
-        Pn = P / P.sum(dim=-1, keepdim=True)
-        entropy = -(Pn * Pn.log()).sum(dim=-1) / math.log(P.shape[-1])
+        P = X.abs().pow(2).to(x.dtype).clamp_min(1e-6)
+        P_sum = P.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        Pn = P / P_sum
+        entropy = -(Pn * Pn.clamp_min(1e-6).log()).sum(dim=-1) / math.log(P.shape[-1])
         hf_start = max(1, int(P.shape[-1] * 0.5))
-        hf_ratio = P[..., hf_start:].sum(dim=-1) / P.sum(dim=-1)
+        P_total = P.sum(dim=-1).clamp_min(1e-6)
+        hf_ratio = P[..., hf_start:].sum(dim=-1) / P_total
         win_score = entropy + 0.5 * hf_ratio
 
         score = torch.zeros(B, T, device=x.device, dtype=x.dtype)

@@ -1,4 +1,4 @@
-"""MATD decoder1: Partition-of-Unity Neural Field Decoder.
+"""MATD decoder2: Hybrid Residual Partition-of-Unity Decoder.
 
 Drop-in replacement for ``decoder.py``.
 
@@ -13,6 +13,11 @@ Compared with the earlier decoder, this version does not round each patch
 length and concatenate hard segments.  Instead, it evaluates a continuous
 per-patch neural field at every target time coordinate and blends patch fields
 with a differentiable partition-of-unity weight derived from metadata.
+
+The local field is a hybrid residual implicit network: a normalized SwiGLU
+branch for stable low/mid-frequency structure plus a small coordinate-only
+SIREN branch for peak/valley detail.  Both detail heads start at zero so the
+existing polynomial trend path remains the safe initial signal.
 """
 
 from __future__ import annotations
@@ -101,6 +106,118 @@ class DecoderTemporalAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Local field network
+# ---------------------------------------------------------------------------
+
+
+class SwiGLUResidualBlock(nn.Module):
+    """Pre-norm residual SwiGLU block."""
+
+    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.up = nn.Linear(dim, hidden_dim * 2)
+        self.drop = nn.Dropout(dropout)
+        self.down = nn.Linear(hidden_dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        a, b = self.up(h).chunk(2, dim=-1)
+        h = F.silu(a) * b
+        return x + self.down(self.drop(h))
+
+
+class SineLayer(nn.Module):
+    """SIREN-style sine layer with stable initialization."""
+
+    def __init__(self, in_dim: int, out_dim: int, omega_0: float = 30.0, is_first: bool = False) -> None:
+        super().__init__()
+        self.omega_0 = float(omega_0)
+        self.linear = nn.Linear(in_dim, out_dim)
+        self.reset_parameters(is_first=is_first)
+
+    def reset_parameters(self, is_first: bool = False) -> None:
+        with torch.no_grad():
+            if is_first:
+                bound = 1.0 / max(1, self.linear.in_features)
+            else:
+                bound = math.sqrt(6.0 / max(1, self.linear.in_features)) / self.omega_0
+            self.linear.weight.uniform_(-bound, bound)
+            self.linear.bias.uniform_(-bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sin(self.omega_0 * self.linear(x))
+
+
+class HybridResidualFieldNet(nn.Module):
+    """Patch-conditioned residual implicit field."""
+
+    def __init__(
+        self,
+        latent_dim: int,
+        meta_dim: int,
+        coord_dim: int,
+        hidden_dim: int,
+        dropout: float = 0.0,
+        n_blocks: int = 3,
+        siren_width: int | None = None,
+        siren_omega: float = 18.0,
+        siren_scale: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.siren_scale = float(siren_scale)
+
+        in_dim = latent_dim + meta_dim + coord_dim
+        self.in_norm = nn.LayerNorm(in_dim)
+        self.in_proj = nn.Linear(in_dim, hidden_dim)
+        self.blocks = nn.ModuleList(
+            [SwiGLUResidualBlock(hidden_dim, hidden_dim * 2, dropout=dropout) for _ in range(n_blocks)]
+        )
+
+        self.film = nn.Sequential(
+            nn.LayerNorm(latent_dim + meta_dim),
+            nn.Linear(latent_dim + meta_dim, hidden_dim * 2),
+        )
+
+        siren_width = siren_width or max(32, hidden_dim // 2)
+        self.siren = nn.Sequential(
+            SineLayer(coord_dim, siren_width, omega_0=siren_omega, is_first=True),
+            SineLayer(siren_width, siren_width, omega_0=siren_omega, is_first=False),
+            nn.Linear(siren_width, hidden_dim),
+        )
+
+        self.out = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.siren_out = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        nn.init.zeros_(self.out[-1].weight)
+        nn.init.zeros_(self.out[-1].bias)
+        nn.init.zeros_(self.siren_out[-1].weight)
+        nn.init.zeros_(self.siren_out[-1].bias)
+
+    def forward(self, z_ctx: torch.Tensor, meta: torch.Tensor, coord: torch.Tensor) -> torch.Tensor:
+        patch_cond = torch.cat([z_ctx, meta], dim=-1)
+        inp = torch.cat([z_ctx, meta, coord], dim=-1)
+        h = self.in_proj(self.in_norm(inp))
+
+        gamma, beta = self.film(patch_cond).chunk(2, dim=-1)
+        gamma = torch.tanh(gamma)
+        for block in self.blocks:
+            h = block(h)
+        h = h * (1.0 + gamma) + beta
+
+        siren_h = self.siren(coord)
+        return self.out(h) + self.siren_scale * self.siren_out(siren_h)
+
+
+# ---------------------------------------------------------------------------
 # Decoder
 # ---------------------------------------------------------------------------
 
@@ -128,10 +245,22 @@ class PartitionOfUnityPatchDecoder(nn.Module):
         density_weight: float = 0.15,
         chunk_size: int = 16,
         detail_scale: float = 0.5,
+        field_blocks: int = 3,
+        siren_omega: float = 18.0,
+        siren_scale: float = 0.1,
+        output_activation: str = "none",
     ) -> None:
         super().__init__()
         if meta_dim < 9:
             raise ValueError("meta_dim must be at least 9")
+        if field_blocks < 1:
+            raise ValueError("field_blocks must be >= 1")
+        if siren_omega <= 0:
+            raise ValueError("siren_omega must be positive")
+        if siren_scale < 0:
+            raise ValueError("siren_scale must be non-negative")
+        if output_activation not in ("none", "sigmoid", "clamp"):
+            raise ValueError("output_activation must be 'none', 'sigmoid' or 'clamp'")
         self.latent_dim = latent_dim
         self.meta_dim = meta_dim
         self.hidden_dim = hidden_dim
@@ -141,6 +270,7 @@ class PartitionOfUnityPatchDecoder(nn.Module):
         self.density_weight = float(density_weight)
         self.chunk_size = int(chunk_size)
         self.detail_scale = float(detail_scale)
+        self.output_activation = output_activation
 
         self.z_norm = nn.LayerNorm(latent_dim)
         self.meta_to_z = nn.Sequential(
@@ -152,17 +282,16 @@ class PartitionOfUnityPatchDecoder(nn.Module):
             [DecoderTemporalAttention(latent_dim, num_heads=context_heads, dropout=dropout) for _ in range(context_depth)]
         )
 
-        coord_dim = 2 * local_bands + 2 * global_bands + 4  # local/global raw coords too
-        in_dim = latent_dim + 9 + coord_dim
-
-        self.field_net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
+        coord_dim = 2 * local_bands + 2 * global_bands + 4
+        self.field_net = HybridResidualFieldNet(
+            latent_dim=latent_dim,
+            meta_dim=9,
+            coord_dim=coord_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            n_blocks=field_blocks,
+            siren_omega=siren_omega,
+            siren_scale=siren_scale,
         )
 
         self.trend_head = nn.Sequential(
@@ -262,8 +391,7 @@ class PartitionOfUnityPatchDecoder(nn.Module):
 
         z_e = z_ctx[:, None, :, :].expand(B, C, K, D)
         m_e = meta[:, None, :, :].expand(B, C, K, 9)
-        inp = torch.cat([z_e, m_e, coord], dim=-1)
-        detail = self.field_net(inp)
+        detail = self.field_net(z_e, m_e, coord)
 
         coeff = self.trend_head(torch.cat([z_ctx, meta], dim=-1))
         u = centered_local.unsqueeze(-1)
@@ -296,7 +424,12 @@ class PartitionOfUnityPatchDecoder(nn.Module):
             outputs.append(y)
 
         out = torch.cat(outputs, dim=1)
-        return out + self.output_calib(out)
+        out = out + self.output_calib(out)
+        if self.output_activation == "sigmoid":
+            out = torch.sigmoid(out)
+        elif self.output_activation == "clamp":
+            out = out.clamp(0.0, 1.0)
+        return out
 
     @torch.no_grad()
     def partition_weights(self, meta: torch.Tensor, target_length: int) -> torch.Tensor:

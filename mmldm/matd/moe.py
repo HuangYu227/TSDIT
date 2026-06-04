@@ -678,7 +678,11 @@ class SemanticCausalTemporalMoE(nn.Module):
             delta.index_add_(0, token_ids, weighted)
             dispatch_mask[token_ids, e_idx] = 1.0
 
-        self._set_aux_losses(router_p, prior_p, combined_logits, dispatch_mask, dropped, meta)
+        if self.training:
+            self._set_aux_losses(router_p, prior_p, combined_logits, dispatch_mask, dropped, meta)
+        else:
+            self.last_aux_losses = {"loss_moe": z.new_tensor(0.0)}
+            self.last_router_stats = {}
 
         z_out = z + self.residual_scale.to(z.dtype) * delta.reshape(B, K, D)
         return z_out, router_p, prior_p

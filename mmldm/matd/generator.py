@@ -12,6 +12,8 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 
+META_DIM = 9  # number of meta features sliced from planner output
+
 
 def _make_alpha_bar(num_steps: int, beta_start: float = 1e-4, beta_end: float = 0.02, schedule: str = "cosine", device: torch.device = torch.device("cpu")) -> torch.Tensor:
     if schedule == "cosine":
@@ -69,9 +71,14 @@ class MATDGenerator:
     @torch.no_grad()
     def _generate_from_modules(self, texts: list[str], target_length: int, K: Optional[int], ddim_steps: Optional[int], cfg_scale: Optional[float], eta: float, use_causal_guidance: Optional[bool]) -> torch.Tensor:
         m = self.module_dict
-        assert m is not None
+        if m is None:
+            raise RuntimeError("MATDGenerator: module_dict is None; use a dict-based model for _generate_from_modules")
         B = len(texts)
-        ddim_steps = int(ddim_steps or self.config.get("ddim_steps", 50))
+        if ddim_steps is None:
+            ddim_steps = int(self.config.get("ddim_steps", 50))
+        ddim_steps = int(ddim_steps)
+        if ddim_steps <= 0:
+            raise ValueError(f"ddim_steps must be positive, got {ddim_steps}")
         cfg_scale = float(cfg_scale if cfg_scale is not None else self.config.get("cfg_scale", 5.0))
         use_causal_guidance = bool(self.config.get("use_causal_guidance_in_sampling", True) if use_causal_guidance is None else use_causal_guidance)
         text_tokens, pooled, attention_mask = m["text_encoder"](texts)
@@ -85,32 +92,40 @@ class MATDGenerator:
             else:
                 K = self.default_k
         meta = m["planner"](text_tokens, text_padding_mask=text_mask, n_patches=K).to(self.device)
-        meta_9 = meta[..., :9]
+        meta_9 = meta[..., :META_DIM]
         denoiser = m["denoiser"]
         D = getattr(denoiser, "input_dim", self.config.get("embed_dim", 256))
         z = torch.randn(B, K, D, device=self.device)
         steps = torch.linspace(self.num_steps - 1, 0, ddim_steps, device=self.device).long()
+        steps_list = steps.tolist()  # avoid CUDA sync per step.item()
+        alpha_bar = self.alpha_bar.to(z.dtype)  # pre-convert once
 
-        for i, step in enumerate(steps):
-            t = torch.full((B,), int(step.item()), device=self.device, dtype=torch.long)
+        # CFG short-circuit: skip uncond forward when it has no effect
+        skip_uncond = (cfg_scale == 0.0) or (cfg_scale == 1.0 and not use_causal_guidance)
+
+        for i, step in enumerate(steps_list):
+            t = torch.full((B,), step, device=self.device, dtype=torch.long)
             causal_feat = None
             if use_causal_guidance and "causal" in m:
                 causal_feat = m["causal"](z, pooled, meta=meta_9)[0]
             eps_cond = denoiser(z, t, text_tokens, meta_9, pooled, causal_feat=causal_feat, text_padding_mask=text_mask)
-            eps_uncond = denoiser(z, t, null_tokens, meta_9, null_pooled, causal_feat=None, text_padding_mask=null_mask)
-            eps = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
-            ab_t = self.alpha_bar[step].to(z.dtype)
+            if skip_uncond:
+                eps = eps_cond
+            else:
+                eps_uncond = denoiser(z, t, null_tokens, meta_9, null_pooled, causal_feat=None, text_padding_mask=null_mask)
+                eps = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+            ab_t = alpha_bar[step]
             if self.prediction_type == "v":
                 x0_pred = ab_t.sqrt() * z - (1.0 - ab_t).sqrt() * eps
                 eps_pred = ab_t.sqrt() * eps + (1.0 - ab_t).sqrt() * z
             else:
                 x0_pred = (z - (1.0 - ab_t).sqrt() * eps) / ab_t.sqrt().clamp_min(1e-8)
                 eps_pred = eps
-            if i == len(steps) - 1:
+            if i == len(steps_list) - 1:
                 z = x0_pred
             else:
-                ab_next = self.alpha_bar[steps[i + 1]].to(z.dtype)
-                sigma = eta * ((1 - ab_next) / (1 - ab_t) * (1 - ab_t / ab_next)).clamp_min(0).sqrt()
+                ab_next = alpha_bar[steps_list[i + 1]]
+                sigma = eta * ((1 - ab_next).clamp_min(1e-8) / (1 - ab_t).clamp_min(1e-8) * (1 - ab_t / ab_next)).clamp_min(0).sqrt()
                 noise = torch.randn_like(z) if eta > 0 else 0.0
                 z = ab_next.sqrt() * x0_pred + (1.0 - ab_next - sigma ** 2).clamp_min(0).sqrt() * eps_pred + sigma * noise
         return m["decoder"](z, meta_9, target_length)

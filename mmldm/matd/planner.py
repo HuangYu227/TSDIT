@@ -168,12 +168,17 @@ class TextToPatchPlanner(nn.Module):
 
         # --- Mass & density prediction ---
         info_raw = self.info_head(hidden)  # (B, K, 2)
-        raw_mass, raw_density = info_raw.unbind(dim=-1)
+        raw_mass, raw_density_hint = info_raw.unbind(dim=-1)
 
-        mass = F.softplus(raw_mass)  # positive
+        # Keep planner metadata semantically consistent with the oracle
+        # tokenizer, where density is defined as mass / length.  The second
+        # info head output is retained as a small learned hint for mass so old
+        # checkpoints remain shape-compatible while all metadata channels stay
+        # self-consistent.
+        mass = F.softplus(raw_mass + 0.1 * torch.tanh(raw_density_hint))  # positive
         mass = mass / (mass.sum(dim=-1, keepdim=True) + 1e-8)  # sum=1
 
-        density = F.softplus(raw_density) + 1e-6  # positive + eps
+        density = mass / (length + 1e-6)
         log_density = torch.log(density + 1e-8)
 
         # --- Order: constant ramp ---

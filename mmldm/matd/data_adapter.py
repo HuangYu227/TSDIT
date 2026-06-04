@@ -2,8 +2,8 @@
 
 Provides :class:`MATDDataset` which wraps the same data sources used by
 :class:`mmldm.tiger.data.dataset.TIGERDataset` (CSV and weather_npy formats)
-but returns simplified ``(x0_tensor, text_str)`` pairs consumed by the MATD
-training loop.  Time series are normalised per-sample to [0, 1].
+but returns ``(x0_tensor, text_str, ts_min, ts_max)`` tuples consumed by
+the MATD training loop.  Time series are normalised per-sample to [0, 1].
 
 Also provides :class:`MATDDataModule` which assembles train / val / test
 DataLoaders with a padding collate function and configurable batch size.
@@ -13,9 +13,10 @@ Example::
     from mmldm.matd.data_adapter import MATDDataModule
 
     dm = MATDDataModule(data_dir="data/weather", batch_size=32)
-    for x0, texts in dm.train_dataloader():
+    for x0, texts, ts_mins, ts_maxs in dm.train_dataloader():
         # x0: (B, T) float tensor in [0, 1]
         # texts: list[str] of length B
+        # ts_mins, ts_maxs: (B,) float32 tensors for de-normalisation
         ...
 """
 
@@ -37,7 +38,7 @@ from torch.utils.data import Dataset, DataLoader
 
 
 class MATDDataset(Dataset):
-    """Time-series dataset returning (x0, text) pairs for MATD training.
+    """Time-series dataset returning (x0, text, ts_min, ts_max) tuples for MATD training.
 
     Supports two data formats inherited from TIGER:
 
@@ -88,6 +89,17 @@ class MATDDataset(Dataset):
             n = min(len(self.ts_data), max_samples)
             self.ts_data = self.ts_data[:n]
             self.caps = self.caps[:n]
+
+        # Check for NaN/Inf in raw data before normalisation
+        bad_mask = ~np.isfinite(self.ts_data)
+        if bad_mask.any():
+            bad_rows = np.unique(np.where(bad_mask)[0])
+            raise ValueError(
+                f"Raw time-series data contains {bad_mask.sum()} NaN/Inf "
+                f"value(s) across {len(bad_rows)} sample(s) (first bad "
+                f"indices: {bad_rows[:10].tolist()}). Clean the data before "
+                f"training."
+            )
 
         # Per-sample min-max normalisation to [0, 1]
         ts_min = self.ts_data.min(axis=1, keepdims=True)
@@ -158,11 +170,21 @@ class MATDDataset(Dataset):
 
         # Split: use 'split' column if available, otherwise random
         if "split" in df.columns:
-            split_map = {"train": "train", "val": "val", "test": "test"}
-            mask = df["split"].map(split_map).fillna("train") == self.split
+            valid_splits = {"train", "val", "test"}
+            unknown = set(df["split"].unique()) - valid_splits
+            if unknown:
+                raise ValueError(
+                    f"CSV 'split' column contains unexpected values: "
+                    f"{unknown}. Expected one of {valid_splits}."
+                )
+            mask = df["split"] == self.split
             idx = np.where(mask.values)[0]
         else:
             n = len(ts_data)
+            assert abs(sum(split_ratio) - 1.0) < 1e-6, (
+                f"split_ratio must sum to 1.0, got {sum(split_ratio):.6f} "
+                f"from {split_ratio}"
+            )
             rng = np.random.RandomState(seed)
             perm = rng.permutation(n)
             r_train, r_val, _r_test = split_ratio
@@ -185,17 +207,20 @@ class MATDDataset(Dataset):
     def __len__(self) -> int:
         return len(self.ts_data)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, str]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, str, float, float]:
         """Return a single sample.
 
         Args:
             idx: Sample index.
 
         Returns:
-            ``(x0, text)`` where ``x0`` is a float32 tensor of shape (T,)
-            normalised to [0, 1], and ``text`` is a caption string.
+            ``(x0, text, ts_min, ts_max)`` where ``x0`` is a float32
+            tensor of shape (T,) normalised to [0, 1], ``text`` is a
+            caption string, and ``ts_min``/``ts_max`` are the original-scale
+            bounds used for downstream de-normalisation.
         """
-        x0 = torch.from_numpy(self.ts_norm[idx])  # (T,)
+        # .clone() to avoid shared-memory corruption from in-place ops
+        x0 = torch.from_numpy(self.ts_norm[idx]).clone()  # (T,)
 
         # Random caption selection when multiple are available
         caps = self.caps[idx]
@@ -204,7 +229,10 @@ class MATDDataset(Dataset):
         else:
             text = str(caps)
 
-        return x0, text
+        ts_min = float(self.ts_min[idx])
+        ts_max = float(self.ts_max[idx])
+
+        return x0, text, ts_min, ts_max
 
 
 # ===========================================================================
@@ -213,27 +241,33 @@ class MATDDataset(Dataset):
 
 
 def matd_collate_fn(
-    batch: list[tuple[torch.Tensor, str]],
-) -> tuple[torch.Tensor, list[str]]:
-    """Collate (x0, text) pairs by padding sequences to the batch max length.
+    batch: list[tuple[torch.Tensor, str, float, float]],
+) -> tuple[torch.Tensor, list[str], torch.Tensor, torch.Tensor]:
+    """Collate (x0, text, ts_min, ts_max) tuples by padding to batch max length.
 
     All time series in a batch are right-padded with zeros to match the
     longest sequence.  This is a no-op when all series share the same
     length (the common case for fixed-interval datasets).
 
     Args:
-        batch: List of ``(x0_tensor (T_i,), text_str)`` tuples.
+        batch: List of ``(x0_tensor (T_i,), text_str, ts_min, ts_max)``
+            tuples as returned by :meth:`MATDDataset.__getitem__`.
 
     Returns:
-        ``(x0_padded, texts)`` where ``x0_padded`` is (B, T_max) and
-        ``texts`` is a list of B caption strings.
+        ``(x0_padded, texts, ts_mins, ts_maxs)`` where ``x0_padded`` is
+        (B, T_max), ``texts`` is a list of B caption strings, and
+        ``ts_mins`` / ``ts_maxs`` are (B,) float32 tensors carrying the
+        per-sample original-scale bounds for downstream de-normalisation.
     """
-    xs, texts = zip(*batch)
+    xs, texts, ts_mins, ts_maxs = zip(*batch)
+
+    ts_mins_t = torch.tensor(ts_mins, dtype=torch.float32)
+    ts_maxs_t = torch.tensor(ts_maxs, dtype=torch.float32)
 
     # All same length -- fast path (no padding needed)
     lengths = {x.shape[0] for x in xs}
     if len(lengths) == 1:
-        return torch.stack(xs), list(texts)
+        return torch.stack(xs), list(texts), ts_mins_t, ts_maxs_t
 
     # Pad to max length in this batch
     max_len = max(lengths)
@@ -244,7 +278,7 @@ def matd_collate_fn(
             x = torch.cat([x, pad], dim=0)
         padded.append(x)
 
-    return torch.stack(padded), list(texts)
+    return torch.stack(padded), list(texts), ts_mins_t, ts_maxs_t
 
 
 # ===========================================================================
@@ -280,7 +314,7 @@ class MATDDataModule:
 
         dm = MATDDataModule(data_dir="data/weather", batch_size=64)
         train_loader = dm.train_dataloader()
-        for x0, texts in train_loader:
+        for x0, texts, ts_mins, ts_maxs in train_loader:
             assert x0.ndim == 2  # (B, T)
             assert len(texts) == x0.shape[0]
     """

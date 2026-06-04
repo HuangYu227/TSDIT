@@ -301,7 +301,7 @@ def calculate_jftsd_baseline(
     gen: np.ndarray,
     condition: np.ndarray,
     device: str = "cuda",
-    emb_dim: int = 16,
+    emb_dim: int = 64,
     train_steps: int = 200,
     seed: int = 42,
 ) -> tuple[Optional[float], str, str]:
@@ -403,7 +403,7 @@ def calculate_jftsd_baseline(
         sigma_real = np.cov(z_real.T)
         sigma_gen = np.cov(z_gen.T)
 
-        eps = 1e-5
+        eps = 1e-6
         sigma_real += np.eye(sigma_real.shape[0]) * eps
         sigma_gen += np.eye(sigma_gen.shape[0]) * eps
 

@@ -112,11 +112,17 @@ class FFTLoss(nn.Module):
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
         pred = pred.float()
         target = target.float()
+        # T<=1: rfft yields only DC bin, no spectral information to compare
+        if pred.shape[1] <= 1:
+            z = pred.new_tensor(0.0)
+            return {"loss_fft": z}
         sp = torch.fft.rfft(pred, dim=1).abs()
         st = torch.fft.rfft(target, dim=1).abs()
         if self.log_magnitude:
-            sp = torch.log1p(sp)
-            st = torch.log1p(st)
+            # eps avoids exact-zero magnitudes (constant sequences) whose
+            # abs()-gradient is 0, starving the model of spectral signal.
+            sp = torch.log1p(sp + 1e-8)
+            st = torch.log1p(st + 1e-8)
         return {"loss_fft": F.l1_loss(sp, st)}
 
 

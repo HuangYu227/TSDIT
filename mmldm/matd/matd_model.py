@@ -126,6 +126,10 @@ class MATDConfig:
     decoder_local_bands: int = 8
     decoder_global_bands: int = 6
     decoder_chunk_size: int = 16
+    decoder_field_blocks: int = 3
+    decoder_siren_omega: float = 18.0
+    decoder_siren_scale: float = 0.1
+    decoder_output_activation: str = "none"
 
     # Diffusion
     timesteps: int = 1000
@@ -156,7 +160,7 @@ class MATDConfig:
     align_temperature: float = 0.07
     planner_beta: float = 1.0
     use_oracle_meta_prob: float = 1.0
-    use_causal_guidance_in_sampling: bool = True
+    use_causal_guidance_in_sampling: bool = False
 
 
 def _make_alpha_bar(num_steps: int, schedule: str = "cosine", beta_start: float = 1e-4, beta_end: float = 0.02) -> torch.Tensor:
@@ -183,6 +187,38 @@ class MATDModel(nn.Module):
         D = cfg.embed_dim
         text_work_dim = cfg.model_dim
 
+        # Validate all embed_dim / num_heads divisibility upfront so the
+        # user gets a clear error instead of a cryptic shape-mismatch deep
+        # inside a submodule constructor.
+        if D % cfg.encoder_num_heads != 0:
+            raise ValueError(
+                f"embed_dim={D} must be divisible by encoder_num_heads={cfg.encoder_num_heads}"
+            )
+        if D % cfg.planner_heads != 0:
+            raise ValueError(
+                f"embed_dim={D} must be divisible by planner_heads={cfg.planner_heads}"
+            )
+        if D % cfg.scci_heads != 0:
+            raise ValueError(
+                f"embed_dim={D} must be divisible by scci_heads={cfg.scci_heads}"
+            )
+        if cfg.dit_dim % cfg.dit_heads != 0:
+            raise ValueError(
+                f"dit_dim={cfg.dit_dim} must be divisible by dit_heads={cfg.dit_heads}"
+            )
+        if cfg.decoder_hidden % cfg.decoder_context_heads != 0:
+            raise ValueError(
+                f"decoder_hidden={cfg.decoder_hidden} must be divisible by "
+                f"decoder_context_heads={cfg.decoder_context_heads}"
+            )
+        # Causal module uses n_heads=4 by default (hardcoded, not in config).
+        _causal_default_heads = 4
+        if D % _causal_default_heads != 0:
+            raise ValueError(
+                f"embed_dim={D} must be divisible by the causal module's "
+                f"default n_heads={_causal_default_heads}"
+            )
+
         self.text_encoder = MATDTextEncoder(cfg.text_model, model_dim=text_work_dim, freeze=cfg.text_frozen, max_length=cfg.text_max_length)
         self.null_encoder = NullTextEncoder(dim=text_work_dim)
 
@@ -200,7 +236,20 @@ class MATDModel(nn.Module):
         self.causal = DynamicCausalMechanismLearner(dim=D, n_mech=cfg.n_mech, n_segments=cfg.n_segments, max_lag=cfg.max_lag, predict_weight=cfg.causal_predict_weight, dag_weight=cfg.causal_dag_weight, sparsity_weight=cfg.causal_sparsity_weight, smooth_weight=cfg.causal_smooth_weight, disentangle_weight=cfg.causal_disentangle_weight, return_segment_lag_graph=cfg.causal_return_segment_lag_graph)
         self.moe = SemanticCausalTemporalMoE(dim=D, meta_dim=9, n_experts=cfg.n_experts, top_k=cfg.top_k, hidden_mult=cfg.moe_hidden_mult, router_hidden_mult=cfg.moe_router_hidden_mult, dropout=cfg.moe_dropout, noisy_gating=cfg.moe_noisy_gating, capacity_factor_train=cfg.moe_capacity_factor_train, capacity_factor_eval=cfg.moe_capacity_factor_eval, prior_scale=cfg.moe_prior_scale, balance_weight=cfg.moe_balance_weight, z_loss_weight=cfg.moe_z_loss_weight, prior_kl_weight=cfg.moe_prior_kl_weight, smooth_weight=cfg.moe_router_smooth_weight, capacity_weight=cfg.moe_capacity_weight, residual_scale=cfg.moe_residual_scale)
         self.denoiser = T2PDenoiser(input_dim=D, output_dim=D, text_dim=text_work_dim, hidden_dim=cfg.dit_dim, n_heads=cfg.dit_heads, n_layers=cfg.dit_depth, mlp_expand=int(cfg.mlp_ratio), dropout=cfg.dit_dropout, qk_norm=cfg.dit_qk_norm, prediction_type="epsilon" if cfg.pred_mode == "eps" else cfg.pred_mode)
-        self.decoder = VariablePatchDecoder(latent_dim=D, meta_dim=9, hidden_dim=cfg.decoder_hidden, local_bands=getattr(cfg, 'decoder_local_bands', 8), global_bands=getattr(cfg, 'decoder_global_bands', 6), context_depth=getattr(cfg, 'decoder_context_depth', 1), context_heads=getattr(cfg, 'decoder_context_heads', 8), chunk_size=getattr(cfg, 'decoder_chunk_size', 16))
+        self.decoder = VariablePatchDecoder(
+            latent_dim=D,
+            meta_dim=9,
+            hidden_dim=cfg.decoder_hidden,
+            local_bands=getattr(cfg, "decoder_local_bands", 8),
+            global_bands=getattr(cfg, "decoder_global_bands", 6),
+            context_depth=getattr(cfg, "decoder_context_depth", 1),
+            context_heads=getattr(cfg, "decoder_context_heads", 8),
+            chunk_size=getattr(cfg, "decoder_chunk_size", 16),
+            field_blocks=getattr(cfg, "decoder_field_blocks", 3),
+            siren_omega=getattr(cfg, "decoder_siren_omega", 18.0),
+            siren_scale=getattr(cfg, "decoder_siren_scale", 0.1),
+            output_activation=getattr(cfg, "decoder_output_activation", "none"),
+        )
 
         self.register_buffer("alpha_bar", _make_alpha_bar(cfg.timesteps, cfg.beta_schedule), persistent=False)
         self.loss_diffusion = DiffusionLoss(min_snr_gamma=cfg.min_snr_gamma, prediction_type="epsilon" if cfg.pred_mode == "eps" else cfg.pred_mode)
@@ -245,20 +294,68 @@ class MATDModel(nn.Module):
     def _encode_text_cfg(self, texts: list[str], training: bool = True):
         token_hidden, pooled, attention_mask = self.text_encoder(texts)
         null_tokens, null_pooled = self.null_encoder(len(texts))
+        drop_mask = None
         if training and self.cfg.p_drop_text > 0:
-            mask = torch.rand(len(texts), device=pooled.device) < self.cfg.p_drop_text
-            if mask.any():
-                M = token_hidden.shape[1]
-                N = null_tokens.shape[1]
-                if N > M:
-                    nt = null_tokens[:, :M]
-                elif N < M:
-                    nt = F.pad(null_tokens, (0, 0, 0, M - N))
-                else:
-                    nt = null_tokens
-                token_hidden = torch.where(mask[:, None, None], nt, token_hidden)
-                pooled = torch.where(mask[:, None], null_pooled, pooled)
-        return token_hidden, pooled, null_tokens, null_pooled, attention_mask
+            drop_mask = torch.rand(len(texts), device=pooled.device) < self.cfg.p_drop_text
+        return token_hidden, pooled, null_tokens, null_pooled, attention_mask, drop_mask
+
+    def _denoise_train_with_cfg_dropout(
+        self,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        token_hidden: torch.Tensor,
+        pooled: torch.Tensor,
+        attention_mask: torch.Tensor,
+        null_tokens: torch.Tensor,
+        null_pooled: torch.Tensor,
+        meta_9: torch.Tensor,
+        causal_feat: Optional[torch.Tensor],
+        drop_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Denoiser forward with per-sample CFG dropout.
+
+        Planner, alignment, slots, and causal losses must always see the real
+        text condition.  CFG dropout is only for the denoiser branch, where a
+        dropped sample should match the inference-time unconditional branch:
+        null text tokens, null pooled text, and no causal feature.
+        """
+        text_key_padding_mask = attention_mask == 0
+        if drop_mask is None or not bool(drop_mask.any()):
+            return self.denoiser(
+                z_t, t, token_hidden, meta_9, pooled,
+                causal_feat=causal_feat,
+                text_padding_mask=text_key_padding_mask,
+            )
+
+        eps_pred = torch.empty_like(z_t)
+        keep_mask = ~drop_mask
+        if bool(keep_mask.any()):
+            eps_pred[keep_mask] = self.denoiser(
+                z_t[keep_mask],
+                t[keep_mask],
+                token_hidden[keep_mask],
+                meta_9[keep_mask],
+                pooled[keep_mask],
+                causal_feat=causal_feat[keep_mask] if causal_feat is not None else None,
+                text_padding_mask=text_key_padding_mask[keep_mask],
+            )
+
+        if bool(drop_mask.any()):
+            null_padding_mask = torch.zeros(
+                (int(drop_mask.sum().item()), null_tokens.shape[1]),
+                device=z_t.device,
+                dtype=torch.bool,
+            )
+            eps_pred[drop_mask] = self.denoiser(
+                z_t[drop_mask],
+                t[drop_mask],
+                null_tokens[drop_mask],
+                meta_9[drop_mask],
+                null_pooled[drop_mask],
+                causal_feat=None,
+                text_padding_mask=null_padding_mask,
+            )
+        return eps_pred
 
     def _encode_oracle(self, x0: torch.Tensor):
         x_in = x0.squeeze(-1) if x0.dim() == 3 and x0.shape[-1] == 1 else x0  # (B,T) or (B,T,C)
@@ -321,9 +418,10 @@ class MATDModel(nn.Module):
             scci=0.0,
         )
 
-    def forward_train(self, x0: torch.Tensor, texts: list[str], meta_override: Optional[torch.Tensor] = None, stage: int = 3) -> dict[str, Any]:
+    def forward_train(self, x0: torch.Tensor, texts: list[str], meta_override: Optional[torch.Tensor] = None, stage: int = 3, training: Optional[bool] = None) -> dict[str, Any]:
         B = x0.shape[0]
-        token_hidden, pooled, null_tokens, null_pooled, attention_mask = self._encode_text_cfg(texts, training=True)
+        training_mode = self.training if training is None else training
+        token_hidden, pooled, null_tokens, null_pooled, attention_mask, drop_mask = self._encode_text_cfg(texts, training=training_mode)
         text_key_padding_mask = attention_mask == 0
 
         z0, meta_oracle = self._encode_oracle(x0)
@@ -364,7 +462,18 @@ class MATDModel(nn.Module):
         else:
             noise = torch.randn_like(z_moe)
             z_t = self._q_sample(z_moe, t, noise)
-            eps_pred = self.denoiser(z_t, t, token_hidden, meta_9, pooled, causal_feat=causal_feat, text_padding_mask=text_key_padding_mask)
+            eps_pred = self._denoise_train_with_cfg_dropout(
+                z_t,
+                t,
+                token_hidden,
+                pooled,
+                attention_mask,
+                null_tokens,
+                null_pooled,
+                meta_9,
+                causal_feat,
+                drop_mask,
+            )
             if self.cfg.pred_mode == "v":
                 ab = self._extract(t, z_moe)
                 diff_target = ab.sqrt() * noise - (1.0 - ab).sqrt() * z_moe
@@ -477,7 +586,10 @@ class MATDModel(nn.Module):
             else:
                 next_step = steps[i + 1]
                 ab_next = self.alpha_bar.to(device=device, dtype=z.dtype)[next_step]
-                sigma = eta * ((1 - ab_next) / (1 - ab_t) * (1 - ab_t / ab_next)).clamp_min(0).sqrt()
+                sigma = eta * (
+                    (1 - ab_next) / (1 - ab_t).clamp_min(1e-8)
+                    * (1 - ab_t / ab_next)
+                ).clamp_min(0).sqrt()
                 noise = torch.randn_like(z) if eta > 0 else 0.0
                 z = ab_next.sqrt() * x0_pred + (1.0 - ab_next - sigma ** 2).clamp_min(0).sqrt() * eps_pred + sigma * noise
         x = self.decoder(z, meta_9, target_length)

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import torch
@@ -50,31 +50,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity between two 1-D vectors (flattened).
-
-    Matches T2S evaluation.py cosine_similarity: both inputs are
-    ``.ravel()``-ed before computing dot / (||a|| * ||b||).
-    """
-    a = np.asarray(a).ravel()
-    b = np.asarray(b).ravel()
-    dot = np.sum(a * b)
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return float(dot / (norm_a * norm_b))
-
-
 def calculate_mrr(
     ori_data: np.ndarray,
     gen_data: np.ndarray,
     k: int | None = None,
     threshold: float = 0.5,
 ) -> float:
-    """Mean Reciprocal Rank (T2S-compatible).
+    """Mean Reciprocal Rank (T2S-compatible, vectorised).
 
-    Exact reimplementation of ``T2S/evaluation.py calculate_mrr``.
+    Exact reimplementation of ``T2S/evaluation.py calculate_mrr`` using
+    numpy broadcasting instead of a Python for-loop.
 
     Args:
         ori_data: ``(B, T, dim)`` ground truth (raw scale).
@@ -90,22 +75,27 @@ def calculate_mrr(
     n_generations = gen_data.shape[3]
     k = n_generations if k is None else min(k, n_generations)
 
-    mrr_scores = np.zeros(n_batch)
-    for b in range(n_batch):
-        real = ori_data[b].flatten()
-        sims = []
-        for g in range(k):
-            gen = gen_data[b, :, :, g].flatten()
-            sims.append(_cosine_similarity(real, gen))
+    # Flatten to (B, D) and (B, K, D) where D = T * dim
+    real_flat = ori_data.reshape(n_batch, -1)                  # (B, D)
+    gen_flat = gen_data[:, :, :, :k].reshape(n_batch, k, -1)   # (B, K, D)
 
-        sorted_idx = np.argsort(sims)[::-1]
-        rank = None
-        for position, idx in enumerate(sorted_idx):
-            if sims[idx] > threshold:
-                rank = position + 1  # 1-indexed rank
-                break
-        mrr_scores[b] = 1.0 / rank if rank is not None else 0.0
+    # Cosine similarity via broadcasting: (B, K)
+    real_norm = np.linalg.norm(real_flat, axis=1, keepdims=True)   # (B, 1)
+    gen_norm = np.linalg.norm(gen_flat, axis=2)                     # (B, K)
+    dots = np.einsum('bi,bki->bk', real_flat, gen_flat)            # (B, K)
+    denom = real_norm * gen_norm                                    # (B, K)
+    sims = np.where(denom > 0, dots / denom, 0.0)                  # (B, K)
 
+    # Sort each sample's similarities descending
+    sorted_idx = np.argsort(-sims, axis=1)                          # (B, K)
+    sorted_sims = np.take_along_axis(sims, sorted_idx, axis=1)     # (B, K)
+
+    # Find first rank whose similarity exceeds the threshold
+    above = sorted_sims > threshold                                 # (B, K)
+    has_relevant = np.any(above, axis=1)                            # (B,)
+    first_rank = np.argmax(above, axis=1)                           # (B,)  [0 if none]
+
+    mrr_scores = np.where(has_relevant, 1.0 / (first_rank + 1), 0.0)
     return float(np.mean(mrr_scores))
 
 
@@ -140,6 +130,7 @@ class MATDEvaluator:
         n_samples_per_text: int = 10,
         cfg_scale: float | None = None,
         ddim_steps: int | None = None,
+        eta: float = 0.0,
     ) -> None:
         self.model = model
         self.dm = data_module
@@ -147,10 +138,105 @@ class MATDEvaluator:
         self.n_samples = n_samples_per_text
         self.cfg_scale = cfg_scale
         self.ddim_steps = ddim_steps
+        self.eta = float(eta)
 
     # ------------------------------------------------------------------
     #  Helpers
     # ------------------------------------------------------------------
+
+    def _generate_from_cache(
+        self,
+        text_tokens: torch.Tensor,
+        pooled: torch.Tensor,
+        attention_mask: torch.Tensor,
+        meta_9: torch.Tensor,
+        null_tokens: torch.Tensor,
+        null_pooled: torch.Tensor,
+        null_padding_mask: torch.Tensor,
+        text_key_padding_mask: torch.Tensor,
+        target_length: int,
+    ) -> torch.Tensor:
+        """Generate one sample per text, reusing cached encoder outputs.
+
+        This mirrors ``MATDModel.generate`` but accepts pre-computed text
+        encoder, planner, and null-encoder outputs so that only the
+        stochastic DDIM loop + decoder run per invocation.
+
+        Args:
+            text_tokens: ``(B, S, D)`` token hidden states from text encoder.
+            pooled: ``(B, text_dim)`` pooled text representation.
+            attention_mask: ``(B, S)`` attention mask from text encoder.
+            meta_9: ``(B, K, 9)`` planner metadata (first 9 dims).
+            null_tokens: ``(B, S', D)`` null-encoder token hidden states.
+            null_pooled: ``(B, text_dim)`` null-encoder pooled output.
+            null_padding_mask: ``(B, S')`` all-False mask for null encoder.
+            text_key_padding_mask: ``(B, S)`` padding mask from attention_mask.
+            target_length: Target output sequence length.
+
+        Returns:
+            ``(B, T, 1)`` generated time series (normalised scale).
+        """
+        model = self.model
+        device = self.device
+        B = text_tokens.shape[0]
+
+        cfg_scale = (
+            model.cfg.cfg_scale if self.cfg_scale is None else self.cfg_scale
+        )
+        ddim_steps = (
+            model.cfg.ddim_steps if self.ddim_steps is None else self.ddim_steps
+        )
+        use_causal_guidance = model.cfg.use_causal_guidance_in_sampling
+
+        K_patches = meta_9.shape[1]
+        D = model.cfg.embed_dim
+        z = torch.randn(B, K_patches, D, device=device)
+        steps = torch.linspace(
+            model.cfg.timesteps - 1, 0, ddim_steps, device=device
+        ).long()
+
+        for i, step in enumerate(steps):
+            t = torch.full((B,), int(step.item()), device=device, dtype=torch.long)
+            causal_feat = None
+            if use_causal_guidance:
+                causal_feat = model.causal(z, pooled, meta=meta_9)[0]
+            eps_cond = model.denoiser(
+                z, t, text_tokens, meta_9, pooled,
+                causal_feat=causal_feat,
+                text_padding_mask=text_key_padding_mask,
+            )
+            eps_uncond = model.denoiser(
+                z, t, null_tokens, meta_9, null_pooled,
+                causal_feat=None,
+                text_padding_mask=null_padding_mask,
+            )
+            eps = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+
+            ab_t = model.alpha_bar.to(device=device, dtype=z.dtype)[step]
+            if model.cfg.pred_mode == "v":
+                x0_pred = ab_t.sqrt() * z - (1.0 - ab_t).sqrt() * eps
+                eps_pred = ab_t.sqrt() * eps + (1.0 - ab_t).sqrt() * z
+            else:
+                x0_pred = (z - (1.0 - ab_t).sqrt() * eps) / ab_t.sqrt().clamp_min(1e-8)
+                eps_pred = eps
+            if i == len(steps) - 1:
+                z = x0_pred
+            else:
+                next_step = steps[i + 1]
+                ab_next = model.alpha_bar.to(device=device, dtype=z.dtype)[next_step]
+                eta = self.eta
+                sigma = eta * (
+                    (1 - ab_next) / (1 - ab_t).clamp_min(1e-8)
+                    * (1 - ab_t / ab_next)
+                ).clamp_min(0).sqrt()
+                noise = torch.randn_like(z) if eta > 0 else 0.0
+                z = (
+                    ab_next.sqrt() * x0_pred
+                    + (1.0 - ab_next - sigma ** 2).clamp_min(0).sqrt() * eps_pred
+                    + sigma * noise
+                )
+
+        return model.decoder(z, meta_9, target_length)
 
     @staticmethod
     def _denormalize(
@@ -168,7 +254,9 @@ class MATDEvaluator:
         Returns:
             ``(N, T)`` raw-scale time series.
         """
-        return x_norm * (ts_max - ts_min)[:, None] + ts_min[:, None]
+        # Clip range to match data_adapter normalisation (1e-8 floor).
+        ts_range = np.clip(ts_max - ts_min, a_min=1e-8, a_max=None)
+        return x_norm * ts_range[:, None] + ts_min[:, None]
 
     # ------------------------------------------------------------------
     #  Core evaluation
@@ -203,7 +291,7 @@ class MATDEvaluator:
         test_ds = self.dm.test_ds
         test_loader = DataLoader(
             test_ds,
-            batch_size=64,
+            batch_size=self.dm.batch_size,
             shuffle=False,
             collate_fn=matd_collate_fn,
         )
@@ -214,10 +302,11 @@ class MATDEvaluator:
         all_text_embed = []    # list of (B, text_dim)
         all_planner_meta = []  # list of (B, K, 9)
         all_scci_slots = []    # list of (B, n_slots, D)
-        sample_offset = 0
 
         for batch in test_loader:
-            x0_norm, texts = batch[0], batch[1]
+            x0_norm, texts, ts_mins, ts_maxs = (
+                batch[0], batch[1], batch[2], batch[3]
+            )
             x0_norm = x0_norm.to(self.device)
             B = x0_norm.shape[0]
             T = x0_norm.shape[1]
@@ -241,37 +330,43 @@ class MATDEvaluator:
                 token_hidden, text_padding_mask=text_padding_mask
             )
 
+            # Pre-compute null encoder + planner meta_9 once (deterministic)
+            null_tokens, null_pooled = self.model.null_encoder(B)
+            null_padding_mask = torch.zeros(
+                null_tokens.shape[:2], device=self.device, dtype=torch.bool
+            )
+            meta_9 = planner_meta[..., :9]
+
             # Only keep the first 9 meta dims (consistent with decoder)
             all_text_embed.append(pooled.detach().cpu())               # (B, text_dim)
-            all_planner_meta.append(planner_meta[..., :9].detach().cpu())  # (B, K, 9)
+            all_planner_meta.append(meta_9.detach().cpu())             # (B, K, 9)
             all_scci_slots.append(scci_slots.detach().cpu())           # (B, n_slots, D)
 
             # -- Generate K independent samples per text --
+            # Reuse cached text encoder, planner, and null encoder outputs
+            # to avoid K redundant text-encoder + planner forward passes.
             gen_k_list: list[np.ndarray] = []
             for _k in range(self.n_samples):
-                gen = self.model.generate(
-                    texts,
+                gen = self._generate_from_cache(
+                    token_hidden, pooled, attention_mask,
+                    meta_9, null_tokens, null_pooled,
+                    null_padding_mask, text_padding_mask,
                     target_length=T,
-                    cfg_scale=self.cfg_scale,
-                    ddim_steps=self.ddim_steps,
                 )  # (B, T, 1)
                 gen_k_list.append(gen.squeeze(-1).cpu().numpy())  # (B, T)
 
-            # Denormalize ground truth
-            idx_s = sample_offset
-            idx_e = sample_offset + B
+            # Denormalize using batch-level ts_min/ts_max from collate_fn
+            batch_ts_min = ts_mins.numpy()
+            batch_ts_max = ts_maxs.numpy()
+
             real_raw = self._denormalize(
-                x0_norm.cpu().numpy(),
-                test_ds.ts_min[idx_s:idx_e],
-                test_ds.ts_max[idx_s:idx_e],
+                x0_norm.cpu().numpy(), batch_ts_min, batch_ts_max,
             )  # (B, T)
 
             # Denormalize all K generations
             for k_idx in range(self.n_samples):
                 gen_k_list[k_idx] = self._denormalize(
-                    gen_k_list[k_idx],
-                    test_ds.ts_min[idx_s:idx_e],
-                    test_ds.ts_max[idx_s:idx_e],
+                    gen_k_list[k_idx], batch_ts_min, batch_ts_max,
                 )
 
             # Collect
@@ -280,8 +375,6 @@ class MATDEvaluator:
             gen_k_batch = gen_k_batch[:, :, np.newaxis, :]  # (B, T, 1, K)
             all_gen_k.append(gen_k_batch)
             all_real_raw.append(real_raw)
-
-            sample_offset += B
 
         # Concatenate all batches
         real_raw = np.concatenate(all_real_raw, axis=0)          # (N, T)

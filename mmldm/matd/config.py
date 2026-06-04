@@ -114,6 +114,10 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     "decoder_local_bands": 8,
     "decoder_global_bands": 6,
     "decoder_chunk_size": 16,
+    "decoder_field_blocks": 3,
+    "decoder_siren_omega": 18.0,
+    "decoder_siren_scale": 0.1,
+    "decoder_output_activation": "none",
 
     # -----------------------------------------------------------------------
     # Diffusion schedule
@@ -161,7 +165,7 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     # -----------------------------------------------------------------------
     # Sampling
     # -----------------------------------------------------------------------
-    "use_causal_guidance_in_sampling": True,
+    "use_causal_guidance_in_sampling": False,
     "planner_beta": 1.0,
     "align_temperature": 0.07,
 }

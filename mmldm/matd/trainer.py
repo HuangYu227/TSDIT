@@ -39,6 +39,7 @@ class EMA:
 
     def __init__(self, model: nn.Module, decay: float = 0.9999) -> None:
         self.decay = decay
+        self.num_updates = 0
         self.shadow = {name: p.detach().clone() for name, p in model.named_parameters() if p.requires_grad}
         self.backup: dict[str, torch.Tensor] = {}
 
@@ -47,6 +48,7 @@ class EMA:
         for name, p in model.named_parameters():
             if p.requires_grad and name in self.shadow:
                 self.shadow[name].mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+        self.num_updates += 1
 
     def apply(self, model: nn.Module) -> None:
         self.backup = {}
@@ -62,10 +64,11 @@ class EMA:
         self.backup = {}
 
     def state_dict(self) -> dict[str, Any]:
-        return {"decay": self.decay, "shadow": self.shadow}
+        return {"decay": self.decay, "num_updates": self.num_updates, "shadow": self.shadow}
 
     def load_state_dict(self, sd: dict[str, Any]) -> None:
         self.decay = sd["decay"]
+        self.num_updates = sd.get("num_updates", 0)
         self.shadow = sd["shadow"]
 
 
@@ -126,6 +129,14 @@ class MATDTrainer:
         self.scheduler = _cosine_warmup_scheduler(self.optimizer, warmup, total_steps, min_lr_ratio)
 
     def _set_trainable(self, trainable_names: Optional[set[str]], stage_steps: Optional[int] = None) -> None:
+        """Set which components are trainable and rebuild optimizer/scheduler.
+
+        Note: rebuilding the optimizer intentionally discards Adam momentum
+        (first/second moment estimates) from the previous stage.  This is
+        acceptable because each training stage targets a different subset of
+        parameters with a fresh scheduler, so carrying over momentum from a
+        different parameter group would be counter-productive.
+        """
         if stage_steps is None:
             stage_steps = int(_cfg_get(self.config, "total_steps", 100000))
         if trainable_names is None:
@@ -201,23 +212,28 @@ class MATDTrainer:
         if torch.is_tensor(grad_norm) and not torch.isfinite(grad_norm.detach()):
             logger.warning("stage=%d step=%d non-finite grad_norm=%s; skipping optimizer step", stage, self.global_step, grad_norm.detach().item())
             self.optimizer.zero_grad(set_to_none=True)
-            if self.grad_scaler.is_enabled():
-                self.grad_scaler.update(max(self.grad_scaler.get_scale() * 0.5, 1.0))
+            # Trust PyTorch's built-in GradScaler backoff: update() with no
+            # prior step() already reduces the scale on inf/nan, so a manual
+            # halving is redundant and can conflict with the internal cooldown.
+            self.grad_scaler.update()
             metrics["grad_norm"] = float("nan")
             metrics["skipped_step"] = 1.0
             return metrics
-        old_scale = self.grad_scaler.get_scale() if self.grad_scaler.is_enabled() else 1.0
+        # PyTorch's GradScaler.step() internally skips the optimizer when
+        # inf/nan gradients are detected, and update() already handles the
+        # scale backoff.  We trust this mechanism rather than inferring step
+        # execution from scale changes, which PyTorch warns against.
         self.grad_scaler.step(self.optimizer)
         self.grad_scaler.update()
-        new_scale = self.grad_scaler.get_scale() if self.grad_scaler.is_enabled() else old_scale
-        optimizer_stepped = (not self.grad_scaler.is_enabled()) or new_scale >= old_scale
-        if self.scheduler is not None and self.global_step > 0 and optimizer_stepped:
-            self.scheduler.step()
-        if self.ema is not None and optimizer_stepped:
+        if self.ema is not None:
             self.ema.update(self.model)
         self.global_step += 1
+        # LambdaLR tolerates being stepped even when the optimizer was
+        # internally skipped by GradScaler, so always advance the schedule.
+        if self.scheduler is not None:
+            self.scheduler.step()
         metrics["grad_norm"] = float(grad_norm.detach().item()) if torch.is_tensor(grad_norm) else float(grad_norm)
-        metrics["skipped_step"] = 0.0 if optimizer_stepped else 1.0
+        metrics["skipped_step"] = 0.0
         return metrics
 
     def train_stage(self, dataloader: torch.utils.data.DataLoader, epochs: int, stage: int = 3, val_dataloader: Optional[torch.utils.data.DataLoader] = None, evaluator: Optional[Any] = None, save_dir: Optional[str] = None, save_best_every: int = 10, patience: int = 0) -> list[dict[str, float]]:
@@ -240,6 +256,7 @@ class MATDTrainer:
         no_improve = 0
         for epoch in range(epochs):
             accum: dict[str, float] = {}
+            counts: dict[str, int] = {}
             n = 0
             skipped = 0
             desc = f"epoch{epoch}" if stage == 0 else f"stage{stage}-epoch{epoch}"
@@ -247,7 +264,9 @@ class MATDTrainer:
             for batch in pbar:
                 metrics = self.train_step(batch, stage=stage)
                 for k, v in metrics.items():
-                    accum[k] = accum.get(k, 0.0) + v
+                    if math.isfinite(v):
+                        accum[k] = accum.get(k, 0.0) + v
+                        counts[k] = counts.get(k, 0) + 1
                 n += 1
                 if metrics.get("skipped_step", 0.0) > 0:
                     skipped += 1
@@ -255,8 +274,10 @@ class MATDTrainer:
                     pbar.set_postfix(loss_total=f"{metrics.get('loss_total', 0.0):.5f}")
                 if self.global_step % self.log_interval == 0:
                     logger.info("stage=%d step=%d loss_total=%.5f", stage, self.global_step, metrics.get("loss_total", 0.0))
-            avg = {k: v / max(n, 1) for k, v in accum.items()}
+            avg = {k: v / max(counts.get(k, 0), 1) for k, v in accum.items()}
             avg["epoch"] = float(epoch)
+            avg["num_batches"] = float(n)
+            avg["num_skipped"] = float(skipped)
             history.append(avg)
             train_loss = avg.get("loss_total", float("inf"))
             logger.info("stage=%d epoch=%d train_loss=%.5f", stage, epoch, train_loss)
@@ -282,7 +303,13 @@ class MATDTrainer:
                         break
             # Run evaluation every eval_interval epochs (stage 0 joint or stage 4 finetune)
             if stage in (0, 4) and evaluator is not None and (epoch + 1) % self.eval_interval == 0:
-                eval_results = evaluator.evaluate()
+                if self.ema is not None:
+                    self.ema.apply(self.model)
+                try:
+                    eval_results = evaluator.evaluate()
+                finally:
+                    if self.ema is not None:
+                        self.ema.restore(self.model)
                 evaluator.print_results(eval_results)
                 best_count = self._check_best_so_far(eval_results, save_dir)
                 metric_str = " ".join(f"{k}={v:.4f}" if isinstance(v, (int, float)) and v == v else f"{k}={v}" for k, v in eval_results.items() if v is not None)
@@ -303,21 +330,23 @@ class MATDTrainer:
     def validate(self, dataloader: torch.utils.data.DataLoader, stage: int = 3) -> dict[str, float]:
         if self.ema is not None:
             self.ema.apply(self.model)
-        self.model.eval()
-        accum: dict[str, float] = {}
-        n = 0
-        for batch in dataloader:
-            x0, texts = batch[:2]
-            x0 = x0.to(self.device)
-            with autocast(enabled=self.use_amp and self.device.type == "cuda"):
-                out = self.model.forward_train(x0, list(texts), stage=stage)
-            for k, v in out.get("loss_terms", {}).items():
-                if torch.is_tensor(v):
-                    accum[k] = accum.get(k, 0.0) + float(v.detach().item())
-            n += 1
-        if self.ema is not None:
-            self.ema.restore(self.model)
-        return {k: v / max(n, 1) for k, v in accum.items()}
+        try:
+            self.model.eval()
+            accum: dict[str, float] = {}
+            n = 0
+            for batch in dataloader:
+                x0, texts = batch[:2]
+                x0 = x0.to(self.device)
+                with autocast(enabled=self.use_amp and self.device.type == "cuda"):
+                    out = self.model.forward_train(x0, list(texts), stage=stage, training=False)
+                for k, v in out.get("loss_terms", {}).items():
+                    if torch.is_tensor(v):
+                        accum[k] = accum.get(k, 0.0) + float(v.detach().item())
+                n += 1
+            return {k: v / max(n, 1) for k, v in accum.items()}
+        finally:
+            if self.ema is not None:
+                self.ema.restore(self.model)
 
     def _check_best_so_far(self, results: dict[str, Any], save_dir: Optional[str] = None) -> int:
         """Check if current metrics are best-so-far and save best checkpoint."""

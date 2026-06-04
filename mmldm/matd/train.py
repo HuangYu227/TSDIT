@@ -48,14 +48,51 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=None,
                         help="Epochs for single-stage training (overrides default per-stage epochs)")
     parser.add_argument("--no_causal_guidance", action="store_true",
-                        help="Disable causal guidance during inference/sampling")
+                        help="Disable causal guidance during inference/sampling (kept for compatibility)")
+    parser.add_argument("--causal_guidance", action="store_true",
+                        help="Enable sampling-time causal guidance")
+    parser.add_argument("--cfg_scale", type=float, default=None,
+                        help="Override classifier-free guidance scale (default: 5.0)")
+    parser.add_argument("--ddim_steps", type=int, default=None,
+                        help="Override DDIM sampling steps used by evaluation (default: 50)")
+    parser.add_argument("--eta", type=float, default=0.0,
+                        help="DDIM eta used by evaluation sampling (default: 0.0)")
+    parser.add_argument("--p_drop_text", type=float, default=None,
+                        help="Override CFG text dropout probability during denoiser training")
+    parser.add_argument("--use_oracle_meta_prob", type=float, default=None,
+                        help="Probability of using oracle patch metadata during training")
     parser.add_argument("--lambda_x0", type=float, default=None,
                         help="Override reconstruction loss weight (default: 0.2)")
+    parser.add_argument("--lambda_delta", type=float, default=None,
+                        help="Override temporal delta loss weight (default: 0.1)")
     parser.add_argument("--lambda_fft", type=float, default=None,
                         help="Override FFT loss weight (default: 0.05)")
+    parser.add_argument("--lambda_plan", type=float, default=None,
+                        help="Override planner loss weight (default: 0.5)")
+    parser.add_argument("--lambda_align", type=float, default=None,
+                        help="Override text/time-series alignment loss weight (default: 0.05)")
+    parser.add_argument("--lambda_moe", type=float, default=None,
+                        help="Override MoE auxiliary loss weight (default: 0.01)")
+    parser.add_argument("--lambda_causal", type=float, default=None,
+                        help="Override causal auxiliary loss weight (default: 0.01)")
+    parser.add_argument("--lambda_scci", type=float, default=None,
+                        help="Override SCCI auxiliary loss weight (default: 0.0)")
+    parser.add_argument("--lambda_latent_anchor", type=float, default=None,
+                        help="Override latent anchor loss weight (default: 0.01)")
     parser.add_argument("--min_snr_gamma", type=float, default=None,
                         help="Override Min-SNR gamma (default: 5.0)")
+    parser.add_argument("--decoder_field_blocks", type=int, default=None,
+                        help="Override hybrid decoder residual field blocks (default: 3)")
+    parser.add_argument("--decoder_siren_omega", type=float, default=None,
+                        help="Override hybrid decoder SIREN omega (default: 18.0)")
+    parser.add_argument("--decoder_siren_scale", type=float, default=None,
+                        help="Override hybrid decoder SIREN residual scale (default: 0.1)")
+    parser.add_argument("--decoder_output_activation", type=str, default=None,
+                        choices=["none", "sigmoid", "clamp"],
+                        help="Optional decoder output activation/range diagnostic")
     args = parser.parse_args()
+    if args.no_causal_guidance and args.causal_guidance:
+        parser.error("--no_causal_guidance and --causal_guidance are mutually exclusive")
 
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
@@ -73,20 +110,34 @@ def main() -> None:
         n_segments=8,
         min_tokens=8,
         timesteps=1000,
-        ddim_steps=50,
+        ddim_steps=50 if args.ddim_steps is None else args.ddim_steps,
         lr=args.lr,
         batch_size=args.batch_size,
         total_steps=args.total_steps,
         warmup_steps=args.warmup_steps,
         log_interval=14,
-        use_causal_guidance_in_sampling=not args.no_causal_guidance,
+        use_causal_guidance_in_sampling=bool(args.causal_guidance),
     )
-    if args.lambda_x0 is not None:
-        cfg_overrides["lambda_x0"] = args.lambda_x0
-    if args.lambda_fft is not None:
-        cfg_overrides["lambda_fft"] = args.lambda_fft
-    if args.min_snr_gamma is not None:
-        cfg_overrides["min_snr_gamma"] = args.min_snr_gamma
+    optional_overrides = {
+        "cfg_scale": args.cfg_scale,
+        "p_drop_text": args.p_drop_text,
+        "use_oracle_meta_prob": args.use_oracle_meta_prob,
+        "lambda_x0": args.lambda_x0,
+        "lambda_delta": args.lambda_delta,
+        "lambda_fft": args.lambda_fft,
+        "lambda_plan": args.lambda_plan,
+        "lambda_align": args.lambda_align,
+        "lambda_moe": args.lambda_moe,
+        "lambda_causal": args.lambda_causal,
+        "lambda_scci": args.lambda_scci,
+        "lambda_latent_anchor": args.lambda_latent_anchor,
+        "min_snr_gamma": args.min_snr_gamma,
+        "decoder_field_blocks": args.decoder_field_blocks,
+        "decoder_siren_omega": args.decoder_siren_omega,
+        "decoder_siren_scale": args.decoder_siren_scale,
+        "decoder_output_activation": args.decoder_output_activation,
+    }
+    cfg_overrides.update({k: v for k, v in optional_overrides.items() if v is not None})
     cfg = MATDConfig(**cfg_overrides)
 
     dm = MATDDataModule(
@@ -116,6 +167,7 @@ def main() -> None:
         n_samples_per_text=10,
         cfg_scale=cfg.cfg_scale,
         ddim_steps=cfg.ddim_steps,
+        eta=args.eta,
     )
 
     if args.stage == "0":

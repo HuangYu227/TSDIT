@@ -244,7 +244,7 @@ class T2PDenoiser(nn.Module):
         self.timestep_mlp = nn.Sequential(nn.Linear(sinusoidal_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
         self.input_proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
         self.causal_token_proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
-        self.causal_pool_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.causal_pool_proj = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
         self.global_cond_mlp = nn.Sequential(nn.Linear(hidden_dim + text_dim + hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
         self.blocks = nn.ModuleList([
             TextTemporalDiTBlock(hidden_dim, text_dim, n_heads, mlp_expand, num_buckets, max_rel_dist, use_density_bias, use_causal_bias, dropout, qk_norm, norm_eps)
