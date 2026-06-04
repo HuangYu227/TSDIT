@@ -165,7 +165,7 @@ class MATDConfig:
     align_temperature: float = 0.07
     planner_beta: float = 1.0
     use_oracle_meta_prob: float = 0.0
-    use_causal_guidance_in_sampling: bool = False
+    use_causal_guidance_in_sampling: bool = True
 
 
 def _make_alpha_bar(num_steps: int, schedule: str = "cosine", beta_start: float = 1e-4, beta_end: float = 0.02) -> torch.Tensor:
