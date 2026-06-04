@@ -1,12 +1,9 @@
-"""Losses for high-standard MATD training.
+"""Losses for MATD training.
 
-This file keeps the same public loss class names as the current framework while
-adding production-grade details needed by the upgraded causal/SCCI/MoE/DiT
-pipeline:
-- optional Min-SNR diffusion weighting;
-- robust reconstruction/delta/FFT losses;
-- alignment loss with safe batch-size handling;
-- generic loss combiner compatible with both flat and nested configs.
+Simplified to 3 loss groups:
+- DiffusionLoss: noise/velocity prediction with optional Min-SNR weighting
+- ReconstructionLoss: L1 + MSE reconstruction from clean latent
+- ConsistencyLoss: decoder trained on noisy latent to close train/inference gap
 """
 from __future__ import annotations
 
@@ -80,6 +77,38 @@ class ReconstructionLoss(nn.Module):
         l1 = F.l1_loss(pred, target)
         mse = F.mse_loss(pred, target)
         return {"loss_recon_l1": l1, "loss_recon_mse": mse, "loss_recon": l1 + self.lambda_mse * mse}
+
+
+class ConsistencyLoss(nn.Module):
+    """Train decoder on noisy latent to close train/inference gap.
+
+    During inference the decoder receives DDIM-denoised latent (with residual
+    error), but during training it only ever sees the clean encoder output.
+    This loss bridges that gap by also decoding the noisy latent z_t and
+    encouraging both outputs to match the ground truth and each other.
+    """
+
+    def forward(
+        self,
+        z_t: torch.Tensor,
+        z_moe: torch.Tensor,
+        meta_9: torch.Tensor,
+        target_len: int,
+        x0_seq: torch.Tensor,
+        decoder: nn.Module,
+    ) -> dict[str, torch.Tensor]:
+        x_from_noisy = decoder(z_t, meta_9, target_len)
+        x_from_clean = decoder(z_moe, meta_9, target_len)
+        loss_noisy = F.mse_loss(x_from_noisy, x0_seq)
+        loss_clean = F.mse_loss(x_from_clean, x0_seq)
+        loss_consistency = F.mse_loss(x_from_noisy, x_from_clean.detach())
+        total = loss_noisy + loss_clean + 0.5 * loss_consistency
+        return {
+            "loss_consistency_noisy": loss_noisy,
+            "loss_consistency_clean": loss_clean,
+            "loss_consistency_align": loss_consistency,
+            "loss_consistency": total,
+        }
 
 
 class DeltaLoss(nn.Module):
@@ -216,15 +245,7 @@ class CausalLosses(nn.Module):
 class LossWeights:
     diffusion: float = 1.0
     reconstruction: float = 0.0
-    latent_anchor: float = 0.0
-    delta: float = 0.0
-    fft: float = 0.0
-    density_weighted: float = 0.0
-    alignment: float = 0.0
-    moe: float = 0.0
-    causal: float = 0.0
-    planner: float = 0.0
-    scci: float = 0.0
+    consistency: float = 0.0
 
 
 def weights_from_config(config: dict) -> LossWeights:
@@ -235,14 +256,7 @@ def weights_from_config(config: dict) -> LossWeights:
     return LossWeights(
         diffusion=config.get("lambda_diffusion", 1.0),
         reconstruction=config.get("lambda_x0", config.get("lambda_recon", 0.2)),
-        latent_anchor=config.get("lambda_latent_anchor", 0.01),
-        delta=config.get("lambda_delta", 0.1),
-        fft=config.get("lambda_fft", 0.05),
-        alignment=config.get("lambda_align", 0.05),
-        moe=config.get("lambda_moe", 0.01),
-        causal=config.get("lambda_causal", 0.01),
-        planner=config.get("lambda_plan", 0.5),
-        scci=config.get("lambda_scci", 0.0),
+        consistency=config.get("lambda_consistency", 0.5),
     )
 
 
@@ -261,15 +275,7 @@ def compute_total_loss(loss_dicts: dict[str, dict[str, torch.Tensor]], weights: 
     group_spec = [
         ("diffusion", weights.diffusion, "loss_diffusion"),
         ("reconstruction", weights.reconstruction, "loss_recon"),
-        ("latent_anchor", weights.latent_anchor, "loss_latent_anchor"),
-        ("delta", weights.delta, "loss_delta"),
-        ("fft", weights.fft, "loss_fft"),
-        ("density_weighted", weights.density_weighted, "loss_density_weighted"),
-        ("alignment", weights.alignment, "loss_align"),
-        ("moe", weights.moe, "loss_moe"),
-        ("causal", weights.causal, "loss_causal"),
-        ("planner", weights.planner, "loss_planner"),
-        ("scci", weights.scci, "loss_scci"),
+        ("consistency", weights.consistency, "loss_consistency"),
     ]
     for group_name, w, agg_key in group_spec:
         sub = loss_dicts.get(group_name)

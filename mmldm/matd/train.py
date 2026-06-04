@@ -63,22 +63,8 @@ def main() -> None:
                         help="Probability of using oracle patch metadata during training")
     parser.add_argument("--lambda_x0", type=float, default=None,
                         help="Override reconstruction loss weight (default: 0.2)")
-    parser.add_argument("--lambda_delta", type=float, default=None,
-                        help="Override temporal delta loss weight (default: 0.1)")
-    parser.add_argument("--lambda_fft", type=float, default=None,
-                        help="Override FFT loss weight (default: 0.05)")
-    parser.add_argument("--lambda_plan", type=float, default=None,
-                        help="Override planner loss weight (default: 0.5)")
-    parser.add_argument("--lambda_align", type=float, default=None,
-                        help="Override text/time-series alignment loss weight (default: 0.05)")
-    parser.add_argument("--lambda_moe", type=float, default=None,
-                        help="Override MoE auxiliary loss weight (default: 0.01)")
-    parser.add_argument("--lambda_causal", type=float, default=None,
-                        help="Override causal auxiliary loss weight (default: 0.01)")
-    parser.add_argument("--lambda_scci", type=float, default=None,
-                        help="Override SCCI auxiliary loss weight (default: 0.0)")
-    parser.add_argument("--lambda_latent_anchor", type=float, default=None,
-                        help="Override latent anchor loss weight (default: 0.01)")
+    parser.add_argument("--lambda_consistency", type=float, default=None,
+                        help="Override consistency loss weight (default: 0.5)")
     parser.add_argument("--min_snr_gamma", type=float, default=None,
                         help="Override Min-SNR gamma (default: 5.0)")
     parser.add_argument("--decoder_field_blocks", type=int, default=None,
@@ -123,14 +109,7 @@ def main() -> None:
         "p_drop_text": args.p_drop_text,
         "use_oracle_meta_prob": args.use_oracle_meta_prob,
         "lambda_x0": args.lambda_x0,
-        "lambda_delta": args.lambda_delta,
-        "lambda_fft": args.lambda_fft,
-        "lambda_plan": args.lambda_plan,
-        "lambda_align": args.lambda_align,
-        "lambda_moe": args.lambda_moe,
-        "lambda_causal": args.lambda_causal,
-        "lambda_scci": args.lambda_scci,
-        "lambda_latent_anchor": args.lambda_latent_anchor,
+        "lambda_consistency": args.lambda_consistency,
         "min_snr_gamma": args.min_snr_gamma,
         "decoder_field_blocks": args.decoder_field_blocks,
         "decoder_siren_omega": args.decoder_siren_omega,

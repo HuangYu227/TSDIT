@@ -22,12 +22,9 @@ from .causal import DynamicCausalMechanismLearner
 from .decoder import VariablePatchDecoder
 from .dit import T2PDenoiser
 from .losses import (
-    AlignmentLoss,
-    DeltaLoss,
+    ConsistencyLoss,
     DiffusionLoss,
-    FFTLoss,
     LossWeights,
-    MoELosses,
     ReconstructionLoss,
     compute_total_loss,
 )
@@ -136,17 +133,10 @@ class MATDConfig:
     beta_schedule: str = "cosine"
     ddim_steps: int = 50
 
-    # Loss weights
+    # Loss weights (simplified to 3)
     lambda_diffusion: float = 1.0
     lambda_x0: float = 0.2
-    lambda_delta: float = 0.1
-    lambda_fft: float = 0.05
-    lambda_plan: float = 0.5
-    lambda_align: float = 0.05
-    lambda_moe: float = 0.01
-    lambda_causal: float = 0.01
-    lambda_scci: float = 0.0
-    lambda_latent_anchor: float = 0.01
+    lambda_consistency: float = 0.5
 
     # Optimizer / CFG
     lr: float = 1e-4
@@ -159,7 +149,7 @@ class MATDConfig:
     cfg_scale: float = 5.0
     align_temperature: float = 0.07
     planner_beta: float = 1.0
-    use_oracle_meta_prob: float = 1.0
+    use_oracle_meta_prob: float = 0.5
     use_causal_guidance_in_sampling: bool = False
 
 
@@ -254,11 +244,7 @@ class MATDModel(nn.Module):
         self.register_buffer("alpha_bar", _make_alpha_bar(cfg.timesteps, cfg.beta_schedule), persistent=False)
         self.loss_diffusion = DiffusionLoss(min_snr_gamma=cfg.min_snr_gamma, prediction_type="epsilon" if cfg.pred_mode == "eps" else cfg.pred_mode)
         self.loss_recon = ReconstructionLoss(lambda_mse=0.5)
-        self.loss_delta = DeltaLoss()
-        self.loss_fft = FFTLoss()
-        self.loss_align = AlignmentLoss(temperature=cfg.align_temperature)
-        self.loss_planner = PlannerLoss(beta=cfg.planner_beta)
-        self.loss_moe = MoELosses(n_experts=cfg.n_experts)
+        self.loss_consistency = ConsistencyLoss()
 
     @property
     def submodules(self) -> dict[str, nn.Module]:
@@ -368,56 +354,35 @@ class MATDModel(nn.Module):
 
     def _stage_weights(self, stage: int) -> LossWeights:
         """Return loss weights tuned for each training stage."""
-        if stage == 0:  # joint training — all components at once
-            return LossWeights(
-                diffusion=self.cfg.lambda_diffusion,
-                reconstruction=self.cfg.lambda_x0,  # now stable: x_hat vs x0_seq
-                latent_anchor=self.cfg.lambda_latent_anchor,
-                delta=self.cfg.lambda_delta,
-                fft=self.cfg.lambda_fft,
-                alignment=self.cfg.lambda_align,
-                moe=self.cfg.lambda_moe,
-                causal=self.cfg.lambda_causal,
-                planner=self.cfg.lambda_plan,
-                scci=self.cfg.lambda_scci,
-            )
-        if stage == 1:  # autoencoder: encoder + decoder only
-            return LossWeights(
-                diffusion=0.0, reconstruction=1.0, latent_anchor=0.01,
-                delta=0.1, fft=0.05,
-                alignment=0.0, moe=0.0, causal=0.0, planner=0.0, scci=0.0,
-            )
-        if stage == 2:  # planner + alignment + SCCI
-            return LossWeights(
-                diffusion=0.0, reconstruction=0.0, latent_anchor=0.0,
-                delta=0.0, fft=0.0,
-                alignment=0.05, moe=0.0, causal=0.0, planner=1.0, scci=0.01,
-            )
-        if stage == 4:  # joint finetune — everything at full strength
+        if stage == 0:  # joint training
             return LossWeights(
                 diffusion=self.cfg.lambda_diffusion,
                 reconstruction=self.cfg.lambda_x0,
-                latent_anchor=self.cfg.lambda_latent_anchor,
-                delta=self.cfg.lambda_delta,
-                fft=self.cfg.lambda_fft,
-                alignment=self.cfg.lambda_align,
-                moe=self.cfg.lambda_moe,
-                causal=self.cfg.lambda_causal,
-                planner=self.cfg.lambda_plan,
-                scci=self.cfg.lambda_scci,
+                consistency=self.cfg.lambda_consistency,
             )
-        # stage 3 (default): oracle-meta diffusion with soft reconstruction
+        if stage == 1:  # autoencoder: encoder + decoder only
+            return LossWeights(
+                diffusion=0.0,
+                reconstruction=1.0,
+                consistency=0.0,
+            )
+        if stage == 2:  # planner (no dedicated loss; planner trains via reconstruction gradient)
+            return LossWeights(
+                diffusion=0.0,
+                reconstruction=1.0,
+                consistency=0.0,
+            )
+        if stage == 4:  # joint finetune
+            return LossWeights(
+                diffusion=self.cfg.lambda_diffusion,
+                reconstruction=self.cfg.lambda_x0,
+                consistency=self.cfg.lambda_consistency,
+            )
+        # stage 3 (default): diffusion with soft reconstruction + consistency
         return LossWeights(
             diffusion=self.cfg.lambda_diffusion,
             reconstruction=self.cfg.lambda_x0 * 0.5,
-            latent_anchor=self.cfg.lambda_latent_anchor * 0.5,
-            delta=0.0,
-            fft=0.0,
-            alignment=0.0,
-            moe=0.0,
-            causal=0.0,
-            planner=0.0,
-            scci=0.0,
+            consistency=self.cfg.lambda_consistency * 0.5,
         )
 
     def forward_train(self, x0: torch.Tensor, texts: list[str], meta_override: Optional[torch.Tensor] = None, stage: int = 3, training: Optional[bool] = None) -> dict[str, Any]:
@@ -490,36 +455,19 @@ class MATDModel(nn.Module):
         if stage != 1:
             loss_dicts["diffusion"] = self.loss_diffusion(eps_pred, diff_target, t=t, alpha_bar=self.alpha_bar)
 
-        # Stable reconstruction: x_hat (decoded from clean z_moe) vs x0_seq (ground truth)
-        # Replaces unstable x0_hat reconstruction that explodes at high timesteps
+        # Reconstruction: decoder output from clean latent vs ground truth
         ts_recon = self.loss_recon(x_hat, x0_seq)
-        latent_anchor = F.smooth_l1_loss(z_moe, z0.detach())
         loss_dicts["reconstruction"] = {
             "loss_ts_recon_l1": ts_recon.get("loss_recon_l1", torch.tensor(0.0, device=x0.device)),
             "loss_ts_recon_mse": ts_recon.get("loss_recon_mse", torch.tensor(0.0, device=x0.device)),
             "loss_recon": ts_recon["loss_recon"],
         }
-        loss_dicts["latent_anchor"] = {"loss_latent_anchor": latent_anchor}
 
-        loss_dicts["delta"] = self.loss_delta(x_hat, x0_seq)
-        loss_dicts["fft"] = self.loss_fft(x_hat, x0_seq)
-        if stage != 1:
-            loss_dicts["planner"] = self.loss_planner(meta_pred, meta_oracle.detach())
-            loss_dicts["alignment"] = self.loss_align(z0.mean(dim=1), pooled)
-            moe_aux = getattr(self.moe, "last_aux_losses", None)
-            loss_dicts["moe"] = moe_aux if moe_aux else self.loss_moe(router_p, prior_p)
-            loss_dicts["causal"] = {
-                "loss_mechanism": causal_losses.get("predict", z0.new_tensor(0.0)),
-                "loss_dag": causal_losses.get("notears", z0.new_tensor(0.0)),
-                "loss_sparsity": causal_losses.get("sparsity", z0.new_tensor(0.0)),
-                "loss_smooth": causal_losses.get("smooth", z0.new_tensor(0.0)),
-                "loss_disentangle": causal_losses.get("disentangle", z0.new_tensor(0.0)),
-                "loss_causal": causal_losses.get("loss_causal", z0.new_tensor(0.0)),
-            }
-            scci_aux = getattr(self.injector, "last_aux_losses", None)
-            if scci_aux:
-                scci_loss = sum(v for k, v in scci_aux.items() if k.startswith("loss_"))
-                loss_dicts["scci"] = {**scci_aux, "loss_scci": scci_loss}
+        # Consistency: decoder trained on noisy latent to close train/inference gap
+        if stage != 1 and z_t is not None:
+            loss_dicts["consistency"] = self.loss_consistency(
+                z_t, z_moe, meta_9, target_len, x0_seq, self.decoder,
+            )
 
         weights = self._stage_weights(stage)
         total_loss, all_terms = compute_total_loss(loss_dicts, weights)
@@ -539,12 +487,6 @@ class MATDModel(nn.Module):
             "meta": meta,
             "token_hidden": token_hidden,
             "pooled": pooled,
-            "router_p": router_p,
-            "prior_p": prior_p,
-            "causal_feat": causal_feat,
-            "A0": A0,
-            "Alags": Alags,
-            "slot_attn": slot_attn,
         }
 
     @torch.no_grad()
