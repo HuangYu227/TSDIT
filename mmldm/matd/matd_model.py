@@ -22,15 +22,15 @@ from .causal import DynamicCausalMechanismLearner
 from .decoder import VariablePatchDecoder
 from .dit import T2PDenoiser
 from .losses import (
-    ConsistencyLoss,
-    DiffusionLoss,
+    AdaptivePatchFieldLoss,
+    CausalSemanticRouterLoss,
+    LatentDiffusionBridgeLoss,
     LossWeights,
-    ReconstructionLoss,
+    TextLayoutLoss,
     compute_total_loss,
 )
-from .losses import weights_from_config
 from .moe import SemanticCausalTemporalMoE
-from .planner import PlannerLoss, TextToPatchPlanner
+from .planner import TextToPatchPlanner
 from .scci import SemanticCausalConditionInjector, TextSemanticSlotExtractor
 from .text_encoder import MATDTextEncoder, NullTextEncoder
 
@@ -133,10 +133,25 @@ class MATDConfig:
     beta_schedule: str = "cosine"
     ddim_steps: int = 50
 
-    # Loss weights (simplified to 3)
+    # Loss weights (v2: 4 groups)
     lambda_diffusion: float = 1.0
     lambda_x0: float = 0.2
-    lambda_consistency: float = 0.5
+    lambda_plan: float = 0.5
+
+    # Sub-loss weights: LatentDiffusionBridgeLoss
+    lambda_latent_x0: float = 0.25
+    lambda_latent_cos: float = 0.05
+
+    # Sub-loss weights: AdaptivePatchFieldLoss
+    lambda_delta: float = 0.10
+    lambda_curvature: float = 0.05
+    lambda_fft: float = 0.05
+    lambda_range: float = 0.02
+
+    # Sub-loss weights: CausalSemanticRouterLoss
+    lambda_causal: float = 0.01
+    lambda_moe: float = 0.01
+    lambda_scci: float = 0.0
 
     # Optimizer / CFG
     lr: float = 1e-4
@@ -149,7 +164,7 @@ class MATDConfig:
     cfg_scale: float = 5.0
     align_temperature: float = 0.07
     planner_beta: float = 1.0
-    use_oracle_meta_prob: float = 0.5
+    use_oracle_meta_prob: float = 0.0
     use_causal_guidance_in_sampling: bool = False
 
 
@@ -242,9 +257,23 @@ class MATDModel(nn.Module):
         )
 
         self.register_buffer("alpha_bar", _make_alpha_bar(cfg.timesteps, cfg.beta_schedule), persistent=False)
-        self.loss_diffusion = DiffusionLoss(min_snr_gamma=cfg.min_snr_gamma, prediction_type="epsilon" if cfg.pred_mode == "eps" else cfg.pred_mode)
-        self.loss_recon = ReconstructionLoss(lambda_mse=0.5)
-        self.loss_consistency = ConsistencyLoss()
+        self.loss_diffusion_bridge = LatentDiffusionBridgeLoss(
+            min_snr_gamma=cfg.min_snr_gamma,
+            latent_x0_weight=cfg.lambda_latent_x0,
+            latent_cos_weight=cfg.lambda_latent_cos,
+        )
+        self.loss_patch_field = AdaptivePatchFieldLoss(
+            delta_weight=cfg.lambda_delta,
+            curvature_weight=cfg.lambda_curvature,
+            fft_weight=cfg.lambda_fft,
+            range_weight=cfg.lambda_range,
+        )
+        self.loss_text_layout = TextLayoutLoss()
+        self.loss_mechanism = CausalSemanticRouterLoss(
+            causal_weight=cfg.lambda_causal,
+            moe_weight=cfg.lambda_moe,
+            scci_weight=cfg.lambda_scci,
+        )
 
     @property
     def submodules(self) -> dict[str, nn.Module]:
@@ -356,33 +385,38 @@ class MATDModel(nn.Module):
         """Return loss weights tuned for each training stage."""
         if stage == 0:  # joint training
             return LossWeights(
-                diffusion=self.cfg.lambda_diffusion,
-                reconstruction=self.cfg.lambda_x0,
-                consistency=self.cfg.lambda_consistency,
+                diffusion_bridge=self.cfg.lambda_diffusion,
+                patch_field=self.cfg.lambda_x0,
+                text_layout=self.cfg.lambda_plan,
+                mechanism=1.0,
             )
         if stage == 1:  # autoencoder: encoder + decoder only
             return LossWeights(
-                diffusion=0.0,
-                reconstruction=1.0,
-                consistency=0.0,
+                diffusion_bridge=0.0,
+                patch_field=1.0,
+                text_layout=0.0,
+                mechanism=0.0,
             )
-        if stage == 2:  # planner (no dedicated loss; planner trains via reconstruction gradient)
+        if stage == 2:  # planner + autoencoder
             return LossWeights(
-                diffusion=0.0,
-                reconstruction=1.0,
-                consistency=0.0,
+                diffusion_bridge=0.0,
+                patch_field=1.0,
+                text_layout=self.cfg.lambda_plan,
+                mechanism=0.0,
             )
         if stage == 4:  # joint finetune
             return LossWeights(
-                diffusion=self.cfg.lambda_diffusion,
-                reconstruction=self.cfg.lambda_x0,
-                consistency=self.cfg.lambda_consistency,
+                diffusion_bridge=self.cfg.lambda_diffusion,
+                patch_field=self.cfg.lambda_x0,
+                text_layout=self.cfg.lambda_plan,
+                mechanism=1.0,
             )
-        # stage 3 (default): diffusion with soft reconstruction + consistency
+        # stage 3 (default): diffusion with soft reconstruction
         return LossWeights(
-            diffusion=self.cfg.lambda_diffusion,
-            reconstruction=self.cfg.lambda_x0 * 0.5,
-            consistency=self.cfg.lambda_consistency * 0.5,
+            diffusion_bridge=self.cfg.lambda_diffusion,
+            patch_field=self.cfg.lambda_x0 * 0.5,
+            text_layout=self.cfg.lambda_plan * 0.5,
+            mechanism=0.5,
         )
 
     def forward_train(self, x0: torch.Tensor, texts: list[str], meta_override: Optional[torch.Tensor] = None, stage: int = 3, training: Optional[bool] = None) -> dict[str, Any]:
@@ -394,13 +428,17 @@ class MATDModel(nn.Module):
         z0, meta_oracle = self._encode_oracle(x0)
         K = z0.shape[1]
         meta_pred = self.planner(token_hidden, text_padding_mask=text_key_padding_mask, n_patches=K)
-        use_oracle = (torch.rand((), device=z0.device).item() < self.cfg.use_oracle_meta_prob)
+        # Stage-aware meta selection: Stage 1 forces oracle to avoid polluting
+        # autoencoder warm-up with untrained planner predictions.
         if meta_override is not None:
             meta = meta_override.to(z0.device)
-        elif use_oracle:
+        elif stage == 1:
             meta = meta_oracle.detach()
-        else:
+        elif stage in (2, 4):
             meta = meta_pred
+        else:
+            use_oracle = (torch.rand((), device=z0.device).item() < self.cfg.use_oracle_meta_prob)
+            meta = meta_oracle.detach() if use_oracle else meta_pred
         meta_9 = meta[..., :9].to(z0.dtype)
 
         # Stage 1 pure autoencoder: skip causal/SCCI/MoE, use z0 directly
@@ -412,21 +450,26 @@ class MATDModel(nn.Module):
             slot_attn = None
             router_p = prior_p = None
         else:
-            t = torch.randint(0, self.cfg.timesteps, (B,), device=z0.device, dtype=torch.long)
-            t_emb = self.denoiser.timestep_embed(t)
+            # Construct clean latent with fixed t=0 so z_moe is deterministic
+            # for the same input.  Random diffusion t is sampled later for denoising.
+            clean_t = torch.zeros((B,), device=z0.device, dtype=torch.long)
+            clean_t_emb = self.denoiser.timestep_embed(clean_t)
             slots = self.slot_extractor(token_hidden, text_padding_mask=text_key_padding_mask)
             causal_feat, A0, Alags, causal_losses = self.causal(z0, pooled, meta=meta_9)
-            z_cond, slot_attn, text_cond = self.injector(z0, meta_9, slots, t_emb, causal_feat)
-            t_emb_k = t_emb.unsqueeze(1).expand(-1, K, -1)
-            z_moe, router_p, prior_p = self.moe(z_cond, meta_9, text_cond, t_emb_k, causal_feat)
+            z_cond, slot_attn, text_cond = self.injector(z0, meta_9, slots, clean_t_emb, causal_feat)
+            clean_t_emb_k = clean_t_emb.unsqueeze(1).expand(-1, K, -1)
+            z_moe, router_p, prior_p = self.moe(z_cond, meta_9, text_cond, clean_t_emb_k, causal_feat)
 
         # Stage 1: pure autoencoder, no diffusion
         if stage == 1:
             noise = None
             z_t = None
+            t = None
             eps_pred = None
             diff_target = None
         else:
+            # Sample diffusion timestep AFTER constructing clean latent
+            t = torch.randint(0, self.cfg.timesteps, (B,), device=z0.device, dtype=torch.long)
             noise = torch.randn_like(z_moe)
             z_t = self._q_sample(z_moe, t, noise)
             eps_pred = self._denoise_train_with_cfg_dropout(
@@ -452,22 +495,30 @@ class MATDModel(nn.Module):
         x0_seq = x0.unsqueeze(-1) if x0.dim() == 2 else x0  # ensure (B,T,C)
 
         loss_dicts: dict[str, dict[str, torch.Tensor]] = {}
-        if stage != 1:
-            loss_dicts["diffusion"] = self.loss_diffusion(eps_pred, diff_target, t=t, alpha_bar=self.alpha_bar)
 
-        # Reconstruction: decoder output from clean latent vs ground truth
-        ts_recon = self.loss_recon(x_hat, x0_seq)
-        loss_dicts["reconstruction"] = {
-            "loss_ts_recon_l1": ts_recon.get("loss_recon_l1", torch.tensor(0.0, device=x0.device)),
-            "loss_ts_recon_mse": ts_recon.get("loss_recon_mse", torch.tensor(0.0, device=x0.device)),
-            "loss_recon": ts_recon["loss_recon"],
-        }
-
-        # Consistency: decoder trained on noisy latent to close train/inference gap
-        if stage != 1 and z_t is not None:
-            loss_dicts["consistency"] = self.loss_consistency(
-                z_t, z_moe, meta_9, target_len, x0_seq, self.decoder,
+        # 1) Diffusion bridge: denoising + pred-x0 latent alignment
+        if stage != 1 and eps_pred is not None and z_t is not None:
+            loss_dicts["diffusion_bridge"] = self.loss_diffusion_bridge(
+                eps_pred, diff_target,
+                z_t=z_t, z_clean=z_moe,
+                t=t, alpha_bar=self.alpha_bar,
+                prediction_type="v" if self.cfg.pred_mode == "v" else "eps",
             )
+
+        # 2) Patch field: shape-aware decoder reconstruction
+        loss_dicts["patch_field"] = self.loss_patch_field(x_hat, x0_seq)
+
+        # 3) Text layout: planner learns to match oracle layout (no gradient to encoder)
+        loss_dicts["text_layout"] = self.loss_text_layout(meta_pred, meta_oracle.detach())
+
+        # 4) Mechanism: causal + SCCI + MoE auxiliary
+        loss_dicts["mechanism"] = self.loss_mechanism(
+            causal_losses=causal_losses if causal_losses else None,
+            moe_aux_losses=getattr(self.moe, "last_aux_losses", None),
+            scci_aux_losses=getattr(self.injector, "last_aux_losses", None),
+            router_p=router_p,
+            prior_p=prior_p,
+        )
 
         weights = self._stage_weights(stage)
         total_loss, all_terms = compute_total_loss(loss_dicts, weights)
@@ -487,6 +538,9 @@ class MATDModel(nn.Module):
             "meta": meta,
             "token_hidden": token_hidden,
             "pooled": pooled,
+            "router_p": router_p,
+            "prior_p": prior_p,
+            "causal_losses": causal_losses,
         }
 
     @torch.no_grad()

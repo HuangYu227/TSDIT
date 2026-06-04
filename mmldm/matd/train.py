@@ -61,10 +61,22 @@ def main() -> None:
                         help="Override CFG text dropout probability during denoiser training")
     parser.add_argument("--use_oracle_meta_prob", type=float, default=None,
                         help="Probability of using oracle patch metadata during training")
+    parser.add_argument("--lambda_diffusion", type=float, default=None,
+                        help="Override diffusion bridge group weight (default: 1.0)")
     parser.add_argument("--lambda_x0", type=float, default=None,
-                        help="Override reconstruction loss weight (default: 0.2)")
-    parser.add_argument("--lambda_consistency", type=float, default=None,
-                        help="Override consistency loss weight (default: 0.5)")
+                        help="Override patch field group weight (default: 0.2)")
+    parser.add_argument("--lambda_plan", type=float, default=None,
+                        help="Override text layout group weight (default: 0.5)")
+    # Sub-loss weights
+    parser.add_argument("--lambda_latent_x0", type=float, default=None)
+    parser.add_argument("--lambda_latent_cos", type=float, default=None)
+    parser.add_argument("--lambda_delta", type=float, default=None)
+    parser.add_argument("--lambda_curvature", type=float, default=None)
+    parser.add_argument("--lambda_fft", type=float, default=None)
+    parser.add_argument("--lambda_range", type=float, default=None)
+    parser.add_argument("--lambda_causal", type=float, default=None)
+    parser.add_argument("--lambda_moe", type=float, default=None)
+    parser.add_argument("--lambda_scci", type=float, default=None)
     parser.add_argument("--min_snr_gamma", type=float, default=None,
                         help="Override Min-SNR gamma (default: 5.0)")
     parser.add_argument("--decoder_field_blocks", type=int, default=None,
@@ -108,9 +120,21 @@ def main() -> None:
         "cfg_scale": args.cfg_scale,
         "p_drop_text": args.p_drop_text,
         "use_oracle_meta_prob": args.use_oracle_meta_prob,
+        "lambda_diffusion": args.lambda_diffusion,
         "lambda_x0": args.lambda_x0,
-        "lambda_consistency": args.lambda_consistency,
+        "lambda_plan": args.lambda_plan,
         "min_snr_gamma": args.min_snr_gamma,
+        # Sub-loss weights
+        "lambda_latent_x0": args.lambda_latent_x0,
+        "lambda_latent_cos": args.lambda_latent_cos,
+        "lambda_delta": args.lambda_delta,
+        "lambda_curvature": args.lambda_curvature,
+        "lambda_fft": args.lambda_fft,
+        "lambda_range": args.lambda_range,
+        "lambda_causal": args.lambda_causal,
+        "lambda_moe": args.lambda_moe,
+        "lambda_scci": args.lambda_scci,
+        # Decoder
         "decoder_field_blocks": args.decoder_field_blocks,
         "decoder_siren_omega": args.decoder_siren_omega,
         "decoder_siren_scale": args.decoder_siren_scale,
