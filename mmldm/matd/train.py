@@ -49,6 +49,12 @@ def main() -> None:
                         help="Epochs for single-stage training (overrides default per-stage epochs)")
     parser.add_argument("--no_causal_guidance", action="store_true",
                         help="Disable causal guidance during inference/sampling")
+    parser.add_argument("--lambda_x0", type=float, default=None,
+                        help="Override reconstruction loss weight (default: 0.2)")
+    parser.add_argument("--lambda_fft", type=float, default=None,
+                        help="Override FFT loss weight (default: 0.05)")
+    parser.add_argument("--min_snr_gamma", type=float, default=None,
+                        help="Override Min-SNR gamma (default: 5.0)")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -60,7 +66,7 @@ def main() -> None:
         force=True,
     )
 
-    cfg = MATDConfig(
+    cfg_overrides = dict(
         embed_dim=args.embed_dim,
         dit_depth=args.dit_depth,
         dit_heads=args.dit_heads,
@@ -75,6 +81,13 @@ def main() -> None:
         log_interval=14,
         use_causal_guidance_in_sampling=not args.no_causal_guidance,
     )
+    if args.lambda_x0 is not None:
+        cfg_overrides["lambda_x0"] = args.lambda_x0
+    if args.lambda_fft is not None:
+        cfg_overrides["lambda_fft"] = args.lambda_fft
+    if args.min_snr_gamma is not None:
+        cfg_overrides["min_snr_gamma"] = args.min_snr_gamma
+    cfg = MATDConfig(**cfg_overrides)
 
     dm = MATDDataModule(
         data_dir=args.data_dir,
