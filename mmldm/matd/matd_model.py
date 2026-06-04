@@ -330,7 +330,7 @@ class MATDModel(nn.Module):
         eps_pred = torch.empty_like(z_t)
         keep_mask = ~drop_mask
         if bool(keep_mask.any()):
-            eps_pred[keep_mask] = self.denoiser(
+            keep_eps = self.denoiser(
                 z_t[keep_mask],
                 t[keep_mask],
                 token_hidden[keep_mask],
@@ -339,6 +339,7 @@ class MATDModel(nn.Module):
                 causal_feat=causal_feat[keep_mask] if causal_feat is not None else None,
                 text_padding_mask=text_key_padding_mask[keep_mask],
             )
+            eps_pred[keep_mask] = keep_eps.to(dtype=eps_pred.dtype)
 
         if bool(drop_mask.any()):
             null_padding_mask = torch.zeros(
@@ -346,7 +347,7 @@ class MATDModel(nn.Module):
                 device=z_t.device,
                 dtype=torch.bool,
             )
-            eps_pred[drop_mask] = self.denoiser(
+            drop_eps = self.denoiser(
                 z_t[drop_mask],
                 t[drop_mask],
                 null_tokens[drop_mask],
@@ -355,6 +356,7 @@ class MATDModel(nn.Module):
                 causal_feat=None,
                 text_padding_mask=null_padding_mask,
             )
+            eps_pred[drop_mask] = drop_eps.to(dtype=eps_pred.dtype)
         return eps_pred
 
     def _encode_oracle(self, x0: torch.Tensor):
