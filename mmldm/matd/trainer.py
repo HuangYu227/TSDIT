@@ -17,9 +17,24 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 try:
-    from torch.amp import GradScaler, autocast
+    from torch.amp import GradScaler as TorchGradScaler
+    from torch.amp import autocast as torch_autocast
+
+    def make_grad_scaler(enabled: bool):
+        return TorchGradScaler("cuda", enabled=enabled)
+
+    def autocast_ctx(device: torch.device, enabled: bool):
+        return torch_autocast(device_type=device.type, enabled=enabled)
+
 except ImportError:
-    from torch.cuda.amp import GradScaler, autocast
+    from torch.cuda.amp import GradScaler as CudaGradScaler
+    from torch.cuda.amp import autocast as cuda_autocast
+
+    def make_grad_scaler(enabled: bool):
+        return CudaGradScaler(enabled=enabled)
+
+    def autocast_ctx(device: torch.device, enabled: bool):
+        return cuda_autocast(enabled=enabled)
 
 try:
     from tqdm import tqdm
@@ -98,7 +113,7 @@ class MATDTrainer:
         self.model.to(self.device)
 
         self.use_amp = bool(_cfg_get(config, "use_amp", True))
-        self.grad_scaler = GradScaler(enabled=self.use_amp and self.device.type == "cuda")
+        self.grad_scaler = make_grad_scaler(enabled=self.use_amp and self.device.type == "cuda")
         self.max_grad_norm = float(_cfg_get(config, "grad_clip", _cfg_get(config, "max_grad_norm", 1.0)))
         self.global_step = int(_cfg_get(config, "global_step", 0))
         self.log_interval = int(_cfg_get(config, "log_interval", 50))
@@ -193,7 +208,7 @@ class MATDTrainer:
     def train_step(self, batch: tuple, stage: int = 3, meta_override: Optional[torch.Tensor] = None) -> dict[str, float]:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
-        with autocast(enabled=self.use_amp and self.device.type == "cuda"):
+        with autocast_ctx(self.device, enabled=self.use_amp and self.device.type == "cuda"):
             out = self._forward(batch, stage=stage, meta_override=meta_override)
             loss = out["loss"] if "loss" in out else out["loss_total"]
         terms = out.get("loss_terms", {"loss_total": loss})
@@ -337,7 +352,7 @@ class MATDTrainer:
             for batch in dataloader:
                 x0, texts = batch[:2]
                 x0 = x0.to(self.device)
-                with autocast(enabled=self.use_amp and self.device.type == "cuda"):
+                with autocast_ctx(self.device, enabled=self.use_amp and self.device.type == "cuda"):
                     out = self.model.forward_train(x0, list(texts), stage=stage, training=False)
                 for k, v in out.get("loss_terms", {}).items():
                     if torch.is_tensor(v):
