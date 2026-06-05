@@ -163,6 +163,7 @@ class LatentDiffusionBridgeLoss(nn.Module):
         loss_denoise = sq_err.mean()
 
         pred_x0 = self.predict_x0(_as_float(z_t), model_out_f, t, alpha_bar, prediction_type)
+        pred_x0 = pred_x0.clamp(-50.0, 50.0)  # Prevent numerical explosion at high noise
         z_clean_f = _as_float(z_clean).detach()
         loss_latent_x0 = F.smooth_l1_loss(pred_x0, z_clean_f)
 
