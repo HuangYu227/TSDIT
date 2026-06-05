@@ -405,7 +405,6 @@ class MATDEvaluator:
             ori_data=real_raw[:, :, np.newaxis],  # (N, T, 1)
             gen_data=gen_multi,                    # (N, T, 1, K)
             k=self.n_samples,
-            threshold=0.5,
         )
 
         # --- J-FTSD with 3 condition variants ---
