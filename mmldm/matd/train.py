@@ -48,7 +48,7 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=None,
                         help="Epochs for single-stage training (overrides default per-stage epochs)")
     parser.add_argument("--no_causal_guidance", action="store_true",
-                        help="Disable causal guidance during inference/sampling (kept for compatibility)")
+                        help="Disable causal guidance during inference/sampling")
     parser.add_argument("--causal_guidance", action="store_true",
                         help="Enable sampling-time causal guidance")
     parser.add_argument("--cfg_scale", type=float, default=None,
@@ -123,7 +123,7 @@ def main() -> None:
         warmup_steps=args.warmup_steps,
         eval_interval=args.eval_interval,
         log_interval=14,
-        use_causal_guidance_in_sampling=bool(args.causal_guidance),
+        use_causal_guidance_in_sampling=not args.no_causal_guidance,
     )
     optional_overrides = {
         "cfg_scale": args.cfg_scale,

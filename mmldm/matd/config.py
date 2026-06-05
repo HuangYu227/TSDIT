@@ -165,7 +165,7 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     # -----------------------------------------------------------------------
     # Sampling
     # -----------------------------------------------------------------------
-    "use_causal_guidance_in_sampling": False,
+    "use_causal_guidance_in_sampling": True,
     "planner_beta": 1.0,
     "align_temperature": 0.07,
 }
