@@ -59,6 +59,24 @@ def _symmetric_kl(p: torch.Tensor, q: torch.Tensor, eps: float = 1e-8) -> torch.
     return 0.5 * (kl_pq + kl_qp).mean()
 
 
+def _js_divergence(
+    p: torch.Tensor,
+    q: torch.Tensor,
+    eps: float = 1e-6,
+    log_ratio_clip: float = 8.0,
+) -> torch.Tensor:
+    """Bounded Jensen-Shannon divergence — more stable than symmetric KL."""
+    p = p.float().clamp_min(eps)
+    q = q.float().clamp_min(eps)
+    p = p / p.sum(dim=-1, keepdim=True).clamp_min(eps)
+    q = q / q.sum(dim=-1, keepdim=True).clamp_min(eps)
+    m = 0.5 * (p + q)
+    log_p_m = (p.log() - m.log()).clamp(-log_ratio_clip, log_ratio_clip)
+    log_q_m = (q.log() - m.log()).clamp(-log_ratio_clip, log_ratio_clip)
+    js = 0.5 * (p * log_p_m).sum(dim=-1) + 0.5 * (q * log_q_m).sum(dim=-1)
+    return js.mean()
+
+
 # -----------------------------------------------------------------------------
 # 1) Latent diffusion bridge
 # -----------------------------------------------------------------------------
@@ -274,7 +292,7 @@ class TextLayoutLoss(nn.Module):
         mass_weight: float = 1.0,
         density_weight: float = 0.5,
         cdf_weight: float = 2.0,
-        distribution_weight: float = 0.5,
+        distribution_weight: float = 0.1,
     ) -> None:
         super().__init__()
         self.beta = float(beta)
@@ -294,9 +312,9 @@ class TextLayoutLoss(nn.Module):
         loss_mass = F.smooth_l1_loss(pred[..., _MASS], tgt[..., _MASS], beta=self.beta)
         loss_log_density = F.smooth_l1_loss(pred[..., _LOG_DENS], tgt[..., _LOG_DENS], beta=self.beta)
         loss_cdf = F.smooth_l1_loss(pred[..., _END], tgt[..., _END], beta=self.beta)
-        loss_len_kl = _symmetric_kl(pred[..., _LENGTH], tgt[..., _LENGTH])
-        loss_mass_kl = _symmetric_kl(pred[..., _MASS], tgt[..., _MASS])
-        loss_distribution = 0.5 * (loss_len_kl + loss_mass_kl)
+        loss_len_dist = _js_divergence(pred[..., _LENGTH], tgt[..., _LENGTH])
+        loss_mass_dist = _js_divergence(pred[..., _MASS], tgt[..., _MASS])
+        loss_distribution = 0.5 * (loss_len_dist + loss_mass_dist)
 
         total = (
             self.center_weight * loss_center

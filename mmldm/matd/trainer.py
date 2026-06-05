@@ -288,7 +288,18 @@ class MATDTrainer:
                 if hasattr(pbar, "set_postfix") and self.global_step % self.log_interval == 0:
                     pbar.set_postfix(loss_total=f"{metrics.get('loss_total', 0.0):.5f}")
                 if self.global_step % self.log_interval == 0:
-                    logger.info("stage=%d step=%d loss_total=%.5f", stage, self.global_step, metrics.get("loss_total", 0.0))
+                    # Diagnostic: log key sub-losses to identify explosion source
+                    diag_keys = [
+                        "loss_diffusion_bridge", "loss_diffusion_denoise",
+                        "loss_patch_field", "loss_field_l1",
+                        "loss_text_layout", "loss_layout_distribution",
+                        "loss_layout_length", "loss_layout_mass",
+                        "loss_mechanism", "grad_norm",
+                    ]
+                    diag = " ".join(
+                        f"{k}={metrics.get(k, 0.0):.4f}" for k in diag_keys if k in metrics
+                    )
+                    logger.info("stage=%d step=%d loss_total=%.5f %s", stage, self.global_step, metrics.get("loss_total", 0.0), diag)
             avg = {k: v / max(counts.get(k, 0), 1) for k, v in accum.items()}
             avg["epoch"] = float(epoch)
             avg["num_batches"] = float(n)
