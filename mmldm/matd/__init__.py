@@ -44,6 +44,16 @@ from .losses import (
     compute_total_loss,
     weights_from_config,
 )
+from .loss_balancer import GradientConflictMonitor, LossBalanceConfig
+from .diagnostics import denorm_roundtrip_diagnostics, summarize_metric_pathologies
+from .metrics_matd import (
+    compute_multisample_metrics,
+    compute_retrieval_diagnostics,
+    compute_scale_diagnostics,
+    compute_temporal_structure_metrics,
+    ensure_btd,
+    ensure_nktd,
+)
 
 # Full model
 from .matd_model import MATDModel, MATDConfig
@@ -68,6 +78,11 @@ __all__ = [
     "VariablePatchDecoder", "LinearPatchDecoder",
     "LatentDiffusionBridgeLoss", "AdaptivePatchFieldLoss", "TextLayoutLoss",
     "CausalSemanticRouterLoss", "LossWeights", "compute_total_loss", "weights_from_config",
+    "GradientConflictMonitor", "LossBalanceConfig",
+    "denorm_roundtrip_diagnostics", "summarize_metric_pathologies",
+    "ensure_btd", "ensure_nktd",
+    "compute_scale_diagnostics", "compute_temporal_structure_metrics",
+    "compute_multisample_metrics", "compute_retrieval_diagnostics",
     "MATDModel", "MATDConfig",
     "MATDTrainer", "EMA", "MATDGenerator",
     "MATDEvaluator", "calculate_mrr",

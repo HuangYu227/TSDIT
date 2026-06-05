@@ -1,13 +1,13 @@
 """MATD Evaluator -- Fair comparison with T2S and CaTSG metrics.
 
 Computes 7 metrics on raw-scale (denormalized) data:
-  T2S-compatible:   MSE, WAPE, MRR (K=10)
+  T2S-compatible:   MSE, WAPE, MRR@10
   CaTSG-compatible: MDD (n_bins=20), KL (flat, 50 bins), MMD (RBF)
   Distribution:     J-FTSD (text), J-FTSD (planner), J-FTSD (slots)
 
 All metric implementations delegate to ``unified_metrics.py`` which has
 been verified to exactly match the original T2S and CaTSG computation
-logic.  MRR is implemented here with the same algorithm as T2S.
+logic.  MRR@10 is implemented here with correct ranking across all samples.
 
 J-FTSD is computed with three different MATD conditions:
   - text:     pooled text encoder output (B, text_dim)
@@ -23,8 +23,7 @@ Fairness guarantees:
   3. **MDD**: Exact CaTSG HistoLoss (n_bins=20, per-feature
      per-timestep histogram density difference).
   4. **MMD**: Exact CaTSG (RBF kernel on flattened ``(N, L*D)``).
-  5. **MRR**: Exact T2S (cosine similarity on flattened vectors,
-     threshold=0.5, K independent generations).
+  5. **MRR@10**: Correct ranking across all B*K samples, top-10 cutoff.
   6. **J-FTSD**: Contrastive+Frechet distance conditioned on MATD's
      own text/planner/slot representations.
 """
@@ -40,13 +39,20 @@ import torch
 from torch.utils.data import DataLoader
 
 from .data_adapter import MATDDataModule, matd_collate_fn
+from .diagnostics import denorm_roundtrip_diagnostics, summarize_metric_pathologies
 from .matd_model import MATDModel
+from .metrics_matd import (
+    compute_multisample_metrics,
+    compute_retrieval_diagnostics,
+    compute_scale_diagnostics,
+    compute_temporal_structure_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# MRR -- T2S-compatible (not in unified_metrics)
+# MRR@10 -- correct ranking (not in unified_metrics)
 # ---------------------------------------------------------------------------
 
 
@@ -54,47 +60,58 @@ def calculate_mrr(
     ori_data: np.ndarray,
     gen_data: np.ndarray,
     k: int | None = None,
+    top_k: int = 10,
 ) -> float:
-    """Mean Reciprocal Rank — measures sample diversity/distinguishability.
+    """Mean Reciprocal Rank @ top_k — correct implementation.
 
-    For each real sample, compute cosine similarity with K generated samples.
-    Rank the generated samples by similarity. MRR = 1/rank of the best match.
-
-    A high MRR (close to 1.0) means generated samples are well-distinguishable
-    (each sample has a unique identity). A low MRR means samples are similar
-    to each other (mode collapse).
+    For each real sample, rank ALL generated samples (from all texts) by
+    cosine similarity.  Only consider the top_k most similar generated
+    samples.  The "relevant" items are the K samples generated from the
+    same text.  MRR@top_k = 1 / rank of the best-matching relevant item
+    within top_k.  If no relevant item appears in top_k, score = 0.
 
     Args:
         ori_data: ``(B, T, dim)`` ground truth (raw scale).
         gen_data: ``(B, T, dim, K)`` K generations per sample (raw scale).
         k: Number of generations to use (default: all K).
+        top_k: Only consider top-k most similar generated samples (default: 10).
 
     Returns:
-        Scalar MRR averaged over samples.
+        Scalar MRR@top_k averaged over samples.
     """
     n_batch = ori_data.shape[0]
     n_generations = gen_data.shape[3]
     k = n_generations if k is None else min(k, n_generations)
 
-    # Flatten to (B, D) and (B, K, D) where D = T * dim
-    real_flat = ori_data.reshape(n_batch, -1)                  # (B, D)
-    gen_flat = gen_data[:, :, :, :k].reshape(n_batch, k, -1)   # (B, K, D)
+    # Flatten real: (B, D)
+    real_flat = ori_data.reshape(n_batch, -1)
+    # Flatten gen: (B, K, D) -> (B*K, D)
+    gen_flat = gen_data[:, :, :, :k].reshape(n_batch, k, -1)
+    gen_all = gen_flat.reshape(n_batch * k, -1)
 
-    # Cosine similarity via broadcasting: (B, K)
-    real_norm = np.linalg.norm(real_flat, axis=1, keepdims=True)   # (B, 1)
-    gen_norm = np.linalg.norm(gen_flat, axis=2)                     # (B, K)
-    dots = np.einsum('bi,bki->bk', real_flat, gen_flat)            # (B, K)
-    denom = real_norm * gen_norm                                    # (B, K)
-    sims = np.where(denom > 0, dots / denom, 0.0)                  # (B, K)
+    # Normalize
+    real_norm = np.linalg.norm(real_flat, axis=1, keepdims=True).clip(min=1e-8)
+    gen_norm = np.linalg.norm(gen_all, axis=1, keepdims=True).clip(min=1e-8)
+    real_normed = real_flat / real_norm
+    gen_normed = gen_all / gen_norm
 
-    # Sort each sample's similarities descending
-    sorted_idx = np.argsort(-sims, axis=1)                          # (B, K)
+    # Cosine similarity matrix: (B, B*K)
+    sim_matrix = real_normed @ gen_normed.T
 
-    # MRR: reciprocal rank of the best match (rank 1 = most similar)
-    # Since we sort by similarity descending, the best match is always rank 1
-    # So MRR = 1/1 = 1.0 for all samples
-    # This is correct: MRR measures if each real sample has a unique best match
-    mrr_scores = np.ones(n_batch)  # Always 1.0 since best match is rank 1
+    mrr_scores = np.zeros(n_batch)
+    for i in range(n_batch):
+        # Get top_k most similar generated samples
+        top_k_indices = np.argsort(-sim_matrix[i])[:top_k]
+        # The "relevant" indices are i*k, i*k+1, ..., i*k+k-1
+        relevant_start = i * k
+        relevant_end = relevant_start + k
+        # Find the rank of the best-matching relevant item within top_k
+        rank = None
+        for r, idx in enumerate(top_k_indices):
+            if relevant_start <= idx < relevant_end:
+                rank = r + 1  # 1-indexed
+                break
+        mrr_scores[i] = 1.0 / rank if rank is not None else 0.0
 
     return float(np.mean(mrr_scores))
 
@@ -280,7 +297,7 @@ class MATDEvaluator:
         Returns:
             Dict with metrics plus metadata::
 
-                MSE, WAPE, MRR                  -- T2S-compatible
+                MSE, WAPE, MRR@10               -- T2S-compatible
                 MDD, KL, MMD                    -- CaTSG-compatible
                 J-FTSD_text, J-FTSD_planner,
                   J-FTSD_slots                  -- distribution-level
@@ -299,6 +316,9 @@ class MATDEvaluator:
         all_gen_single = []    # (N, T) first generation, denormalized
         all_gen_k = []         # (N, T, 1, K) all K generations, denormalized
         all_real_raw = []      # (N, T) ground truth, denormalized
+        all_x0_norm = []       # (N, T) normalized ground truth
+        all_ts_mins = []       # (N,) per-sample raw minima
+        all_ts_maxs = []       # (N,) per-sample raw maxima
         all_text_embed = []    # list of (B, text_dim)
         all_planner_meta = []  # list of (B, K, 9)
         all_scci_slots = []    # list of (B, n_slots, D)
@@ -375,11 +395,17 @@ class MATDEvaluator:
             gen_k_batch = gen_k_batch[:, :, np.newaxis, :]  # (B, T, 1, K)
             all_gen_k.append(gen_k_batch)
             all_real_raw.append(real_raw)
+            all_x0_norm.append(x0_norm.cpu().numpy())
+            all_ts_mins.append(batch_ts_min)
+            all_ts_maxs.append(batch_ts_max)
 
         # Concatenate all batches
         real_raw = np.concatenate(all_real_raw, axis=0)          # (N, T)
         gen_single = np.concatenate(all_gen_single, axis=0)      # (N, T)
         gen_multi = np.concatenate(all_gen_k, axis=0)            # (N, T, 1, K)
+        x0_norm_all = np.concatenate(all_x0_norm, axis=0)        # (N, T)
+        ts_mins_all = np.concatenate(all_ts_mins, axis=0)        # (N,)
+        ts_maxs_all = np.concatenate(all_ts_maxs, axis=0)        # (N,)
         text_embed = torch.cat(all_text_embed, dim=0).numpy()    # (N, text_dim)
         planner_meta = torch.cat(all_planner_meta, dim=0).numpy()  # (N, K, 9)
         scci_slots = torch.cat(all_scci_slots, dim=0).numpy()    # (N, n_slots, D)
@@ -405,6 +431,17 @@ class MATDEvaluator:
             ori_data=real_raw[:, :, np.newaxis],  # (N, T, 1)
             gen_data=gen_multi,                    # (N, T, 1, K)
             k=self.n_samples,
+        )
+
+        # --- MATD-specific diagnostics and multi-sample metrics ---
+        scale_diag = compute_scale_diagnostics(real_raw, gen_single)
+        denorm_diag = denorm_roundtrip_diagnostics(
+            x0_norm_all, ts_mins_all, ts_maxs_all
+        )
+        structure = compute_temporal_structure_metrics(real_raw, gen_single)
+        multisample = compute_multisample_metrics(real_raw, gen_multi)
+        retrieval = compute_retrieval_diagnostics(
+            real_raw, gen_multi, top_k=10
         )
 
         # --- J-FTSD with 3 condition variants ---
@@ -465,6 +502,12 @@ class MATDEvaluator:
             "J-FTSD_slots": jftsd_slots,
             "J-FTSD_slots_status": jftsd_slots_status,
         }
+        results.update({f"diagnostics/{k}": v for k, v in scale_diag.items()})
+        results.update({f"diagnostics/{k}": v for k, v in denorm_diag.items()})
+        results.update({f"structure/{k}": v for k, v in structure.items()})
+        results.update({f"multisample/{k}": v for k, v in multisample.items()})
+        results.update({f"retrieval/{k}": v for k, v in retrieval.items()})
+        results.update({f"diagnostics/{k}": v for k, v in summarize_metric_pathologies(results).items()})
 
         return results
 
@@ -483,9 +526,9 @@ class MATDEvaluator:
         print(f"  MRR K:      {results['n_mrr_samples']}")
         print()
         print("  T2S-compatible metrics (raw scale):")
-        print(f"    MSE:  {results['MSE']:.6f}")
-        print(f"    WAPE: {results['WAPE']:.6f}")
-        print(f"    MRR:  {results['MRR']:.6f}")
+        print(f"    MSE:    {results['MSE']:.6f}")
+        print(f"    WAPE:   {results['WAPE']:.6f}")
+        print(f"    MRR@10: {results['MRR']:.6f}")
         print()
         print("  CaTSG-compatible metrics (raw scale):")
         print(f"    MDD:  {results['MDD']:.6f}")
@@ -500,4 +543,15 @@ class MATDEvaluator:
                 print(f"    J-FTSD ({variant}): {val:.4f} ({status})")
             else:
                 print(f"    J-FTSD ({variant}): skipped ({status})")
+        print()
+        print("  MATD diagnostics:")
+        for key in (
+            "diagnostics/target_tiny_denominator_ratio",
+            "multisample/best_mse",
+            "structure/acf_mae",
+            "retrieval/mrr_at_k",
+            "retrieval/top1_self_rate",
+        ):
+            if key in results:
+                print(f"    {key}: {results[key]:.6f}")
         print("=" * 60)

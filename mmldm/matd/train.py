@@ -55,6 +55,8 @@ def main() -> None:
                         help="Override classifier-free guidance scale (default: 5.0)")
     parser.add_argument("--ddim_steps", type=int, default=None,
                         help="Override DDIM sampling steps used by evaluation (default: 50)")
+    parser.add_argument("--eval_interval", type=int, default=10,
+                        help="Run evaluator every N epochs for stage 0/4 training")
     parser.add_argument("--eta", type=float, default=0.0,
                         help="DDIM eta used by evaluation sampling (default: 0.0)")
     parser.add_argument("--p_drop_text", type=float, default=None,
@@ -88,6 +90,12 @@ def main() -> None:
     parser.add_argument("--decoder_output_activation", type=str, default=None,
                         choices=["none", "sigmoid", "clamp"],
                         help="Optional decoder output activation/range diagnostic")
+    parser.add_argument("--loss_balance_enabled", action="store_true",
+                        help="Enable observe-only gradient conflict diagnostics")
+    parser.add_argument("--loss_balance_interval", type=int, default=50,
+                        help="Step interval for observe-only gradient diagnostics")
+    parser.add_argument("--loss_balance_probe_components", type=str, nargs="*", default=None,
+                        help="Optional parameter-name substrings to probe for gradient diagnostics")
     args = parser.parse_args()
     if args.no_causal_guidance and args.causal_guidance:
         parser.error("--no_causal_guidance and --causal_guidance are mutually exclusive")
@@ -113,6 +121,7 @@ def main() -> None:
         batch_size=args.batch_size,
         total_steps=args.total_steps,
         warmup_steps=args.warmup_steps,
+        eval_interval=args.eval_interval,
         log_interval=14,
         use_causal_guidance_in_sampling=bool(args.causal_guidance),
     )
@@ -142,6 +151,12 @@ def main() -> None:
     }
     cfg_overrides.update({k: v for k, v in optional_overrides.items() if v is not None})
     cfg = MATDConfig(**cfg_overrides)
+    trainer_config = dict(cfg.__dict__)
+    trainer_config["loss_balance"] = {
+        "enabled": args.loss_balance_enabled,
+        "interval": args.loss_balance_interval,
+        "probe_components": args.loss_balance_probe_components,
+    }
 
     dm = MATDDataModule(
         data_dir=args.data_dir,
@@ -152,7 +167,7 @@ def main() -> None:
     )
 
     model = MATDModel(cfg).cuda()
-    trainer = MATDTrainer(model, cfg.__dict__, device="cuda")
+    trainer = MATDTrainer(model, trainer_config, device="cuda")
 
     train_loader = dm.train_dataloader()
     val_loader = dm.val_dataloader()

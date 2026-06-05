@@ -16,6 +16,9 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
+
+from .loss_balancer import GradientConflictMonitor, LossBalanceConfig
+
 try:
     from torch.amp import GradScaler as TorchGradScaler
     from torch.amp import autocast as torch_autocast
@@ -128,6 +131,8 @@ class MATDTrainer:
         ema_cfg = config.get("ema", {}) if isinstance(config.get("ema", {}), dict) else {}
         self.use_ema = bool(ema_cfg.get("enabled", _cfg_get(config, "ema_enabled", True)))
         self.ema = EMA(self.model, decay=float(ema_cfg.get("decay", _cfg_get(config, "ema_decay", 0.9999)))) if self.use_ema else None
+        self.loss_balance_config = LossBalanceConfig.from_mapping(config.get("loss_balance"))
+        self.gradient_monitor = GradientConflictMonitor()
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
         opt_cfg = self.config.get("optimizer", {}) if isinstance(self.config.get("optimizer", {}), dict) else {}
@@ -219,6 +224,23 @@ class MATDTrainer:
             self.optimizer.zero_grad(set_to_none=True)
             metrics["skipped_step"] = 1.0
             return metrics
+        if self.loss_balance_config.enabled:
+            if hasattr(self.model, "_stage_weights"):
+                weights = self.model._stage_weights(stage)
+                metrics.update({
+                    "loss_weight_diffusion_bridge": float(weights.diffusion_bridge),
+                    "loss_weight_patch_field": float(weights.patch_field),
+                    "loss_weight_text_layout": float(weights.text_layout),
+                    "loss_weight_mechanism": float(weights.mechanism),
+                })
+            if self.loss_balance_config.should_probe(self.global_step):
+                grad_diag = self.gradient_monitor.compute(
+                    out.get("loss_dicts", {}),
+                    self.model,
+                    components=self.loss_balance_config.probe_components,
+                )
+                metrics.update(grad_diag)
+                self.optimizer.zero_grad(set_to_none=True)
         self.grad_scaler.scale(loss).backward()
         self.grad_scaler.unscale_(self.optimizer)
         grad_norm = torch.tensor(0.0, device=self.device)
