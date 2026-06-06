@@ -182,6 +182,7 @@ class MATDConfig:
     total_steps: int = 100_000
     batch_size: int = 32
     grad_clip: float = 1.0
+    module_grad_interval: int = 0
     ema_enabled: bool = False
     ema_decay: float = 0.999
     p_drop_text: float = 0.1
@@ -621,6 +622,40 @@ class MATDModel(nn.Module):
 
         weights = self._stage_weights(stage)
         total_loss, all_terms = compute_total_loss(loss_dicts, weights)
+        with torch.no_grad():
+            eps = torch.tensor(1e-8, device=z0.device, dtype=z0.dtype)
+            clean_recon_mse = F.mse_loss(x_hat.detach(), x0_seq.detach())
+            endpoint_recon_mse = F.mse_loss(x_endpoint.detach(), x0_seq.detach())
+            latent_x0_mse = F.mse_loss(pred_x0_latent.detach(), z_clean.detach())
+            denoise_mse = F.mse_loss(eps_pred.detach(), diff_target.detach())
+            z0_rms = z0.detach().pow(2).mean().sqrt()
+            z_clean_rms = z_clean.detach().pow(2).mean().sqrt()
+            pred_x0_rms = pred_x0_latent.detach().pow(2).mean().sqrt()
+            if plan_tokens is not None:
+                plan_residual = (z_clean.detach() - z0.detach()).pow(2).mean().sqrt()
+                plan_token_std = plan_tokens.detach().std()
+                plan_residual_ratio = plan_residual / (z0_rms + eps)
+                plan_to_z0_std_ratio = plan_token_std / (z0.detach().std() + eps)
+            else:
+                plan_residual_ratio = torch.zeros((), device=z0.device, dtype=z0.dtype)
+                plan_to_z0_std_ratio = torch.zeros((), device=z0.device, dtype=z0.dtype)
+            all_terms.update({
+                "train_diag/clean_recon_mse": clean_recon_mse,
+                "train_diag/endpoint_recon_mse": endpoint_recon_mse,
+                "train_diag/endpoint_over_clean_mse": endpoint_recon_mse / (clean_recon_mse + eps),
+                "train_diag/denoise_mse": denoise_mse,
+                "train_diag/latent_x0_mse": latent_x0_mse,
+                "train_diag/latent_x0_rel_mse": latent_x0_mse / (z_clean.detach().pow(2).mean() + eps),
+                "train_diag/z0_rms": z0_rms,
+                "train_diag/z_clean_rms": z_clean_rms,
+                "train_diag/pred_x0_rms": pred_x0_rms,
+                "train_diag/pred_over_clean_rms": pred_x0_rms / (z_clean_rms + eps),
+                "train_diag/plan_residual_ratio": plan_residual_ratio,
+                "train_diag/plan_to_z0_std_ratio": plan_to_z0_std_ratio,
+                "train_diag/text_drop_rate": drop_mask.float().mean(),
+                "train_diag/timestep_mean": t.float().mean(),
+                "train_diag/timestep_max": t.float().max(),
+            })
         return {
             "loss": total_loss,
             "loss_total": total_loss,
@@ -632,7 +667,9 @@ class MATDModel(nn.Module):
             "z_t": z_t,
             "noise": noise,
             "eps_pred": eps_pred,
+            "pred_x0_latent": pred_x0_latent,
             "x_hat": x_hat,
+            "x_endpoint": x_endpoint,
             "meta_pred": meta_pred,
             "meta_oracle": meta_oracle,
             "meta": meta,

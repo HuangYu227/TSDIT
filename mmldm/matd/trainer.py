@@ -121,6 +121,7 @@ class MATDTrainer:
         self.global_step = int(_cfg_get(config, "global_step", 0))
         self.log_interval = int(_cfg_get(config, "log_interval", 50))
         self.eval_interval = int(_cfg_get(config, "eval_interval", 10))
+        self.module_grad_interval = int(_cfg_get(config, "module_grad_interval", 0) or 0)
         self.best_metrics: dict[str, float] = {}
         self.best_count: int = 0
 
@@ -138,6 +139,35 @@ class MATDTrainer:
         )
         self.loss_balance_config = LossBalanceConfig.from_mapping(config.get("loss_balance"))
         self.gradient_monitor = GradientConflictMonitor()
+
+    @staticmethod
+    def _module_norms(module: nn.Module) -> tuple[float, float, float]:
+        grad_sq = 0.0
+        param_sq = 0.0
+        trainable = 0
+        for param in module.parameters():
+            if not param.requires_grad:
+                continue
+            trainable += param.numel()
+            param_sq += float(param.detach().float().pow(2).sum().item())
+            if param.grad is not None:
+                grad_sq += float(param.grad.detach().float().pow(2).sum().item())
+        return math.sqrt(grad_sq), math.sqrt(param_sq), float(trainable)
+
+    def _collect_module_grad_metrics(self) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        for name in (
+            "encoder", "decoder", "planner", "denoiser",
+            "text_encoder", "null_encoder", "slot_extractor",
+            "injector", "causal", "moe",
+        ):
+            module = getattr(self.model, name, None)
+            if isinstance(module, nn.Module):
+                grad_norm, param_norm, trainable = self._module_norms(module)
+                metrics[f"grad_module/{name}"] = grad_norm
+                metrics[f"param_module/{name}"] = param_norm
+                metrics[f"trainable_module/{name}"] = trainable
+        return metrics
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
         opt_cfg = self.config.get("optimizer", {}) if isinstance(self.config.get("optimizer", {}), dict) else {}
@@ -248,6 +278,8 @@ class MATDTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
         self.grad_scaler.scale(loss).backward()
         self.grad_scaler.unscale_(self.optimizer)
+        if self.module_grad_interval > 0 and self.global_step % self.module_grad_interval == 0:
+            metrics.update(self._collect_module_grad_metrics())
         grad_norm = torch.tensor(0.0, device=self.device)
         if self.max_grad_norm > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -328,7 +360,20 @@ class MATDTrainer:
                         "loss_layout_length", "loss_layout_mass",
                         "diagnostics/plan_token_std",
                         "diagnostics/plan_global_norm",
+                        "train_diag/clean_recon_mse",
+                        "train_diag/endpoint_recon_mse",
+                        "train_diag/endpoint_over_clean_mse",
+                        "train_diag/denoise_mse",
+                        "train_diag/latent_x0_mse",
+                        "train_diag/latent_x0_rel_mse",
+                        "train_diag/pred_over_clean_rms",
+                        "train_diag/plan_residual_ratio",
+                        "train_diag/plan_to_z0_std_ratio",
+                        "train_diag/text_drop_rate",
                         "loss_mechanism", "grad_norm",
+                        "grad_module/encoder", "grad_module/decoder",
+                        "grad_module/planner", "grad_module/denoiser",
+                        "grad_module/text_encoder",
                     ]
                     diag = " ".join(
                         f"{k}={metrics.get(k, 0.0):.4f}" for k in diag_keys if k in metrics

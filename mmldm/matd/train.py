@@ -122,6 +122,8 @@ def main() -> None:
                         help="Step interval for observe-only gradient diagnostics")
     parser.add_argument("--loss_balance_probe_components", type=str, nargs="*", default=None,
                         help="Optional parameter-name substrings to probe for gradient diagnostics")
+    parser.add_argument("--module_grad_interval", type=int, default=None,
+                        help="Log per-module gradient norms every N optimizer steps (0 disables)")
     parser.add_argument("--ema", dest="ema_enabled", action="store_true",
                         help="Enable EMA weights for evaluation/checkpointing")
     parser.add_argument("--no_ema", dest="ema_enabled", action="store_false",
@@ -172,6 +174,7 @@ def main() -> None:
         "use_causal_guidance_in_sampling": causal_guidance_override,
         "architecture": args.architecture,
         "condition_sensitivity_eval": args.condition_sensitivity_eval,
+        "module_grad_interval": args.module_grad_interval,
         "ema_enabled": args.ema_enabled,
         "ema_decay": args.ema_decay,
         "cfg_scale": args.cfg_scale,

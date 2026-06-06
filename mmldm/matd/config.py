@@ -171,6 +171,7 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     "total_steps": 100000,
     "batch_size": 32,
     "grad_clip": 1.0,
+    "module_grad_interval": 0,
     "ema_enabled": False,
     "ema_decay": 0.999,
 
