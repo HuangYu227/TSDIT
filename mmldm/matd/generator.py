@@ -80,7 +80,7 @@ class MATDGenerator:
         if ddim_steps <= 0:
             raise ValueError(f"ddim_steps must be positive, got {ddim_steps}")
         cfg_scale = float(cfg_scale if cfg_scale is not None else self.config.get("cfg_scale", 5.0))
-        use_causal_guidance = bool(self.config.get("use_causal_guidance_in_sampling", True) if use_causal_guidance is None else use_causal_guidance)
+        use_causal_guidance = bool(self.config.get("use_causal_guidance_in_sampling", False) if use_causal_guidance is None else use_causal_guidance)
         text_tokens, pooled, attention_mask = m["text_encoder"](texts)
         null_tokens, null_pooled = m["null_encoder"](B)
         text_mask = attention_mask == 0

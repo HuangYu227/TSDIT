@@ -43,6 +43,9 @@ def main() -> None:
     parser.add_argument("--stage", type=str, default="all",
                         choices=["0", "1", "2", "3", "4", "all"],
                         help="Training stage: 0=joint, 1/2/3/4=single stage, all=sequential 1->4")
+    parser.add_argument("--architecture", type=str, default=None,
+                        choices=["core_v2", "full"],
+                        help="Model architecture path: core_v2=PlanFormer-DiT core, full=legacy full MATD")
     parser.add_argument("--joint_epochs", type=int, default=200,
                         help="Epochs for --stage 0 joint training (default: 200)")
     parser.add_argument("--epochs", type=int, default=None,
@@ -116,6 +119,11 @@ def main() -> None:
                         help="Step interval for observe-only gradient diagnostics")
     parser.add_argument("--loss_balance_probe_components", type=str, nargs="*", default=None,
                         help="Optional parameter-name substrings to probe for gradient diagnostics")
+    parser.add_argument("--condition_sensitivity_eval", dest="condition_sensitivity_eval", action="store_true",
+                        help="Enable shuffled-text condition sensitivity diagnostics during evaluation")
+    parser.add_argument("--no_condition_sensitivity_eval", dest="condition_sensitivity_eval", action="store_false",
+                        help="Disable shuffled-text condition sensitivity diagnostics during evaluation")
+    parser.set_defaults(condition_sensitivity_eval=None)
     args = parser.parse_args()
     if args.no_causal_guidance and args.causal_guidance:
         parser.error("--no_causal_guidance and --causal_guidance are mutually exclusive")
@@ -128,6 +136,12 @@ def main() -> None:
         stream=sys.stdout,
         force=True,
     )
+
+    causal_guidance_override = None
+    if args.causal_guidance:
+        causal_guidance_override = True
+    elif args.no_causal_guidance:
+        causal_guidance_override = False
 
     cfg_overrides = dict(
         embed_dim=args.embed_dim,
@@ -143,9 +157,11 @@ def main() -> None:
         warmup_steps=args.warmup_steps,
         eval_interval=args.eval_interval,
         log_interval=14,
-        use_causal_guidance_in_sampling=not args.no_causal_guidance,
     )
     optional_overrides = {
+        "use_causal_guidance_in_sampling": causal_guidance_override,
+        "architecture": args.architecture,
+        "condition_sensitivity_eval": args.condition_sensitivity_eval,
         "cfg_scale": args.cfg_scale,
         "p_drop_text": args.p_drop_text,
         "use_oracle_meta_prob": args.use_oracle_meta_prob,

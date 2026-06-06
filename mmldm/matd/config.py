@@ -23,6 +23,12 @@ from typing import Any, Optional
 
 MATD_DEFAULT_CONFIG: dict[str, Any] = {
     # -----------------------------------------------------------------------
+    # Architecture
+    # -----------------------------------------------------------------------
+    "architecture": "core_v2",
+    "condition_sensitivity_eval": True,
+
+    # -----------------------------------------------------------------------
     # Tokenizer (DA-ATP -- Density-Adaptive Adaptive Tokenisation for Patches)
     # -----------------------------------------------------------------------
     "embed_dim": 256,
@@ -59,8 +65,8 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     "planner_mode": "latent",
     "planner_depth": 3,
     "layout_source": "canonical",
-    "lambda_plan_stats": 0.2,
-    "lambda_plan_contrast": 0.05,
+    "lambda_plan_stats": 0.0,
+    "lambda_plan_contrast": 1.0,
     "lambda_plan_kl": 0.001,
     "lambda_plan_layout": 0.0,
     "plan_residual_scale": 0.2,
@@ -143,16 +149,16 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     "lambda_x0": 0.2,
     "lambda_delta": 0.1,
     "lambda_fft": 0.05,
-    "lambda_plan": 0.5,
+    "lambda_plan": 0.05,
     "lambda_endpoint_recon": 1.0,
-    "lambda_endpoint_moment": 0.2,
-    "lambda_endpoint_delta": 0.2,
-    "lambda_endpoint_acf": 0.1,
+    "lambda_endpoint_moment": 0.0,
+    "lambda_endpoint_delta": 0.0,
+    "lambda_endpoint_acf": 0.0,
     "endpoint_acf_lags": 8,
     "endpoint_latent_clip": 20.0,
     "lambda_align": 0.05,
-    "lambda_moe": 0.01,
-    "lambda_causal": 0.01,
+    "lambda_moe": 0.0,
+    "lambda_causal": 0.0,
     "lambda_scci": 0.0,
     "lambda_latent_anchor": 0.01,
 
@@ -176,12 +182,12 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     # -----------------------------------------------------------------------
     # Staged meta training
     # -----------------------------------------------------------------------
-    "use_oracle_meta_prob": 1.0,
+    "use_oracle_meta_prob": 0.0,
 
     # -----------------------------------------------------------------------
     # Sampling
     # -----------------------------------------------------------------------
-    "use_causal_guidance_in_sampling": True,
+    "use_causal_guidance_in_sampling": False,
     "planner_beta": 1.0,
     "align_temperature": 0.07,
 }

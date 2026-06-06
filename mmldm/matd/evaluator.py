@@ -48,6 +48,7 @@ from .metrics_matd import (
     compute_scale_diagnostics,
     compute_temporal_structure_metrics,
 )
+from .planner import build_canonical_meta
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +208,8 @@ class MATDEvaluator:
             model.cfg.ddim_steps if self.ddim_steps is None else self.ddim_steps
         )
         use_causal_guidance = model.cfg.use_causal_guidance_in_sampling
+        if getattr(model.cfg, "architecture", "core_v2") == "core_v2":
+            use_causal_guidance = False
 
         K_patches = meta_9.shape[1]
         D = model.cfg.embed_dim
@@ -329,6 +332,11 @@ class MATDEvaluator:
         all_scci_slots = []    # list of (B, n_slots, D)
         all_plan_tokens = []   # list of (B, K, D), latent planner only
         all_plan_global = []   # list of (B, D), latent planner only
+        sensitivity_mse_gaps: list[float] = []
+        sensitivity_wape_gaps: list[float] = []
+        plan_shift_norms: list[float] = []
+        text_plan_cos_correct: list[float] = []
+        text_plan_cos_shuffled: list[float] = []
 
         for batch in test_loader:
             x0_norm, texts, ts_mins, ts_maxs = (
@@ -353,9 +361,15 @@ class MATDEvaluator:
             meta_9, plan = self.model._run_planner(
                 token_hidden, pooled, text_padding_mask, K_patches
             )
-            scci_slots = self.model.slot_extractor(
-                token_hidden, text_padding_mask=text_padding_mask
-            )
+            if getattr(self.model.cfg, "architecture", "core_v2") == "core_v2":
+                meta_9 = build_canonical_meta(B, K_patches, self.device, pooled.dtype)
+                scci_slots = plan.plan_tokens if plan is not None else torch.zeros(
+                    B, K_patches, self.model.cfg.embed_dim, device=self.device, dtype=pooled.dtype
+                )
+            else:
+                scci_slots = self.model.slot_extractor(
+                    token_hidden, text_padding_mask=text_padding_mask
+                )
 
             # Pre-compute null encoder + planner meta_9 once (deterministic)
             null_tokens, null_pooled = self.model.null_encoder(B)
@@ -372,6 +386,11 @@ class MATDEvaluator:
             if plan_tokens is not None and plan_global is not None:
                 all_plan_tokens.append(plan_tokens.detach().cpu())
                 all_plan_global.append(plan_global.detach().cpu())
+
+            run_condition_sensitivity = (
+                bool(getattr(self.model.cfg, "condition_sensitivity_eval", True))
+                and B >= 2
+            )
 
             # -- Generate K independent samples per text --
             # Reuse cached text encoder, planner, and null encoder outputs
@@ -395,6 +414,49 @@ class MATDEvaluator:
             real_raw = self._denormalize(
                 x0_norm.cpu().numpy(), batch_ts_min, batch_ts_max,
             )  # (B, T)
+
+            if run_condition_sensitivity:
+                perm = torch.randperm(B, device=self.device)
+                shuffled_texts = [texts[int(i)] for i in perm.detach().cpu().tolist()]
+                shuf_tokens, shuf_pooled, shuf_attention = self.model.text_encoder(shuffled_texts)
+                shuf_padding_mask = shuf_attention == 0
+                shuf_meta, shuf_plan = self.model._run_planner(
+                    shuf_tokens, shuf_pooled, shuf_padding_mask, K_patches
+                )
+                if getattr(self.model.cfg, "architecture", "core_v2") == "core_v2":
+                    shuf_meta = build_canonical_meta(B, K_patches, self.device, shuf_pooled.dtype)
+                shuf_plan_tokens = shuf_plan.plan_tokens if shuf_plan is not None else None
+                shuf_plan_global = shuf_plan.plan_global if shuf_plan is not None else None
+                gen_shuf = self._generate_from_cache(
+                    shuf_tokens, shuf_pooled, shuf_attention,
+                    shuf_meta[..., :9].to(self.device),
+                    null_tokens, null_pooled,
+                    null_padding_mask, shuf_padding_mask,
+                    target_length=T,
+                    plan_tokens=shuf_plan_tokens,
+                    plan_global=shuf_plan_global,
+                ).squeeze(-1).cpu().numpy()
+                gen_shuf_raw = self._denormalize(gen_shuf, batch_ts_min, batch_ts_max)
+                gen_real_raw_for_gap = self._denormalize(gen_k_list[0], batch_ts_min, batch_ts_max)
+                mse_correct = float(np.mean((gen_real_raw_for_gap - real_raw) ** 2))
+                mse_shuffled = float(np.mean((gen_shuf_raw - real_raw) ** 2))
+                denom = np.maximum(np.abs(real_raw).sum(axis=1), 1e-8)
+                wape_correct = float(np.mean(np.abs(gen_real_raw_for_gap - real_raw).sum(axis=1) / denom))
+                wape_shuffled = float(np.mean(np.abs(gen_shuf_raw - real_raw).sum(axis=1) / denom))
+                sensitivity_mse_gaps.append(mse_shuffled - mse_correct)
+                sensitivity_wape_gaps.append(wape_shuffled - wape_correct)
+                if plan_global is not None and shuf_plan_global is not None:
+                    plan_shift_norms.append(float((plan_global - shuf_plan_global).norm(dim=-1).mean().item()))
+                    n_corr = min(pooled.shape[-1], plan_global.shape[-1])
+                    n_shuf = min(shuf_pooled.shape[-1], plan_global.shape[-1])
+                    if n_corr > 0:
+                        text_plan_cos_correct.append(float(torch.nn.functional.cosine_similarity(
+                            pooled[:, :n_corr].to(plan_global.dtype), plan_global[:, :n_corr], dim=-1
+                        ).mean().item()))
+                    if n_shuf > 0:
+                        text_plan_cos_shuffled.append(float(torch.nn.functional.cosine_similarity(
+                            shuf_pooled[:, :n_shuf].to(plan_global.dtype), plan_global[:, :n_shuf], dim=-1
+                        ).mean().item()))
 
             # Denormalize all K generations
             for k_idx in range(self.n_samples):
@@ -434,6 +496,15 @@ class MATDEvaluator:
                 )
                 condition_diag["plan_token_variance"] = float(plan_tokens_all.var().item())
                 condition_diag["text_plan_cosine"] = float(cos.mean().item())
+        if sensitivity_mse_gaps:
+            condition_diag["sensitivity_mse_gap"] = float(np.mean(sensitivity_mse_gaps))
+            condition_diag["sensitivity_wape_gap"] = float(np.mean(sensitivity_wape_gaps))
+        if plan_shift_norms:
+            condition_diag["plan_shift_norm"] = float(np.mean(plan_shift_norms))
+        if text_plan_cos_correct:
+            condition_diag["text_plan_cosine_correct"] = float(np.mean(text_plan_cos_correct))
+        if text_plan_cos_shuffled:
+            condition_diag["text_plan_cosine_shuffled"] = float(np.mean(text_plan_cos_shuffled))
 
         # --- T2S + CaTSG metrics via unified_metrics ---
         from mmldm.tiger.evaluation.unified_metrics import (
@@ -589,6 +660,11 @@ class MATDEvaluator:
             "structure/acf_mae",
             "condition/plan_token_variance",
             "condition/text_plan_cosine",
+            "condition/sensitivity_mse_gap",
+            "condition/sensitivity_wape_gap",
+            "condition/plan_shift_norm",
+            "condition/text_plan_cosine_correct",
+            "condition/text_plan_cosine_shuffled",
             "retrieval/mrr_at_k",
             "retrieval/top1_self_rate",
         ):

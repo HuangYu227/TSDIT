@@ -47,6 +47,10 @@ def _import_tokenizer():
 
 @dataclass
 class MATDConfig:
+    # Architecture switch
+    architecture: str = "core_v2"  # core_v2 or full
+    condition_sensitivity_eval: bool = True
+
     # Tokenizer
     embed_dim: int = 256
     target_tokens: int | None = None
@@ -78,8 +82,8 @@ class MATDConfig:
     planner_mode: str = "latent"  # latent or layout
     planner_depth: int = 3
     layout_source: str = "canonical"  # canonical, oracle, predicted
-    lambda_plan_stats: float = 0.2
-    lambda_plan_contrast: float = 0.05
+    lambda_plan_stats: float = 0.0
+    lambda_plan_contrast: float = 1.0
     lambda_plan_kl: float = 0.001
     lambda_plan_layout: float = 0.0
     plan_residual_scale: float = 0.2
@@ -148,15 +152,15 @@ class MATDConfig:
     # Loss weights (v2: 4 groups)
     lambda_diffusion: float = 1.0
     lambda_x0: float = 0.2
-    lambda_plan: float = 0.5
+    lambda_plan: float = 0.05
 
     # Sub-loss weights: LatentDiffusionBridgeLoss
     lambda_latent_x0: float = 0.25
     lambda_latent_cos: float = 0.05
     lambda_endpoint_recon: float = 1.0
-    lambda_endpoint_moment: float = 0.2
-    lambda_endpoint_delta: float = 0.2
-    lambda_endpoint_acf: float = 0.1
+    lambda_endpoint_moment: float = 0.0
+    lambda_endpoint_delta: float = 0.0
+    lambda_endpoint_acf: float = 0.0
     endpoint_acf_lags: int = 8
     endpoint_latent_clip: float = 20.0
 
@@ -167,8 +171,8 @@ class MATDConfig:
     lambda_range: float = 0.02
 
     # Sub-loss weights: CausalSemanticRouterLoss
-    lambda_causal: float = 0.01
-    lambda_moe: float = 0.01
+    lambda_causal: float = 0.0
+    lambda_moe: float = 0.0
     lambda_scci: float = 0.0
 
     # Optimizer / CFG
@@ -183,7 +187,7 @@ class MATDConfig:
     align_temperature: float = 0.07
     planner_beta: float = 1.0
     use_oracle_meta_prob: float = 0.0
-    use_causal_guidance_in_sampling: bool = True
+    use_causal_guidance_in_sampling: bool = False
 
 
 def _make_alpha_bar(num_steps: int, schedule: str = "cosine", beta_start: float = 1e-4, beta_end: float = 0.02) -> torch.Tensor:
@@ -209,6 +213,9 @@ class MATDModel(nn.Module):
         self.cfg = cfg
         D = cfg.embed_dim
         text_work_dim = cfg.model_dim
+        self.architecture = getattr(cfg, "architecture", "core_v2")
+        if self.architecture not in ("core_v2", "full"):
+            raise ValueError(f"architecture must be 'core_v2' or 'full', got {self.architecture!r}")
 
         # Validate all embed_dim / num_heads divisibility upfront so the
         # user gets a clear error instead of a cryptic shape-mismatch deep
@@ -458,6 +465,13 @@ class MATDModel(nn.Module):
 
     def _stage_weights(self, stage: int) -> LossWeights:
         """Return loss weights tuned for each training stage."""
+        if getattr(self.cfg, "architecture", "core_v2") == "core_v2":
+            return LossWeights(
+                diffusion_bridge=self.cfg.lambda_diffusion,
+                patch_field=self.cfg.lambda_x0,
+                text_layout=self.cfg.lambda_plan,
+                mechanism=0.0,
+            )
         if stage == 0:  # joint training
             return LossWeights(
                 diffusion_bridge=self.cfg.lambda_diffusion,
@@ -495,6 +509,144 @@ class MATDModel(nn.Module):
         )
 
     def forward_train(self, x0: torch.Tensor, texts: list[str], meta_override: Optional[torch.Tensor] = None, stage: int = 3, training: Optional[bool] = None) -> dict[str, Any]:
+        if getattr(self.cfg, "architecture", "core_v2") == "core_v2":
+            return self._forward_train_core_v2(
+                x0,
+                texts,
+                meta_override=meta_override,
+                stage=stage,
+                training=training,
+            )
+        return self._forward_train_full(
+            x0,
+            texts,
+            meta_override=meta_override,
+            stage=stage,
+            training=training,
+        )
+
+    def _forward_train_core_v2(
+        self,
+        x0: torch.Tensor,
+        texts: list[str],
+        meta_override: Optional[torch.Tensor] = None,
+        stage: int = 3,
+        training: Optional[bool] = None,
+    ) -> dict[str, Any]:
+        B = x0.shape[0]
+        training_mode = self.training if training is None else training
+        token_hidden, pooled, null_tokens, null_pooled, attention_mask, drop_mask = self._encode_text_cfg(texts, training=training_mode)
+        text_key_padding_mask = attention_mask == 0
+
+        z0, meta_oracle = self._encode_oracle(x0)
+        K = z0.shape[1]
+        meta_pred, plan = self._run_planner(token_hidden, pooled, text_key_padding_mask, K)
+        if meta_override is not None:
+            meta = meta_override.to(z0.device, dtype=z0.dtype)
+        else:
+            meta = build_canonical_meta(B, K, z0.device, z0.dtype)
+        meta_9 = meta[..., :9].to(z0.dtype)
+
+        plan_tokens = plan.plan_tokens.to(z0.dtype) if plan is not None else None
+        plan_global = plan.plan_global.to(z0.dtype) if plan is not None else None
+        if plan_tokens is not None:
+            z_clean = z0 + float(getattr(self.cfg, "plan_residual_scale", 0.2)) * plan_tokens
+        else:
+            z_clean = z0
+
+        t = torch.randint(0, self.cfg.timesteps, (B,), device=z0.device, dtype=torch.long)
+        noise = torch.randn_like(z_clean)
+        z_t = self._q_sample(z_clean, t, noise)
+        eps_pred = self._denoise_train_with_cfg_dropout(
+            z_t,
+            t,
+            token_hidden,
+            pooled,
+            attention_mask,
+            null_tokens,
+            null_pooled,
+            meta_9,
+            causal_feat=None,
+            drop_mask=drop_mask,
+            plan_tokens=plan_tokens,
+            plan_global=plan_global,
+        )
+        if self.cfg.pred_mode == "v":
+            ab = self._extract(t, z_clean)
+            diff_target = ab.sqrt() * noise - (1.0 - ab).sqrt() * z_clean
+            pred_x0_latent = self._predict_x0_from_v(z_t, eps_pred, t)
+        else:
+            diff_target = noise
+            pred_x0_latent = self._predict_x0_from_eps(z_t, eps_pred, t)
+
+        target_len = x0.shape[1]
+        z_decode = z_clean
+        if training_mode and getattr(self.cfg, "decoder_latent_noise_std", 0.0) > 0:
+            z_decode = z_decode + float(self.cfg.decoder_latent_noise_std) * torch.randn_like(z_decode)
+        x_hat = self.decoder(z_decode, meta_9, target_len)
+        x0_seq = x0.unsqueeze(-1) if x0.dim() == 2 else x0
+
+        diffusion_losses = self.loss_diffusion_bridge(
+            eps_pred,
+            diff_target,
+            z_t=z_t,
+            z_clean=z_clean,
+            t=t,
+            alpha_bar=self.alpha_bar,
+            prediction_type="v" if self.cfg.pred_mode == "v" else "eps",
+        )
+        latent_clip = float(getattr(self.cfg, "endpoint_latent_clip", 20.0))
+        if latent_clip > 0:
+            pred_x0_latent = pred_x0_latent.clamp(-latent_clip, latent_clip)
+        x_endpoint = self.decoder(pred_x0_latent, meta_9, target_len)
+        endpoint_losses = self.loss_endpoint_series(x_endpoint, x0_seq)
+        diffusion_losses["loss_diffusion_bridge_base"] = diffusion_losses["loss_diffusion_bridge"]
+        diffusion_losses.update(endpoint_losses)
+        diffusion_losses["loss_diffusion_bridge"] = (
+            diffusion_losses["loss_diffusion_bridge"]
+            + endpoint_losses["loss_endpoint_total"]
+        )
+
+        loss_dicts: dict[str, dict[str, torch.Tensor]] = {
+            "diffusion_bridge": diffusion_losses,
+            "patch_field": self.loss_patch_field(x_hat, x0_seq),
+        }
+        if self.planner_mode == "latent" and plan is not None:
+            plan_losses = self.loss_plan_consistency(plan.plan_global, pooled, x0_seq, plan_kl=plan.plan_kl)
+            plan_losses["diagnostics/plan_token_std"] = plan.plan_tokens.detach().std()
+            plan_losses["diagnostics/plan_global_norm"] = plan.plan_global.detach().norm(dim=-1).mean()
+            loss_dicts["text_layout"] = plan_losses
+
+        weights = self._stage_weights(stage)
+        total_loss, all_terms = compute_total_loss(loss_dicts, weights)
+        return {
+            "loss": total_loss,
+            "loss_total": total_loss,
+            "loss_terms": all_terms,
+            "loss_dicts": loss_dicts,
+            "z0": z0,
+            "z_base": z_clean,
+            "z_moe": z_clean,
+            "z_t": z_t,
+            "noise": noise,
+            "eps_pred": eps_pred,
+            "x_hat": x_hat,
+            "meta_pred": meta_pred,
+            "meta_oracle": meta_oracle,
+            "meta": meta,
+            "plan_tokens": plan_tokens,
+            "plan_global": plan_global,
+            "token_hidden": token_hidden,
+            "pooled": pooled,
+            "router_p": None,
+            "prior_p": None,
+            "causal_losses": {},
+            "causal_feat": None,
+            "A0": None,
+            "Alags": None,
+        }
+
+    def _forward_train_full(self, x0: torch.Tensor, texts: list[str], meta_override: Optional[torch.Tensor] = None, stage: int = 3, training: Optional[bool] = None) -> dict[str, Any]:
         B = x0.shape[0]
         training_mode = self.training if training is None else training
         token_hidden, pooled, null_tokens, null_pooled, attention_mask, drop_mask = self._encode_text_cfg(texts, training=training_mode)
@@ -672,6 +824,8 @@ class MATDModel(nn.Module):
         ddim_steps = self.cfg.ddim_steps if ddim_steps is None else ddim_steps
         cfg_scale = self.cfg.cfg_scale if cfg_scale is None else cfg_scale
         use_causal_guidance = self.cfg.use_causal_guidance_in_sampling if use_causal_guidance is None else use_causal_guidance
+        if self.architecture == "core_v2":
+            use_causal_guidance = False
 
         text_tokens, pooled, attention_mask = self.text_encoder(texts)
         null_tokens, null_pooled = self.null_encoder(B)
@@ -680,6 +834,8 @@ class MATDModel(nn.Module):
         if K is None:
             K = self.encoder._choose_k(target_length) if hasattr(self.encoder, "_choose_k") else max(self.cfg.min_tokens, math.ceil(target_length / self.cfg.target_seg_len))
         meta_9, plan = self._run_planner(text_tokens, pooled, text_key_padding_mask, K)
+        if self.architecture == "core_v2":
+            meta_9 = build_canonical_meta(B, K, device, dtype=pooled.dtype)
         meta_9 = meta_9.to(device)
         plan_tokens = plan.plan_tokens if plan is not None else None
         plan_global = plan.plan_global if plan is not None else None
