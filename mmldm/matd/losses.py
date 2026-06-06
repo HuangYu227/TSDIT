@@ -273,6 +273,100 @@ class AdaptivePatchFieldLoss(nn.Module):
         }
 
 
+class EndpointSeriesLoss(nn.Module):
+    """Sequence-level loss on the denoiser-implied clean endpoint.
+
+    The regular bridge objective aligns ``pred_x0`` with the clean latent.  This
+    loss closes the train/eval gap by decoding that endpoint and optimizing the
+    actual time-series statistics used by evaluation.
+    """
+
+    def __init__(
+        self,
+        recon_weight: float = 1.0,
+        moment_weight: float = 0.2,
+        delta_weight: float = 0.2,
+        acf_weight: float = 0.1,
+        acf_lags: int = 8,
+    ) -> None:
+        super().__init__()
+        self.recon_weight = float(recon_weight)
+        self.moment_weight = float(moment_weight)
+        self.delta_weight = float(delta_weight)
+        self.acf_weight = float(acf_weight)
+        self.acf_lags = int(acf_lags)
+
+    @staticmethod
+    def _ensure_btc(x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            return x.unsqueeze(-1)
+        return x
+
+    @staticmethod
+    def _moment_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_mean = pred.mean(dim=1)
+        tgt_mean = target.mean(dim=1)
+        pred_std = pred.std(dim=1, unbiased=False)
+        tgt_std = target.std(dim=1, unbiased=False)
+        pred_range = pred.amax(dim=1) - pred.amin(dim=1)
+        tgt_range = target.amax(dim=1) - target.amin(dim=1)
+        return (
+            F.l1_loss(pred_mean, tgt_mean)
+            + F.l1_loss(pred_std, tgt_std)
+            + F.l1_loss(pred_range, tgt_range)
+        )
+
+    @staticmethod
+    def _acf(x: torch.Tensor, max_lag: int) -> torch.Tensor:
+        B, T, C = x.shape
+        if T <= 1 or max_lag <= 0:
+            return x.new_zeros(B, 0, C)
+        centered = x - x.mean(dim=1, keepdim=True)
+        var = centered.pow(2).mean(dim=1).clamp_min(1e-6)
+        feats = []
+        for lag in range(1, min(max_lag, T - 1) + 1):
+            cov = (centered[:, :-lag] * centered[:, lag:]).mean(dim=1)
+            feats.append(cov / var)
+        if not feats:
+            return x.new_zeros(B, 0, C)
+        return torch.stack(feats, dim=1).clamp(-1.0, 1.0)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        pred = self._ensure_btc(_as_float(pred))
+        target = self._ensure_btc(_as_float(target))
+        if pred.shape != target.shape:
+            raise ValueError(f"endpoint pred/target shape mismatch: {tuple(pred.shape)} vs {tuple(target.shape)}")
+
+        loss_l1 = F.l1_loss(pred, target)
+        loss_mse = F.mse_loss(pred, target)
+        loss_recon = loss_l1 + 0.5 * loss_mse
+
+        d_pred = _finite_difference(pred, order=1)
+        d_tgt = _finite_difference(target, order=1)
+        loss_delta = F.l1_loss(d_pred, d_tgt) if d_pred.numel() > 0 else pred.new_tensor(0.0)
+
+        loss_moment = self._moment_loss(pred, target)
+        pred_acf = self._acf(pred, self.acf_lags)
+        tgt_acf = self._acf(target, self.acf_lags)
+        loss_acf = F.l1_loss(pred_acf, tgt_acf) if pred_acf.numel() > 0 else pred.new_tensor(0.0)
+
+        total = (
+            self.recon_weight * loss_recon
+            + self.moment_weight * loss_moment
+            + self.delta_weight * loss_delta
+            + self.acf_weight * loss_acf
+        )
+        return {
+            "loss_endpoint_l1": loss_l1,
+            "loss_endpoint_mse": loss_mse,
+            "loss_endpoint_recon": loss_recon,
+            "loss_endpoint_moment": loss_moment,
+            "loss_endpoint_delta": loss_delta,
+            "loss_endpoint_acf": loss_acf,
+            "loss_endpoint_total": total,
+        }
+
+
 # -----------------------------------------------------------------------------
 # 3) Text-to-layout loss
 # -----------------------------------------------------------------------------

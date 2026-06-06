@@ -117,7 +117,8 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     "decoder_field_blocks": 3,
     "decoder_siren_omega": 18.0,
     "decoder_siren_scale": 0.1,
-    "decoder_output_activation": "none",
+    "decoder_output_activation": "sigmoid",
+    "decoder_latent_noise_std": 0.02,
 
     # -----------------------------------------------------------------------
     # Diffusion schedule
@@ -134,6 +135,12 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     "lambda_delta": 0.1,
     "lambda_fft": 0.05,
     "lambda_plan": 0.5,
+    "lambda_endpoint_recon": 1.0,
+    "lambda_endpoint_moment": 0.2,
+    "lambda_endpoint_delta": 0.2,
+    "lambda_endpoint_acf": 0.1,
+    "endpoint_acf_lags": 8,
+    "endpoint_latent_clip": 20.0,
     "lambda_align": 0.05,
     "lambda_moe": 0.01,
     "lambda_causal": 0.01,

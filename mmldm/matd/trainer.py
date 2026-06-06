@@ -313,6 +313,9 @@ class MATDTrainer:
                     # Diagnostic: log key sub-losses to identify explosion source
                     diag_keys = [
                         "loss_diffusion_bridge", "loss_diffusion_denoise",
+                        "loss_diffusion_bridge_base", "loss_endpoint_total",
+                        "loss_endpoint_recon", "loss_endpoint_moment",
+                        "loss_endpoint_delta", "loss_endpoint_acf",
                         "loss_patch_field", "loss_field_l1",
                         "loss_text_layout", "loss_layout_distribution",
                         "loss_layout_length", "loss_layout_mass",

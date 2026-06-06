@@ -38,6 +38,7 @@ from .decoder import VariablePatchDecoder, LinearPatchDecoder
 from .losses import (
     AdaptivePatchFieldLoss,
     CausalSemanticRouterLoss,
+    EndpointSeriesLoss,
     LatentDiffusionBridgeLoss,
     TextLayoutLoss,
     LossWeights,
@@ -76,7 +77,7 @@ __all__ = [
     "DynamicCausalMechanismLearner",
     "T2PDenoiser", "TextTemporalDiTBlock", "RelativeTemporalSelfAttention",
     "VariablePatchDecoder", "LinearPatchDecoder",
-    "LatentDiffusionBridgeLoss", "AdaptivePatchFieldLoss", "TextLayoutLoss",
+    "LatentDiffusionBridgeLoss", "AdaptivePatchFieldLoss", "EndpointSeriesLoss", "TextLayoutLoss",
     "CausalSemanticRouterLoss", "LossWeights", "compute_total_loss", "weights_from_config",
     "GradientConflictMonitor", "LossBalanceConfig",
     "denorm_roundtrip_diagnostics", "summarize_metric_pathologies",

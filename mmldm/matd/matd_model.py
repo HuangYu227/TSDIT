@@ -24,6 +24,7 @@ from .dit import T2PDenoiser
 from .losses import (
     AdaptivePatchFieldLoss,
     CausalSemanticRouterLoss,
+    EndpointSeriesLoss,
     LatentDiffusionBridgeLoss,
     LossWeights,
     TextLayoutLoss,
@@ -126,7 +127,8 @@ class MATDConfig:
     decoder_field_blocks: int = 3
     decoder_siren_omega: float = 18.0
     decoder_siren_scale: float = 0.1
-    decoder_output_activation: str = "none"
+    decoder_output_activation: str = "sigmoid"
+    decoder_latent_noise_std: float = 0.02
 
     # Diffusion
     timesteps: int = 1000
@@ -141,6 +143,12 @@ class MATDConfig:
     # Sub-loss weights: LatentDiffusionBridgeLoss
     lambda_latent_x0: float = 0.25
     lambda_latent_cos: float = 0.05
+    lambda_endpoint_recon: float = 1.0
+    lambda_endpoint_moment: float = 0.2
+    lambda_endpoint_delta: float = 0.2
+    lambda_endpoint_acf: float = 0.1
+    endpoint_acf_lags: int = 8
+    endpoint_latent_clip: float = 20.0
 
     # Sub-loss weights: AdaptivePatchFieldLoss
     lambda_delta: float = 0.10
@@ -267,6 +275,13 @@ class MATDModel(nn.Module):
             curvature_weight=cfg.lambda_curvature,
             fft_weight=cfg.lambda_fft,
             range_weight=cfg.lambda_range,
+        )
+        self.loss_endpoint_series = EndpointSeriesLoss(
+            recon_weight=getattr(cfg, "lambda_endpoint_recon", 1.0),
+            moment_weight=getattr(cfg, "lambda_endpoint_moment", 0.2),
+            delta_weight=getattr(cfg, "lambda_endpoint_delta", 0.2),
+            acf_weight=getattr(cfg, "lambda_endpoint_acf", 0.1),
+            acf_lags=getattr(cfg, "endpoint_acf_lags", 8),
         )
         self.loss_text_layout = TextLayoutLoss()
         self.loss_mechanism = CausalSemanticRouterLoss(
@@ -491,19 +506,38 @@ class MATDModel(nn.Module):
                 diff_target = noise
 
         target_len = x0.shape[1]
-        x_hat = self.decoder(z_moe, meta_9, target_len)
+        z_decode = z_moe
+        if training_mode and stage != 1 and getattr(self.cfg, "decoder_latent_noise_std", 0.0) > 0:
+            z_decode = z_decode + float(self.cfg.decoder_latent_noise_std) * torch.randn_like(z_decode)
+        x_hat = self.decoder(z_decode, meta_9, target_len)
         x0_seq = x0.unsqueeze(-1) if x0.dim() == 2 else x0  # ensure (B,T,C)
 
         loss_dicts: dict[str, dict[str, torch.Tensor]] = {}
 
         # 1) Diffusion bridge: denoising + pred-x0 latent alignment
         if stage != 1 and eps_pred is not None and z_t is not None:
-            loss_dicts["diffusion_bridge"] = self.loss_diffusion_bridge(
+            diffusion_losses = self.loss_diffusion_bridge(
                 eps_pred, diff_target,
                 z_t=z_t, z_clean=z_moe,
                 t=t, alpha_bar=self.alpha_bar,
                 prediction_type="v" if self.cfg.pred_mode == "v" else "eps",
             )
+            if self.cfg.pred_mode == "v":
+                pred_x0_latent = self._predict_x0_from_v(z_t, eps_pred, t)
+            else:
+                pred_x0_latent = self._predict_x0_from_eps(z_t, eps_pred, t)
+            latent_clip = float(getattr(self.cfg, "endpoint_latent_clip", 20.0))
+            if latent_clip > 0:
+                pred_x0_latent = pred_x0_latent.clamp(-latent_clip, latent_clip)
+            x_endpoint = self.decoder(pred_x0_latent, meta_9, target_len)
+            endpoint_losses = self.loss_endpoint_series(x_endpoint, x0_seq)
+            diffusion_losses["loss_diffusion_bridge_base"] = diffusion_losses["loss_diffusion_bridge"]
+            diffusion_losses.update(endpoint_losses)
+            diffusion_losses["loss_diffusion_bridge"] = (
+                diffusion_losses["loss_diffusion_bridge"]
+                + endpoint_losses["loss_endpoint_total"]
+            )
+            loss_dicts["diffusion_bridge"] = diffusion_losses
 
         # 2) Patch field: shape-aware decoder reconstruction
         loss_dicts["patch_field"] = self.loss_patch_field(x_hat, x0_seq)

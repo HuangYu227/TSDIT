@@ -72,6 +72,12 @@ def main() -> None:
     # Sub-loss weights
     parser.add_argument("--lambda_latent_x0", type=float, default=None)
     parser.add_argument("--lambda_latent_cos", type=float, default=None)
+    parser.add_argument("--lambda_endpoint_recon", type=float, default=None)
+    parser.add_argument("--lambda_endpoint_moment", type=float, default=None)
+    parser.add_argument("--lambda_endpoint_delta", type=float, default=None)
+    parser.add_argument("--lambda_endpoint_acf", type=float, default=None)
+    parser.add_argument("--endpoint_acf_lags", type=int, default=None)
+    parser.add_argument("--endpoint_latent_clip", type=float, default=None)
     parser.add_argument("--lambda_delta", type=float, default=None)
     parser.add_argument("--lambda_curvature", type=float, default=None)
     parser.add_argument("--lambda_fft", type=float, default=None)
@@ -90,6 +96,8 @@ def main() -> None:
     parser.add_argument("--decoder_output_activation", type=str, default=None,
                         choices=["none", "sigmoid", "clamp"],
                         help="Optional decoder output activation/range diagnostic")
+    parser.add_argument("--decoder_latent_noise_std", type=float, default=None,
+                        help="Gaussian latent noise added before clean-path decoder reconstruction")
     parser.add_argument("--loss_balance_enabled", action="store_true",
                         help="Enable observe-only gradient conflict diagnostics")
     parser.add_argument("--loss_balance_interval", type=int, default=50,
@@ -136,6 +144,12 @@ def main() -> None:
         # Sub-loss weights
         "lambda_latent_x0": args.lambda_latent_x0,
         "lambda_latent_cos": args.lambda_latent_cos,
+        "lambda_endpoint_recon": args.lambda_endpoint_recon,
+        "lambda_endpoint_moment": args.lambda_endpoint_moment,
+        "lambda_endpoint_delta": args.lambda_endpoint_delta,
+        "lambda_endpoint_acf": args.lambda_endpoint_acf,
+        "endpoint_acf_lags": args.endpoint_acf_lags,
+        "endpoint_latent_clip": args.endpoint_latent_clip,
         "lambda_delta": args.lambda_delta,
         "lambda_curvature": args.lambda_curvature,
         "lambda_fft": args.lambda_fft,
@@ -148,6 +162,7 @@ def main() -> None:
         "decoder_siren_omega": args.decoder_siren_omega,
         "decoder_siren_scale": args.decoder_siren_scale,
         "decoder_output_activation": args.decoder_output_activation,
+        "decoder_latent_noise_std": args.decoder_latent_noise_std,
     }
     cfg_overrides.update({k: v for k, v in optional_overrides.items() if v is not None})
     cfg = MATDConfig(**cfg_overrides)
