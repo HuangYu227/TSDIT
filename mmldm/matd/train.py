@@ -119,11 +119,18 @@ def main() -> None:
                         help="Step interval for observe-only gradient diagnostics")
     parser.add_argument("--loss_balance_probe_components", type=str, nargs="*", default=None,
                         help="Optional parameter-name substrings to probe for gradient diagnostics")
+    parser.add_argument("--ema", dest="ema_enabled", action="store_true",
+                        help="Enable EMA weights for evaluation/checkpointing")
+    parser.add_argument("--no_ema", dest="ema_enabled", action="store_false",
+                        help="Disable EMA weights for evaluation/checkpointing")
+    parser.add_argument("--ema_decay", type=float, default=None,
+                        help="EMA decay if EMA is enabled")
     parser.add_argument("--condition_sensitivity_eval", dest="condition_sensitivity_eval", action="store_true",
                         help="Enable shuffled-text condition sensitivity diagnostics during evaluation")
     parser.add_argument("--no_condition_sensitivity_eval", dest="condition_sensitivity_eval", action="store_false",
                         help="Disable shuffled-text condition sensitivity diagnostics during evaluation")
     parser.set_defaults(condition_sensitivity_eval=None)
+    parser.set_defaults(ema_enabled=None)
     args = parser.parse_args()
     if args.no_causal_guidance and args.causal_guidance:
         parser.error("--no_causal_guidance and --causal_guidance are mutually exclusive")
@@ -162,6 +169,8 @@ def main() -> None:
         "use_causal_guidance_in_sampling": causal_guidance_override,
         "architecture": args.architecture,
         "condition_sensitivity_eval": args.condition_sensitivity_eval,
+        "ema_enabled": args.ema_enabled,
+        "ema_decay": args.ema_decay,
         "cfg_scale": args.cfg_scale,
         "p_drop_text": args.p_drop_text,
         "use_oracle_meta_prob": args.use_oracle_meta_prob,

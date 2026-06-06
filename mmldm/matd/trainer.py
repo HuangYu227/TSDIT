@@ -131,6 +131,11 @@ class MATDTrainer:
         ema_cfg = config.get("ema", {}) if isinstance(config.get("ema", {}), dict) else {}
         self.use_ema = bool(ema_cfg.get("enabled", _cfg_get(config, "ema_enabled", True)))
         self.ema = EMA(self.model, decay=float(ema_cfg.get("decay", _cfg_get(config, "ema_decay", 0.9999)))) if self.use_ema else None
+        logger.info(
+            "MATDTrainer EMA %s%s",
+            "enabled" if self.use_ema else "disabled",
+            f" decay={self.ema.decay}" if self.ema is not None else "",
+        )
         self.loss_balance_config = LossBalanceConfig.from_mapping(config.get("loss_balance"))
         self.gradient_monitor = GradientConflictMonitor()
 

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 import mmldm.matd.matd_model as matd_model
+from mmldm.matd.config import get_matd_config
 from mmldm.matd.matd_model import MATDConfig, MATDModel
 
 
@@ -120,3 +121,8 @@ def test_matd_config_core_v2_defaults():
     assert cfg.layout_source == "canonical"
     assert cfg.use_oracle_meta_prob == 0.0
     assert cfg.use_causal_guidance_in_sampling is False
+    assert cfg.ema_enabled is False
+    flat = get_matd_config()
+    assert flat["architecture"] == "core_v2"
+    assert flat["ema_enabled"] is False
+    assert flat["use_causal_guidance_in_sampling"] is False

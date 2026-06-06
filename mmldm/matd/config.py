@@ -171,7 +171,8 @@ MATD_DEFAULT_CONFIG: dict[str, Any] = {
     "total_steps": 100000,
     "batch_size": 32,
     "grad_clip": 1.0,
-    "ema_decay": 0.9999,
+    "ema_enabled": False,
+    "ema_decay": 0.999,
 
     # -----------------------------------------------------------------------
     # Classifier-Free Guidance (CFG)

@@ -182,6 +182,8 @@ class MATDConfig:
     total_steps: int = 100_000
     batch_size: int = 32
     grad_clip: float = 1.0
+    ema_enabled: bool = False
+    ema_decay: float = 0.999
     p_drop_text: float = 0.1
     cfg_scale: float = 5.0
     align_temperature: float = 0.07
