@@ -3,7 +3,8 @@
 Provides :class:`MATDDataset` which wraps the same data sources used by
 :class:`mmldm.tiger.data.dataset.TIGERDataset` (CSV and weather_npy formats)
 but returns ``(x0_tensor, text_str, ts_min, ts_max)`` tuples consumed by
-the MATD training loop.  Time series are normalised per-sample to [0, 1].
+the MATD training loop.  Time series are normalised to [0, 1] with either
+per-sample min-max scaling or dataset-level global min-max scaling.
 
 Also provides :class:`MATDDataModule` which assembles train / val / test
 DataLoaders with a padding collate function and configurable batch size.
@@ -48,7 +49,7 @@ class MATDDataset(Dataset):
        ``embedding_cleaned_{dataset}_{time_interval}.csv`` with columns
        ``SampleID, Text, OT, ...``.
 
-    Each sample is normalised per-sample to [0, 1] using min-max scaling.
+    Samples are normalised to [0, 1] using the selected scaling mode.
     A random caption is chosen when multiple captions are available.
 
     Args:
@@ -60,6 +61,9 @@ class MATDDataset(Dataset):
         max_samples: Optional cap on the number of samples loaded.
         seed: Random seed for reproducible train/val/test splits (CSV mode).
         split_ratio: ``(train_frac, val_frac, test_frac)`` for random splits.
+        normalization: ``"per_sample"`` preserves the historical behavior.
+            ``"global_minmax"`` uses a dataset-level scaler so raw level
+            information remains learnable from text.
     """
 
     def __init__(
@@ -72,11 +76,17 @@ class MATDDataset(Dataset):
         max_samples: Optional[int] = None,
         seed: int = 123,
         split_ratio: tuple[float, float, float] = (0.8, 0.1, 0.1),
+        normalization: str = "per_sample",
     ) -> None:
         super().__init__()
         self.data_dir = data_dir
         self.split = split
         self.dataset_type = dataset_type
+        self.normalization = normalization
+        if normalization not in {"per_sample", "global_minmax"}:
+            raise ValueError(
+                f"normalization must be 'per_sample' or 'global_minmax', got {normalization!r}"
+            )
 
         if dataset_type == "weather_npy":
             self._load_weather_npy()
@@ -101,9 +111,14 @@ class MATDDataset(Dataset):
                 f"training."
             )
 
-        # Per-sample min-max normalisation to [0, 1]
-        ts_min = self.ts_data.min(axis=1, keepdims=True)
-        ts_max = self.ts_data.max(axis=1, keepdims=True)
+        if normalization == "global_minmax":
+            global_min = float(getattr(self, "global_ts_min", np.min(self.ts_data)))
+            global_max = float(getattr(self, "global_ts_max", np.max(self.ts_data)))
+            ts_min = np.full((self.ts_data.shape[0], 1), global_min, dtype=np.float32)
+            ts_max = np.full((self.ts_data.shape[0], 1), global_max, dtype=np.float32)
+        else:
+            ts_min = self.ts_data.min(axis=1, keepdims=True)
+            ts_max = self.ts_data.max(axis=1, keepdims=True)
         ts_range = np.clip(ts_max - ts_min, a_min=1e-8, a_max=None)
         self.ts_norm = (self.ts_data - ts_min) / ts_range  # (N, T)
 
@@ -121,6 +136,8 @@ class MATDDataset(Dataset):
         caps_path = os.path.join(self.data_dir, f"{self.split}_text_caps.npy")
 
         self.ts_data = np.load(ts_path).astype(np.float32)  # (N, T)
+        self.global_ts_min = float(np.min(self.ts_data))
+        self.global_ts_max = float(np.max(self.ts_data))
         raw_caps = np.load(caps_path, allow_pickle=True)  # (N, n_caps)
 
         # Flatten to list of lists for uniform access
@@ -164,6 +181,8 @@ class MATDDataset(Dataset):
             for item in df["OT"]
         ]
         ts_data = np.array(parsed, dtype=np.float32)  # (N, T)
+        self.global_ts_min = float(np.min(ts_data))
+        self.global_ts_max = float(np.max(ts_data))
 
         # Text captions: wrap each in a list for uniform access
         caps: list[list[str]] = [[str(t)] for t in df["Text"].tolist()]
@@ -304,6 +323,7 @@ class MATDDataModule:
         seed: Random seed for reproducible splits.
         split_ratio: ``(train, val, test)`` fraction tuple.
         pin_memory: Whether to use pinned memory in DataLoaders.
+        normalization: ``"per_sample"`` or ``"global_minmax"``.
 
     Attributes:
         train_ds: Training split dataset.
@@ -331,6 +351,7 @@ class MATDDataModule:
         seed: int = 123,
         split_ratio: tuple[float, float, float] = (0.8, 0.1, 0.1),
         pin_memory: bool = True,
+        normalization: str = "per_sample",
     ) -> None:
         self.data_dir = data_dir
         self.dataset_type = dataset_type
@@ -342,6 +363,7 @@ class MATDDataModule:
         self.seed = seed
         self.split_ratio = split_ratio
         self.pin_memory = pin_memory
+        self.normalization = normalization
 
         # Build datasets eagerly so errors surface at construction time
         common = dict(
@@ -352,6 +374,7 @@ class MATDDataModule:
             max_samples=max_samples,
             seed=seed,
             split_ratio=split_ratio,
+            normalization=normalization,
         )
         self.train_ds = MATDDataset(split="train", **common)
         self.val_ds = MATDDataset(split="val", **common)

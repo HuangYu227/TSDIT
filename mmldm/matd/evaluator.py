@@ -176,6 +176,7 @@ class MATDEvaluator:
         target_length: int,
         plan_tokens: torch.Tensor | None = None,
         plan_global: torch.Tensor | None = None,
+        initial_z: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Generate one sample per text, reusing cached encoder outputs.
 
@@ -193,6 +194,8 @@ class MATDEvaluator:
             null_padding_mask: ``(B, S')`` all-False mask for null encoder.
             text_key_padding_mask: ``(B, S)`` padding mask from attention_mask.
             target_length: Target output sequence length.
+            initial_z: Optional ``(B, K, D)`` latent used to make paired
+                condition-sensitivity generations differ only in conditioning.
 
         Returns:
             ``(B, T, 1)`` generated time series (normalised scale).
@@ -213,7 +216,15 @@ class MATDEvaluator:
 
         K_patches = meta_9.shape[1]
         D = model.cfg.embed_dim
-        z = torch.randn(B, K_patches, D, device=device)
+        if initial_z is None:
+            z = torch.randn(B, K_patches, D, device=device)
+        else:
+            expected_shape = (B, K_patches, D)
+            if tuple(initial_z.shape) != expected_shape:
+                raise ValueError(
+                    f"initial_z shape must be {expected_shape}, got {tuple(initial_z.shape)}"
+                )
+            z = initial_z.to(device=device, dtype=text_tokens.dtype).clone()
         steps = torch.linspace(
             model.cfg.timesteps - 1, 0, ddim_steps, device=device
         ).long()
@@ -396,6 +407,13 @@ class MATDEvaluator:
             # Reuse cached text encoder, planner, and null encoder outputs
             # to avoid K redundant text-encoder + planner forward passes.
             gen_k_list: list[np.ndarray] = []
+            sensitivity_initial_z = None
+            if run_condition_sensitivity:
+                sensitivity_initial_z = torch.randn(
+                    B, K_patches, self.model.cfg.embed_dim, device=self.device,
+                    dtype=token_hidden.dtype,
+                )
+
             for _k in range(self.n_samples):
                 gen = self._generate_from_cache(
                     token_hidden, pooled, attention_mask,
@@ -404,6 +422,7 @@ class MATDEvaluator:
                     target_length=T,
                     plan_tokens=plan_tokens,
                     plan_global=plan_global,
+                    initial_z=sensitivity_initial_z if _k == 0 else None,
                 )  # (B, T, 1)
                 gen_k_list.append(gen.squeeze(-1).cpu().numpy())  # (B, T)
 
@@ -435,6 +454,7 @@ class MATDEvaluator:
                     target_length=T,
                     plan_tokens=shuf_plan_tokens,
                     plan_global=shuf_plan_global,
+                    initial_z=sensitivity_initial_z,
                 ).squeeze(-1).cpu().numpy()
                 gen_shuf_raw = self._denormalize(gen_shuf, batch_ts_min, batch_ts_max)
                 gen_real_raw_for_gap = self._denormalize(gen_k_list[0], batch_ts_min, batch_ts_max)

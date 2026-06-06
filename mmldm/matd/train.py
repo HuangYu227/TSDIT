@@ -31,6 +31,9 @@ def main() -> None:
     parser.add_argument("--datasets", type=str, nargs="+", required=True, help="Dataset names (e.g. traffic)")
     parser.add_argument("--time_interval", type=int, default=96, help="Sequence length (24, 48, 96)")
     parser.add_argument("--dataset_type", type=str, default="csv", choices=["csv", "weather_npy"])
+    parser.add_argument("--normalization", type=str, default="per_sample",
+                        choices=["per_sample", "global_minmax"],
+                        help="Time-series normalization protocol used by MATDDataModule")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--warmup_steps", type=int, default=1000)
@@ -225,6 +228,11 @@ def main() -> None:
         datasets=args.datasets,
         time_interval=args.time_interval,
         batch_size=cfg.batch_size,
+        normalization=args.normalization,
+    )
+    logging.getLogger(__name__).info(
+        "MATD data protocol: dataset_type=%s datasets=%s time_interval=%d normalization=%s",
+        args.dataset_type, ",".join(args.datasets), args.time_interval, args.normalization,
     )
 
     model = MATDModel(cfg).cuda()
