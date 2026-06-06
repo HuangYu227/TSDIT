@@ -639,6 +639,11 @@ class MATDModel(nn.Module):
             else:
                 plan_residual_ratio = torch.zeros((), device=z0.device, dtype=z0.dtype)
                 plan_to_z0_std_ratio = torch.zeros((), device=z0.device, dtype=z0.dtype)
+            text_drop_rate = (
+                drop_mask.float().mean()
+                if drop_mask is not None
+                else torch.zeros((), device=z0.device, dtype=z0.dtype)
+            )
             all_terms.update({
                 "train_diag/clean_recon_mse": clean_recon_mse,
                 "train_diag/endpoint_recon_mse": endpoint_recon_mse,
@@ -652,7 +657,7 @@ class MATDModel(nn.Module):
                 "train_diag/pred_over_clean_rms": pred_x0_rms / (z_clean_rms + eps),
                 "train_diag/plan_residual_ratio": plan_residual_ratio,
                 "train_diag/plan_to_z0_std_ratio": plan_to_z0_std_ratio,
-                "train_diag/text_drop_rate": drop_mask.float().mean(),
+                "train_diag/text_drop_rate": text_drop_rate,
                 "train_diag/timestep_mean": t.float().mean(),
                 "train_diag/timestep_max": t.float().max(),
             })
