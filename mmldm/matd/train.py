@@ -69,6 +69,18 @@ def main() -> None:
                         help="Override patch field group weight (default: 0.2)")
     parser.add_argument("--lambda_plan", type=float, default=None,
                         help="Override text layout group weight (default: 0.5)")
+    parser.add_argument("--planner_mode", type=str, default=None, choices=["latent", "layout"],
+                        help="Planner mode: latent temporal plan or legacy layout regression")
+    parser.add_argument("--planner_depth", type=int, default=None,
+                        help="Number of PlanFormer blocks in latent planner mode")
+    parser.add_argument("--layout_source", type=str, default=None, choices=["canonical", "oracle", "predicted"],
+                        help="Layout metadata source for latent planner mode")
+    parser.add_argument("--lambda_plan_stats", type=float, default=None)
+    parser.add_argument("--lambda_plan_contrast", type=float, default=None)
+    parser.add_argument("--lambda_plan_kl", type=float, default=None)
+    parser.add_argument("--lambda_plan_layout", type=float, default=None)
+    parser.add_argument("--plan_residual_scale", type=float, default=None)
+    parser.add_argument("--plan_context_scale", type=float, default=None)
     # Sub-loss weights
     parser.add_argument("--lambda_latent_x0", type=float, default=None)
     parser.add_argument("--lambda_latent_cos", type=float, default=None)
@@ -140,6 +152,15 @@ def main() -> None:
         "lambda_diffusion": args.lambda_diffusion,
         "lambda_x0": args.lambda_x0,
         "lambda_plan": args.lambda_plan,
+        "planner_mode": args.planner_mode,
+        "planner_depth": args.planner_depth,
+        "layout_source": args.layout_source,
+        "lambda_plan_stats": args.lambda_plan_stats,
+        "lambda_plan_contrast": args.lambda_plan_contrast,
+        "lambda_plan_kl": args.lambda_plan_kl,
+        "lambda_plan_layout": args.lambda_plan_layout,
+        "plan_residual_scale": args.plan_residual_scale,
+        "plan_context_scale": args.plan_context_scale,
         "min_snr_gamma": args.min_snr_gamma,
         # Sub-loss weights
         "lambda_latent_x0": args.lambda_latent_x0,

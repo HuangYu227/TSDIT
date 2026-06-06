@@ -372,6 +372,104 @@ class EndpointSeriesLoss(nn.Module):
 # -----------------------------------------------------------------------------
 
 
+class PlanConsistencyLoss(nn.Module):
+    """Text latent plan supervision via sequence statistics and contrastive binding."""
+
+    def __init__(
+        self,
+        plan_dim: int,
+        text_dim: int,
+        stats_weight: float = 0.2,
+        contrast_weight: float = 0.05,
+        kl_weight: float = 0.001,
+        temperature: float = 0.07,
+    ) -> None:
+        super().__init__()
+        self.stats_weight = float(stats_weight)
+        self.contrast_weight = float(contrast_weight)
+        self.kl_weight = float(kl_weight)
+        self.temperature = float(temperature)
+        self.stats_head = nn.Sequential(
+            nn.LayerNorm(plan_dim),
+            nn.Linear(plan_dim, plan_dim),
+            nn.SiLU(),
+            nn.Linear(plan_dim, 6),
+        )
+        self.plan_proj = nn.Linear(plan_dim, plan_dim)
+        self.text_proj = nn.Linear(text_dim, plan_dim)
+
+    @staticmethod
+    def _ensure_btc(x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            return x.unsqueeze(-1)
+        return x
+
+    @staticmethod
+    def _target_stats(x: torch.Tensor) -> torch.Tensor:
+        x = PlanConsistencyLoss._ensure_btc(_as_float(x))
+        mean = x.mean(dim=(1, 2))
+        std = x.std(dim=(1, 2), unbiased=False)
+        value_range = x.amax(dim=(1, 2)) - x.amin(dim=(1, 2))
+        delta = _finite_difference(x, order=1)
+        if delta.numel() > 0:
+            mean_abs_delta = delta.abs().mean(dim=(1, 2))
+            max_abs_delta = delta.abs().amax(dim=(1, 2))
+        else:
+            mean_abs_delta = x.new_zeros(x.shape[0])
+            max_abs_delta = x.new_zeros(x.shape[0])
+
+        centered = x - x.mean(dim=1, keepdim=True)
+        psd = torch.fft.rfft(centered.float(), dim=1).abs().pow(2)
+        if psd.shape[1] > 1:
+            low_end = min(4, psd.shape[1])
+            low_energy = psd[:, 1:low_end].sum(dim=(1, 2))
+            total_energy = psd[:, 1:].sum(dim=(1, 2)).clamp_min(1e-8)
+            low_freq_ratio = low_energy / total_energy
+        else:
+            low_freq_ratio = x.new_zeros(x.shape[0])
+
+        return torch.stack(
+            [mean, std, value_range, mean_abs_delta, max_abs_delta, low_freq_ratio.to(x.dtype)],
+            dim=-1,
+        )
+
+    def forward(
+        self,
+        plan_global: torch.Tensor,
+        pooled_text: torch.Tensor,
+        x0: torch.Tensor,
+        plan_kl: Optional[torch.Tensor] = None,
+    ) -> dict[str, torch.Tensor]:
+        target = self._target_stats(x0).detach().to(plan_global.dtype)
+        pred = self.stats_head(plan_global)
+        loss_stats = F.smooth_l1_loss(pred, target)
+
+        plan_z = F.normalize(self.plan_proj(plan_global), dim=-1)
+        text_z = F.normalize(self.text_proj(pooled_text.to(plan_global.dtype)), dim=-1)
+        logits = (plan_z @ text_z.T) / max(self.temperature, 1e-6)
+        labels = torch.arange(plan_global.shape[0], device=plan_global.device)
+        if plan_global.shape[0] > 1:
+            loss_contrast = 0.5 * (
+                F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)
+            )
+        else:
+            loss_contrast = plan_global.new_tensor(0.0)
+
+        loss_kl = plan_kl if torch.is_tensor(plan_kl) else plan_global.new_tensor(0.0)
+        total = (
+            self.stats_weight * loss_stats
+            + self.contrast_weight * loss_contrast
+            + self.kl_weight * loss_kl
+        )
+        return {
+            "loss_plan_stats": loss_stats,
+            "loss_plan_contrast": loss_contrast,
+            "loss_plan_kl": loss_kl,
+            "loss_plan_total": total,
+            "loss_text_layout": total,
+        }
+
+
 _START, _END, _CENTER, _LENGTH, _LOG_LEN = range(5)
 _MASS, _DENSITY, _LOG_DENS, _ORDER = 5, 6, 7, 8
 

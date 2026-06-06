@@ -5,6 +5,7 @@ import numpy as np
 from mmldm.matd.metrics_matd import (
     compute_multisample_metrics,
     compute_retrieval_diagnostics,
+    compute_robust_distribution_metrics,
     compute_scale_diagnostics,
     ensure_btd,
     ensure_nktd,
@@ -70,3 +71,41 @@ def test_retrieval_diagnostics_reports_saturation_and_failures():
 
     assert swapped_diag["mrr_at_k"] < 1.0
     assert swapped_diag["top1_self_rate"] < 1.0
+
+
+def test_robust_distribution_metrics_are_zero_for_identical_arrays():
+    real = np.array(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [2.0, 3.0, 4.0, 5.0],
+            [3.0, 4.0, 5.0, 6.0],
+        ]
+    )
+
+    metrics = compute_robust_distribution_metrics(real, real.copy(), n_bins=10)
+
+    assert metrics["mdd_prob"] == 0.0
+    assert metrics["js_flat"] == 0.0
+    assert metrics["mmd_median"] == 0.0
+    assert metrics["wasserstein1_flat"] == 0.0
+    assert metrics["outside_real_range_rate"] == 0.0
+
+
+def test_robust_distribution_metrics_stay_finite_for_out_of_range_generation():
+    real = np.array(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [2.0, 3.0, 4.0, 5.0],
+            [3.0, 4.0, 5.0, 6.0],
+        ]
+    )
+    gen = real + 10.0
+
+    metrics = compute_robust_distribution_metrics(real, gen, n_bins=10)
+
+    assert metrics["mdd_prob"] > 0.0
+    assert metrics["js_flat"] > 0.0
+    assert metrics["mmd_median"] > 0.0
+    assert metrics["wasserstein1_flat"] > 0.0
+    assert metrics["outside_real_range_rate"] == 1.0
+    assert all(math.isfinite(v) for v in metrics.values())

@@ -317,8 +317,12 @@ class MATDTrainer:
                         "loss_endpoint_recon", "loss_endpoint_moment",
                         "loss_endpoint_delta", "loss_endpoint_acf",
                         "loss_patch_field", "loss_field_l1",
+                        "loss_plan_total", "loss_plan_stats",
+                        "loss_plan_contrast", "loss_plan_kl",
                         "loss_text_layout", "loss_layout_distribution",
                         "loss_layout_length", "loss_layout_mass",
+                        "diagnostics/plan_token_std",
+                        "diagnostics/plan_global_norm",
                         "loss_mechanism", "grad_norm",
                     ]
                     diag = " ".join(

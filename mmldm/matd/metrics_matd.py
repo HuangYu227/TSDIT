@@ -100,6 +100,145 @@ def _macro_mean(values: np.ndarray) -> float:
     return _safe_float(np.nanmean(values))
 
 
+def _hist_prob(
+    values: np.ndarray,
+    bins: np.ndarray,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    vals = _finite_values(values)
+    if vals.size == 0:
+        prob = np.full(len(bins) - 1, 1.0 / max(len(bins) - 1, 1), dtype=np.float64)
+        return prob
+    counts, _ = np.histogram(vals, bins=bins, density=False)
+    prob = counts.astype(np.float64) + eps
+    return prob / np.sum(prob)
+
+
+def _combined_bins(real: np.ndarray, gen: np.ndarray, n_bins: int) -> np.ndarray:
+    vals = np.concatenate([_finite_values(real), _finite_values(gen)])
+    if vals.size == 0:
+        return np.linspace(0.0, 1.0, n_bins + 1)
+    lo = float(np.min(vals))
+    hi = float(np.max(vals))
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return np.linspace(0.0, 1.0, n_bins + 1)
+    if hi <= lo:
+        pad = max(abs(lo), 1.0) * 1e-6
+        lo -= pad
+        hi += pad
+    return np.linspace(lo, hi, n_bins + 1)
+
+
+def _js_divergence_prob(p: np.ndarray, q: np.ndarray, eps: float = 1e-12) -> float:
+    p = np.asarray(p, dtype=np.float64) + eps
+    q = np.asarray(q, dtype=np.float64) + eps
+    p = p / np.sum(p)
+    q = q / np.sum(q)
+    m = 0.5 * (p + q)
+    kl_pm = np.sum(p * (np.log(p) - np.log(m)))
+    kl_qm = np.sum(q * (np.log(q) - np.log(m)))
+    return _safe_float(0.5 * (kl_pm + kl_qm))
+
+
+def _pairwise_sq_dists(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    x_norm = np.sum(x * x, axis=1, keepdims=True)
+    y_norm = np.sum(y * y, axis=1, keepdims=True).T
+    return np.maximum(x_norm + y_norm - 2.0 * (x @ y.T), 0.0)
+
+
+def _mmd_rbf_median(
+    real_flat: np.ndarray,
+    gen_flat: np.ndarray,
+    max_samples: int = 1024,
+) -> float:
+    n = min(real_flat.shape[0], gen_flat.shape[0])
+    if n == 0:
+        return float("nan")
+    if n > max_samples:
+        idx = np.linspace(0, n - 1, max_samples, dtype=np.int64)
+        real_flat = real_flat[idx]
+        gen_flat = gen_flat[idx]
+        n = max_samples
+    combined = np.concatenate([real_flat, gen_flat], axis=0)
+    d2_combined = _pairwise_sq_dists(combined, combined)
+    positive = d2_combined[d2_combined > 1e-12]
+    if positive.size == 0:
+        return 0.0
+    median_sq = float(np.median(positive))
+    gamma = 1.0 / max(2.0 * median_sq, 1e-12)
+    k_xx = np.exp(-gamma * _pairwise_sq_dists(real_flat, real_flat))
+    k_yy = np.exp(-gamma * _pairwise_sq_dists(gen_flat, gen_flat))
+    k_xy = np.exp(-gamma * _pairwise_sq_dists(real_flat, gen_flat))
+    return _safe_float(max(float(k_xx.mean() + k_yy.mean() - 2.0 * k_xy.mean()), 0.0))
+
+
+def compute_robust_distribution_metrics(
+    real_raw: np.ndarray,
+    gen_raw: np.ndarray,
+    n_bins: int = 50,
+    mmd_max_samples: int = 1024,
+    eps: float = 1e-12,
+) -> dict[str, float]:
+    """Compute distribution diagnostics with stricter distance properties.
+
+    These metrics are intentionally separate from the CaTSG-compatible
+    histogram metrics.  They use shared probability-mass histograms, finite
+    smoothing, and a median-heuristic RBF kernel so identical arrays return
+    zero up to numerical precision and out-of-range generations do not create
+    NaNs.
+    """
+    real = ensure_btd(real_raw)
+    gen = ensure_btd(gen_raw)
+    if real.shape != gen.shape:
+        raise ValueError(f"shape mismatch: real {real.shape} vs gen {gen.shape}")
+
+    n_bins = max(int(n_bins), 2)
+    mdd_terms = []
+    for d in range(real.shape[2]):
+        for t in range(real.shape[1]):
+            r = real[:, t, d]
+            g = gen[:, t, d]
+            bins = _combined_bins(r, g, n_bins)
+            p = _hist_prob(r, bins, eps=eps)
+            q = _hist_prob(g, bins, eps=eps)
+            mdd_terms.append(np.mean(np.abs(p - q)))
+
+    flat_bins = _combined_bins(real, gen, n_bins)
+    p_flat = _hist_prob(real, flat_bins, eps=eps)
+    q_flat = _hist_prob(gen, flat_bins, eps=eps)
+    js_flat = _js_divergence_prob(p_flat, q_flat, eps=eps)
+
+    real_flat_values = _finite_values(real)
+    gen_flat_values = _finite_values(gen)
+    if real_flat_values.size and gen_flat_values.size:
+        n = min(real_flat_values.size, gen_flat_values.size)
+        wasserstein1 = np.mean(
+            np.abs(np.sort(real_flat_values)[:n] - np.sort(gen_flat_values)[:n])
+        )
+    else:
+        wasserstein1 = np.nan
+
+    real_seq = np.nan_to_num(real.reshape(real.shape[0], -1), nan=0.0, posinf=0.0, neginf=0.0)
+    gen_seq = np.nan_to_num(gen.reshape(gen.shape[0], -1), nan=0.0, posinf=0.0, neginf=0.0)
+    mmd_median = _mmd_rbf_median(real_seq, gen_seq, max_samples=mmd_max_samples)
+
+    real_min = np.nanmin(real) if np.isfinite(real).any() else np.nan
+    real_max = np.nanmax(real) if np.isfinite(real).any() else np.nan
+    if np.isfinite(real_min) and np.isfinite(real_max):
+        outside = (gen < real_min) | (gen > real_max)
+        outside_rate = np.nanmean(outside.astype(np.float64))
+    else:
+        outside_rate = np.nan
+
+    return {
+        "mdd_prob": _safe_float(np.nanmean(mdd_terms)),
+        "js_flat": _safe_float(js_flat),
+        "mmd_median": _safe_float(mmd_median),
+        "wasserstein1_flat": _safe_float(wasserstein1),
+        "outside_real_range_rate": _safe_float(outside_rate),
+    }
+
+
 def compute_scale_diagnostics(
     real_raw: np.ndarray,
     gen_raw: np.ndarray | None = None,

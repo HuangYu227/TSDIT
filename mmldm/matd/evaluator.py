@@ -44,6 +44,7 @@ from .matd_model import MATDModel
 from .metrics_matd import (
     compute_multisample_metrics,
     compute_retrieval_diagnostics,
+    compute_robust_distribution_metrics,
     compute_scale_diagnostics,
     compute_temporal_structure_metrics,
 )
@@ -172,6 +173,8 @@ class MATDEvaluator:
         null_padding_mask: torch.Tensor,
         text_key_padding_mask: torch.Tensor,
         target_length: int,
+        plan_tokens: torch.Tensor | None = None,
+        plan_global: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Generate one sample per text, reusing cached encoder outputs.
 
@@ -221,6 +224,8 @@ class MATDEvaluator:
                 z, t, text_tokens, meta_9, pooled,
                 causal_feat=causal_feat,
                 text_padding_mask=text_key_padding_mask,
+                plan_tokens=plan_tokens,
+                plan_global=plan_global,
             )
             eps_uncond = model.denoiser(
                 z, t, null_tokens, meta_9, null_pooled,
@@ -322,6 +327,8 @@ class MATDEvaluator:
         all_text_embed = []    # list of (B, text_dim)
         all_planner_meta = []  # list of (B, K, 9)
         all_scci_slots = []    # list of (B, n_slots, D)
+        all_plan_tokens = []   # list of (B, K, D), latent planner only
+        all_plan_global = []   # list of (B, D), latent planner only
 
         for batch in test_loader:
             x0_norm, texts, ts_mins, ts_maxs = (
@@ -343,8 +350,8 @@ class MATDEvaluator:
                     math.ceil(T / self.model.cfg.target_seg_len),
                 )
             )
-            planner_meta = self.model.planner(
-                token_hidden, text_padding_mask=text_padding_mask, n_patches=K_patches
+            meta_9, plan = self.model._run_planner(
+                token_hidden, pooled, text_padding_mask, K_patches
             )
             scci_slots = self.model.slot_extractor(
                 token_hidden, text_padding_mask=text_padding_mask
@@ -355,12 +362,16 @@ class MATDEvaluator:
             null_padding_mask = torch.zeros(
                 null_tokens.shape[:2], device=self.device, dtype=torch.bool
             )
-            meta_9 = planner_meta[..., :9]
+            plan_tokens = plan.plan_tokens if plan is not None else None
+            plan_global = plan.plan_global if plan is not None else None
 
             # Only keep the first 9 meta dims (consistent with decoder)
             all_text_embed.append(pooled.detach().cpu())               # (B, text_dim)
             all_planner_meta.append(meta_9.detach().cpu())             # (B, K, 9)
             all_scci_slots.append(scci_slots.detach().cpu())           # (B, n_slots, D)
+            if plan_tokens is not None and plan_global is not None:
+                all_plan_tokens.append(plan_tokens.detach().cpu())
+                all_plan_global.append(plan_global.detach().cpu())
 
             # -- Generate K independent samples per text --
             # Reuse cached text encoder, planner, and null encoder outputs
@@ -372,6 +383,8 @@ class MATDEvaluator:
                     meta_9, null_tokens, null_pooled,
                     null_padding_mask, text_padding_mask,
                     target_length=T,
+                    plan_tokens=plan_tokens,
+                    plan_global=plan_global,
                 )  # (B, T, 1)
                 gen_k_list.append(gen.squeeze(-1).cpu().numpy())  # (B, T)
 
@@ -409,6 +422,18 @@ class MATDEvaluator:
         text_embed = torch.cat(all_text_embed, dim=0).numpy()    # (N, text_dim)
         planner_meta = torch.cat(all_planner_meta, dim=0).numpy()  # (N, K, 9)
         scci_slots = torch.cat(all_scci_slots, dim=0).numpy()    # (N, n_slots, D)
+        condition_diag: dict[str, float] = {}
+        if all_plan_tokens and all_plan_global:
+            plan_tokens_all = torch.cat(all_plan_tokens, dim=0)
+            plan_global_all = torch.cat(all_plan_global, dim=0)
+            text_embed_t = torch.cat(all_text_embed, dim=0).to(plan_global_all.dtype)
+            n = min(text_embed_t.shape[-1], plan_global_all.shape[-1])
+            if n > 0:
+                cos = torch.nn.functional.cosine_similarity(
+                    text_embed_t[:, :n], plan_global_all[:, :n], dim=-1
+                )
+                condition_diag["plan_token_variance"] = float(plan_tokens_all.var().item())
+                condition_diag["text_plan_cosine"] = float(cos.mean().item())
 
         # --- T2S + CaTSG metrics via unified_metrics ---
         from mmldm.tiger.evaluation.unified_metrics import (
@@ -439,6 +464,7 @@ class MATDEvaluator:
             x0_norm_all, ts_mins_all, ts_maxs_all
         )
         structure = compute_temporal_structure_metrics(real_raw, gen_single)
+        robust_distribution = compute_robust_distribution_metrics(real_raw, gen_single)
         multisample = compute_multisample_metrics(real_raw, gen_multi)
         retrieval = compute_retrieval_diagnostics(
             real_raw, gen_multi, top_k=10
@@ -505,6 +531,8 @@ class MATDEvaluator:
         results.update({f"diagnostics/{k}": v for k, v in scale_diag.items()})
         results.update({f"diagnostics/{k}": v for k, v in denorm_diag.items()})
         results.update({f"structure/{k}": v for k, v in structure.items()})
+        results.update({f"robust/{k}": v for k, v in robust_distribution.items()})
+        results.update({f"condition/{k}": v for k, v in condition_diag.items()})
         results.update({f"multisample/{k}": v for k, v in multisample.items()})
         results.update({f"retrieval/{k}": v for k, v in retrieval.items()})
         results.update({f"diagnostics/{k}": v for k, v in summarize_metric_pathologies(results).items()})
@@ -535,6 +563,16 @@ class MATDEvaluator:
         print(f"    KL:   {results['KL']:.6f}")
         print(f"    MMD:  {results['MMD']:.6f}")
         print()
+        print("  Robust distribution metrics:")
+        for key in (
+            "robust/mdd_prob",
+            "robust/js_flat",
+            "robust/mmd_median",
+            "robust/wasserstein1_flat",
+        ):
+            if key in results:
+                print(f"    {key}: {results[key]:.6f}")
+        print()
         print("  Distribution-level (J-FTSD):")
         for variant in ("text", "planner", "slots"):
             val = results.get(f"J-FTSD_{variant}")
@@ -549,6 +587,8 @@ class MATDEvaluator:
             "diagnostics/target_tiny_denominator_ratio",
             "multisample/best_mse",
             "structure/acf_mae",
+            "condition/plan_token_variance",
+            "condition/text_plan_cosine",
             "retrieval/mrr_at_k",
             "retrieval/top1_self_rate",
         ):

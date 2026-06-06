@@ -232,6 +232,7 @@ class T2PDenoiser(nn.Module):
         norm_eps: float = 1e-5,
         sinusoidal_dim: int = 256,
         prediction_type: str = "epsilon",
+        plan_context_scale: float = 1.0,
     ) -> None:
         super().__init__()
         if prediction_type not in ("epsilon", "eps", "v"):
@@ -241,10 +242,13 @@ class T2PDenoiser(nn.Module):
         self.hidden_dim = hidden_dim
         self.prediction_type = "epsilon" if prediction_type == "eps" else prediction_type
         self.sinusoidal_dim = sinusoidal_dim
+        self.plan_context_scale = float(plan_context_scale)
         self.timestep_mlp = nn.Sequential(nn.Linear(sinusoidal_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
         self.input_proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
         self.causal_token_proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
         self.causal_pool_proj = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+        self.plan_token_proj = nn.Linear(input_dim, text_dim) if input_dim != text_dim else nn.Identity()
+        self.plan_global_proj = nn.Linear(input_dim, text_dim) if input_dim != text_dim else nn.Identity()
         self.global_cond_mlp = nn.Sequential(nn.Linear(hidden_dim + text_dim + hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
         self.blocks = nn.ModuleList([
             TextTemporalDiTBlock(hidden_dim, text_dim, n_heads, mlp_expand, num_buckets, max_rel_dist, use_density_bias, use_causal_bias, dropout, qk_norm, norm_eps)
@@ -270,11 +274,36 @@ class T2PDenoiser(nn.Module):
         pooled_text: torch.Tensor,
         causal_feat: Optional[torch.Tensor] = None,
         text_padding_mask: Optional[torch.Tensor] = None,
+        plan_tokens: Optional[torch.Tensor] = None,
+        plan_global: Optional[torch.Tensor] = None,
+        plan_padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         centers = meta[..., 2].clamp(0.0, 1.0)
         log_density = meta[..., 7] if meta.shape[-1] > 7 else None
         timestep_emb = self._timestep_embed(t)
         x = self.input_proj(z_t)
+        if plan_tokens is not None:
+            plan_text_tokens = self.plan_token_proj(plan_tokens.to(dtype=text_tokens.dtype))
+            text_tokens = torch.cat([text_tokens, plan_text_tokens], dim=1)
+            if text_padding_mask is not None or plan_padding_mask is not None:
+                if text_padding_mask is None:
+                    text_padding_mask = torch.zeros(
+                        text_tokens.shape[0],
+                        text_tokens.shape[1] - plan_text_tokens.shape[1],
+                        device=text_tokens.device,
+                        dtype=torch.bool,
+                    )
+                if plan_padding_mask is None:
+                    plan_padding_mask = torch.zeros(
+                        plan_text_tokens.shape[:2],
+                        device=text_tokens.device,
+                        dtype=torch.bool,
+                    )
+                text_padding_mask = torch.cat([text_padding_mask, plan_padding_mask], dim=1)
+        if plan_global is not None:
+            pooled_text = pooled_text + self.plan_context_scale * self.plan_global_proj(
+                plan_global.to(dtype=pooled_text.dtype)
+            )
         if causal_feat is not None:
             causal_tokens = self.causal_token_proj(causal_feat)
             x = x + causal_tokens

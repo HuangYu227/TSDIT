@@ -27,11 +27,12 @@ from .losses import (
     EndpointSeriesLoss,
     LatentDiffusionBridgeLoss,
     LossWeights,
+    PlanConsistencyLoss,
     TextLayoutLoss,
     compute_total_loss,
 )
 from .moe import SemanticCausalTemporalMoE
-from .planner import TextToPatchPlanner
+from .planner import PlanOutput, TextLatentPlanGenerator, TextToPatchPlanner, build_canonical_meta
 from .scci import SemanticCausalConditionInjector, TextSemanticSlotExtractor
 from .text_encoder import MATDTextEncoder, NullTextEncoder
 
@@ -74,6 +75,15 @@ class MATDConfig:
     n_slots: int = 6
     slot_iters: int = 2
     planner_heads: int = 8
+    planner_mode: str = "latent"  # latent or layout
+    planner_depth: int = 3
+    layout_source: str = "canonical"  # canonical, oracle, predicted
+    lambda_plan_stats: float = 0.2
+    lambda_plan_contrast: float = 0.05
+    lambda_plan_kl: float = 0.001
+    lambda_plan_layout: float = 0.0
+    plan_residual_scale: float = 0.2
+    plan_context_scale: float = 1.0
     scci_heads: int = 4
     scci_dropout: float = 0.0
 
@@ -243,12 +253,24 @@ class MATDModel(nn.Module):
         except TypeError:
             self.encoder = Tokenizer(**tok_kwargs)
 
-        self.planner = TextToPatchPlanner(text_dim=text_work_dim, hidden_dim=D, n_heads=cfg.planner_heads, n_patches=cfg.max_tokens)
+        self.planner_mode = getattr(cfg, "planner_mode", "latent")
+        if self.planner_mode not in ("latent", "layout"):
+            raise ValueError(f"planner_mode must be 'latent' or 'layout', got {self.planner_mode!r}")
+        if self.planner_mode == "latent":
+            self.planner = TextLatentPlanGenerator(
+                text_dim=text_work_dim,
+                hidden_dim=D,
+                n_heads=cfg.planner_heads,
+                n_patches=cfg.max_tokens,
+                depth=getattr(cfg, "planner_depth", 3),
+            )
+        else:
+            self.planner = TextToPatchPlanner(text_dim=text_work_dim, hidden_dim=D, n_heads=cfg.planner_heads, n_patches=cfg.max_tokens)
         self.slot_extractor = TextSemanticSlotExtractor(text_dim=text_work_dim, dim=D, n_slots=cfg.n_slots, n_heads=cfg.scci_heads, n_iters=cfg.slot_iters, dropout=cfg.scci_dropout)
         self.injector = SemanticCausalConditionInjector(dim=D, meta_dim=9, n_heads=cfg.scci_heads, dropout=cfg.scci_dropout)
         self.causal = DynamicCausalMechanismLearner(dim=D, n_mech=cfg.n_mech, n_segments=cfg.n_segments, max_lag=cfg.max_lag, predict_weight=cfg.causal_predict_weight, dag_weight=cfg.causal_dag_weight, sparsity_weight=cfg.causal_sparsity_weight, smooth_weight=cfg.causal_smooth_weight, disentangle_weight=cfg.causal_disentangle_weight, return_segment_lag_graph=cfg.causal_return_segment_lag_graph)
         self.moe = SemanticCausalTemporalMoE(dim=D, meta_dim=9, n_experts=cfg.n_experts, top_k=cfg.top_k, hidden_mult=cfg.moe_hidden_mult, router_hidden_mult=cfg.moe_router_hidden_mult, dropout=cfg.moe_dropout, noisy_gating=cfg.moe_noisy_gating, capacity_factor_train=cfg.moe_capacity_factor_train, capacity_factor_eval=cfg.moe_capacity_factor_eval, prior_scale=cfg.moe_prior_scale, balance_weight=cfg.moe_balance_weight, z_loss_weight=cfg.moe_z_loss_weight, prior_kl_weight=cfg.moe_prior_kl_weight, smooth_weight=cfg.moe_router_smooth_weight, capacity_weight=cfg.moe_capacity_weight, residual_scale=cfg.moe_residual_scale)
-        self.denoiser = T2PDenoiser(input_dim=D, output_dim=D, text_dim=text_work_dim, hidden_dim=cfg.dit_dim, n_heads=cfg.dit_heads, n_layers=cfg.dit_depth, mlp_expand=int(cfg.mlp_ratio), dropout=cfg.dit_dropout, qk_norm=cfg.dit_qk_norm, prediction_type="epsilon" if cfg.pred_mode == "eps" else cfg.pred_mode)
+        self.denoiser = T2PDenoiser(input_dim=D, output_dim=D, text_dim=text_work_dim, hidden_dim=cfg.dit_dim, n_heads=cfg.dit_heads, n_layers=cfg.dit_depth, mlp_expand=int(cfg.mlp_ratio), dropout=cfg.dit_dropout, qk_norm=cfg.dit_qk_norm, prediction_type="epsilon" if cfg.pred_mode == "eps" else cfg.pred_mode, plan_context_scale=getattr(cfg, "plan_context_scale", 1.0))
         self.decoder = VariablePatchDecoder(
             latent_dim=D,
             meta_dim=9,
@@ -284,6 +306,14 @@ class MATDModel(nn.Module):
             acf_lags=getattr(cfg, "endpoint_acf_lags", 8),
         )
         self.loss_text_layout = TextLayoutLoss()
+        self.loss_plan_consistency = PlanConsistencyLoss(
+            plan_dim=D,
+            text_dim=text_work_dim,
+            stats_weight=getattr(cfg, "lambda_plan_stats", 0.2),
+            contrast_weight=getattr(cfg, "lambda_plan_contrast", 0.05),
+            kl_weight=getattr(cfg, "lambda_plan_kl", 0.001),
+            temperature=getattr(cfg, "align_temperature", 0.07),
+        )
         self.loss_mechanism = CausalSemanticRouterLoss(
             causal_weight=cfg.lambda_causal,
             moe_weight=cfg.lambda_moe,
@@ -329,6 +359,28 @@ class MATDModel(nn.Module):
             drop_mask = torch.rand(len(texts), device=pooled.device) < self.cfg.p_drop_text
         return token_hidden, pooled, null_tokens, null_pooled, attention_mask, drop_mask
 
+    def _run_planner(
+        self,
+        token_hidden: torch.Tensor,
+        pooled: torch.Tensor,
+        text_key_padding_mask: Optional[torch.Tensor],
+        n_patches: int,
+    ) -> tuple[torch.Tensor, Optional[PlanOutput]]:
+        if self.planner_mode == "latent":
+            plan = self.planner(
+                token_hidden,
+                pooled_text=pooled,
+                text_padding_mask=text_key_padding_mask,
+                n_patches=n_patches,
+            )
+            return plan.meta[..., :9], plan
+        meta_pred = self.planner(
+            token_hidden,
+            text_padding_mask=text_key_padding_mask,
+            n_patches=n_patches,
+        )
+        return meta_pred[..., :9], None
+
     def _denoise_train_with_cfg_dropout(
         self,
         z_t: torch.Tensor,
@@ -341,6 +393,8 @@ class MATDModel(nn.Module):
         meta_9: torch.Tensor,
         causal_feat: Optional[torch.Tensor],
         drop_mask: Optional[torch.Tensor],
+        plan_tokens: Optional[torch.Tensor] = None,
+        plan_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Denoiser forward with per-sample CFG dropout.
 
@@ -355,6 +409,8 @@ class MATDModel(nn.Module):
                 z_t, t, token_hidden, meta_9, pooled,
                 causal_feat=causal_feat,
                 text_padding_mask=text_key_padding_mask,
+                plan_tokens=plan_tokens,
+                plan_global=plan_global,
             )
 
         eps_pred = torch.empty_like(z_t)
@@ -368,6 +424,8 @@ class MATDModel(nn.Module):
                 pooled[keep_mask],
                 causal_feat=causal_feat[keep_mask] if causal_feat is not None else None,
                 text_padding_mask=text_key_padding_mask[keep_mask],
+                plan_tokens=plan_tokens[keep_mask] if plan_tokens is not None else None,
+                plan_global=plan_global[keep_mask] if plan_global is not None else None,
             )
             eps_pred[keep_mask] = keep_eps.to(dtype=eps_pred.dtype)
 
@@ -385,6 +443,8 @@ class MATDModel(nn.Module):
                 null_pooled[drop_mask],
                 causal_feat=None,
                 text_padding_mask=null_padding_mask,
+                plan_tokens=None,
+                plan_global=None,
             )
             eps_pred[drop_mask] = drop_eps.to(dtype=eps_pred.dtype)
         return eps_pred
@@ -442,11 +502,17 @@ class MATDModel(nn.Module):
 
         z0, meta_oracle = self._encode_oracle(x0)
         K = z0.shape[1]
-        meta_pred = self.planner(token_hidden, text_padding_mask=text_key_padding_mask, n_patches=K)
-        # Stage-aware meta selection: Stage 1 forces oracle to avoid polluting
-        # autoencoder warm-up with untrained planner predictions.
+        meta_pred, plan = self._run_planner(token_hidden, pooled, text_key_padding_mask, K)
+        layout_source = getattr(self.cfg, "layout_source", "canonical")
         if meta_override is not None:
             meta = meta_override.to(z0.device)
+        elif self.planner_mode == "latent":
+            if layout_source == "oracle":
+                meta = meta_oracle.detach()
+            elif layout_source == "predicted":
+                meta = meta_pred
+            else:
+                meta = build_canonical_meta(B, K, z0.device, z0.dtype)
         elif stage == 1:
             meta = meta_oracle.detach()
         elif stage in (2, 4):
@@ -455,10 +521,16 @@ class MATDModel(nn.Module):
             use_oracle = (torch.rand((), device=z0.device).item() < self.cfg.use_oracle_meta_prob)
             meta = meta_oracle.detach() if use_oracle else meta_pred
         meta_9 = meta[..., :9].to(z0.dtype)
+        plan_tokens = plan.plan_tokens.to(z0.dtype) if plan is not None else None
+        plan_global = plan.plan_global.to(z0.dtype) if plan is not None else None
+        if plan_tokens is not None and stage != 1:
+            z_base = z0 + float(getattr(self.cfg, "plan_residual_scale", 0.2)) * plan_tokens
+        else:
+            z_base = z0
 
         # Stage 1 pure autoencoder: skip causal/SCCI/MoE, use z0 directly
         if stage == 1:
-            z_moe = z0
+            z_moe = z_base
             causal_feat = None
             A0 = Alags = None
             causal_losses = {}
@@ -470,8 +542,8 @@ class MATDModel(nn.Module):
             clean_t = torch.zeros((B,), device=z0.device, dtype=torch.long)
             clean_t_emb = self.denoiser.timestep_embed(clean_t)
             slots = self.slot_extractor(token_hidden, text_padding_mask=text_key_padding_mask)
-            causal_feat, A0, Alags, causal_losses = self.causal(z0, pooled, meta=meta_9)
-            z_cond, slot_attn, text_cond = self.injector(z0, meta_9, slots, clean_t_emb, causal_feat)
+            causal_feat, A0, Alags, causal_losses = self.causal(z_base, pooled, meta=meta_9)
+            z_cond, slot_attn, text_cond = self.injector(z_base, meta_9, slots, clean_t_emb, causal_feat)
             clean_t_emb_k = clean_t_emb.unsqueeze(1).expand(-1, K, -1)
             z_moe, router_p, prior_p = self.moe(z_cond, meta_9, text_cond, clean_t_emb_k, causal_feat)
 
@@ -498,6 +570,8 @@ class MATDModel(nn.Module):
                 meta_9,
                 causal_feat,
                 drop_mask,
+                plan_tokens=plan_tokens,
+                plan_global=plan_global,
             )
             if self.cfg.pred_mode == "v":
                 ab = self._extract(t, z_moe)
@@ -542,8 +616,19 @@ class MATDModel(nn.Module):
         # 2) Patch field: shape-aware decoder reconstruction
         loss_dicts["patch_field"] = self.loss_patch_field(x_hat, x0_seq)
 
-        # 3) Text layout: planner learns to match oracle layout (no gradient to encoder)
-        loss_dicts["text_layout"] = self.loss_text_layout(meta_pred, meta_oracle.detach())
+        # 3) Text plan: latent plan predicts global sequence statistics by default.
+        if self.planner_mode == "latent" and plan is not None:
+            plan_losses = self.loss_plan_consistency(plan.plan_global, pooled, x0_seq, plan_kl=plan.plan_kl)
+            plan_losses["diagnostics/plan_token_std"] = plan.plan_tokens.detach().std()
+            plan_losses["diagnostics/plan_global_norm"] = plan.plan_global.detach().norm(dim=-1).mean()
+            layout_weight = float(getattr(self.cfg, "lambda_plan_layout", 0.0))
+            if layout_weight > 0.0:
+                legacy_layout = self.loss_text_layout(meta_pred, meta_oracle.detach())
+                plan_losses.update({f"legacy_{k}": v for k, v in legacy_layout.items()})
+                plan_losses["loss_text_layout"] = plan_losses["loss_text_layout"] + layout_weight * legacy_layout["loss_text_layout"]
+            loss_dicts["text_layout"] = plan_losses
+        else:
+            loss_dicts["text_layout"] = self.loss_text_layout(meta_pred, meta_oracle.detach())
 
         # 4) Mechanism: causal + SCCI + MoE auxiliary
         loss_dicts["mechanism"] = self.loss_mechanism(
@@ -562,6 +647,7 @@ class MATDModel(nn.Module):
             "loss_terms": all_terms,
             "loss_dicts": loss_dicts,
             "z0": z0,
+            "z_base": z_base,
             "z_moe": z_moe,
             "z_t": z_t,
             "noise": noise,
@@ -570,6 +656,8 @@ class MATDModel(nn.Module):
             "meta_pred": meta_pred,
             "meta_oracle": meta_oracle,
             "meta": meta,
+            "plan_tokens": plan_tokens,
+            "plan_global": plan_global,
             "token_hidden": token_hidden,
             "pooled": pooled,
             "router_p": router_p,
@@ -591,8 +679,10 @@ class MATDModel(nn.Module):
         null_padding_mask = torch.zeros(null_tokens.shape[:2], device=device, dtype=torch.bool)
         if K is None:
             K = self.encoder._choose_k(target_length) if hasattr(self.encoder, "_choose_k") else max(self.cfg.min_tokens, math.ceil(target_length / self.cfg.target_seg_len))
-        meta = self.planner(text_tokens, text_padding_mask=text_key_padding_mask, n_patches=K).to(device)
-        meta_9 = meta[..., :9]
+        meta_9, plan = self._run_planner(text_tokens, pooled, text_key_padding_mask, K)
+        meta_9 = meta_9.to(device)
+        plan_tokens = plan.plan_tokens if plan is not None else None
+        plan_global = plan.plan_global if plan is not None else None
         D = self.cfg.embed_dim
         z = torch.randn(B, K, D, device=device)
         steps = torch.linspace(self.cfg.timesteps - 1, 0, ddim_steps, device=device).long()
@@ -602,7 +692,17 @@ class MATDModel(nn.Module):
             causal_feat = None
             if use_causal_guidance:
                 causal_feat = self.causal(z, pooled, meta=meta_9)[0]
-            eps_cond = self.denoiser(z, t, text_tokens, meta_9, pooled, causal_feat=causal_feat, text_padding_mask=text_key_padding_mask)
+            eps_cond = self.denoiser(
+                z,
+                t,
+                text_tokens,
+                meta_9,
+                pooled,
+                causal_feat=causal_feat,
+                text_padding_mask=text_key_padding_mask,
+                plan_tokens=plan_tokens,
+                plan_global=plan_global,
+            )
             eps_uncond = self.denoiser(z, t, null_tokens, meta_9, null_pooled, causal_feat=None, text_padding_mask=null_padding_mask)
             eps = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
 

@@ -17,7 +17,13 @@ from .tokenizer import (
 from .text_encoder import MATDTextEncoder, NullTextEncoder
 
 # Planner
-from .planner import TextToPatchPlanner, PlannerLoss
+from .planner import (
+    PlanOutput,
+    TextLatentPlanGenerator,
+    TextToPatchPlanner,
+    PlannerLoss,
+    build_canonical_meta,
+)
 
 # SCCI
 from .scci import TextSemanticSlotExtractor, SemanticCausalConditionInjector
@@ -40,6 +46,7 @@ from .losses import (
     CausalSemanticRouterLoss,
     EndpointSeriesLoss,
     LatentDiffusionBridgeLoss,
+    PlanConsistencyLoss,
     TextLayoutLoss,
     LossWeights,
     compute_total_loss,
@@ -50,6 +57,7 @@ from .diagnostics import denorm_roundtrip_diagnostics, summarize_metric_patholog
 from .metrics_matd import (
     compute_multisample_metrics,
     compute_retrieval_diagnostics,
+    compute_robust_distribution_metrics,
     compute_scale_diagnostics,
     compute_temporal_structure_metrics,
     ensure_btd,
@@ -71,18 +79,21 @@ __all__ = [
     "MATDDataset", "MATDDataModule", "matd_collate_fn",
     "DensityAwareAdaptivePatch", "TemporalContextBlock", "AdaptiveTemporalEncoder",
     "MATDTextEncoder", "NullTextEncoder",
-    "TextToPatchPlanner", "PlannerLoss",
+    "PlanOutput", "TextLatentPlanGenerator", "TextToPatchPlanner",
+    "PlannerLoss", "build_canonical_meta",
     "TextSemanticSlotExtractor", "SemanticCausalConditionInjector",
     "SemanticCausalTemporalMoE",
     "DynamicCausalMechanismLearner",
     "T2PDenoiser", "TextTemporalDiTBlock", "RelativeTemporalSelfAttention",
     "VariablePatchDecoder", "LinearPatchDecoder",
-    "LatentDiffusionBridgeLoss", "AdaptivePatchFieldLoss", "EndpointSeriesLoss", "TextLayoutLoss",
+    "LatentDiffusionBridgeLoss", "AdaptivePatchFieldLoss", "EndpointSeriesLoss",
+    "PlanConsistencyLoss", "TextLayoutLoss",
     "CausalSemanticRouterLoss", "LossWeights", "compute_total_loss", "weights_from_config",
     "GradientConflictMonitor", "LossBalanceConfig",
     "denorm_roundtrip_diagnostics", "summarize_metric_pathologies",
     "ensure_btd", "ensure_nktd",
     "compute_scale_diagnostics", "compute_temporal_structure_metrics",
+    "compute_robust_distribution_metrics",
     "compute_multisample_metrics", "compute_retrieval_diagnostics",
     "MATDModel", "MATDConfig",
     "MATDTrainer", "EMA", "MATDGenerator",
